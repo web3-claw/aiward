@@ -304,6 +304,12 @@ pub enum Commands {
     Coverage,
     #[command(hide = true, name = "__broker")]
     BrokerServe,
+    /// Print shell integration code. Add `eval "$(ward shell-init)"` to your shell config.
+    ShellInit {
+        /// Override shell detection (zsh, bash, fish).
+        #[arg(long)]
+        shell: Option<String>,
+    },
     /// Activate human mode for this terminal window.
     Human {
         /// Unlock duration (e.g. 8h, 30m).
@@ -690,6 +696,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(all(coverage, not(test)))]
         Commands::Coverage => coverage_exercise_cli_edges(),
         Commands::BrokerServe => broker::serve(),
+        Commands::ShellInit { shell } => shell_init(shell.as_deref()),
         Commands::Human { ttl } => crate::human::activate_human_mode(&ttl),
         Commands::HumanGuardian {
             shell_pid,
@@ -1190,6 +1197,11 @@ fn setup(options: SetupOptions) -> Result<()> {
     if options.yes {
         println!("Used setup defaults.");
     }
+    if let Some(rc) = ensure_shell_integration() {
+        println!();
+        println!("Shell integration added to {}.", rc.display());
+        prompt_shell_reload(&rc);
+    }
     Ok(())
 }
 
@@ -1231,6 +1243,11 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
     }
     if cwd.join(".env").exists() {
         println!("Warning: plaintext .env exists. Run ward import .env, then remove .env.");
+    }
+    if let Some(rc) = ensure_shell_integration() {
+        println!();
+        println!("Shell integration added to {}.", rc.display());
+        prompt_shell_reload(&rc);
     }
 
     Ok(())
@@ -2106,6 +2123,21 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
     if context_options.branch.is_none() {
         context_options.branch = branch.clone();
     }
+    // In a human terminal, infer remaining context from the current git repo.
+    if crate::human::is_human_terminal() {
+        if context_options.agent.is_none() {
+            context_options.agent = Some("human".to_string());
+        }
+        if context_options.worktree.is_none() {
+            context_options.worktree = git.worktree_path.as_deref().map(PathBuf::from);
+        }
+        if context_options.commit.is_none() {
+            context_options.commit = git.commit.clone();
+        }
+        if context_options.git_remote.is_none() {
+            context_options.git_remote = git.remote.clone();
+        }
+    }
     let resolved_profile = resolve_run_profile(
         &config,
         options.profile.as_deref(),
@@ -2614,6 +2646,242 @@ fn lock() -> Result<()> {
         crate::human::display::print_padlock_closing();
     }
     Ok(())
+}
+
+fn prompt_shell_reload(_rc: &Path) {
+    #[cfg(not(coverage))]
+    {
+        let reload = inquire::Confirm::new("Reload shell now to activate ward hooks?")
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
+        if reload {
+            let marker = broker::run_dir().join("shell-reload");
+            crate::fs_util::ensure_private_dir(&broker::run_dir()).ok();
+            fs::write(&marker, "").ok();
+            // Fallback if the ward() shell function isn't installed yet.
+            println!();
+            println!("  Run this to reload and activate:");
+            println!("    exec $SHELL  &&  ward human");
+        } else {
+            println!();
+            println!("  When ready, reload your shell:");
+            println!("    exec $SHELL  &&  ward human");
+        }
+    }
+    #[cfg(coverage)]
+    {
+        let _ = rc;
+        println!();
+        println!("  Reload your shell and activate human mode:");
+        println!("    exec $SHELL  &&  ward human");
+    }
+}
+
+fn ensure_shell_integration() -> Option<PathBuf> {
+    let shell = detect_shell()?;
+    let rc_path = shell_rc_path(&shell)?;
+    let marker = "ward shell-init";
+    let contents = fs::read_to_string(&rc_path).unwrap_or_default();
+    if contents.contains(marker) {
+        return None; // already installed
+    }
+    let line = if shell == "fish" {
+        "\n# ward shell integration\nward shell-init | source\n"
+    } else {
+        "\n# ward shell integration\neval \"$(ward shell-init)\"\n"
+    };
+    if fs::OpenOptions::new()
+        .append(true)
+        .open(&rc_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
+        .is_ok()
+    {
+        Some(rc_path)
+    } else {
+        None
+    }
+}
+
+fn shell_rc_path(shell: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let path = match shell {
+        "zsh" => home.join(".zshrc"),
+        "bash" => {
+            let candidate = home.join(".bashrc");
+            if candidate.exists() {
+                candidate
+            } else {
+                home.join(".bash_profile")
+            }
+        }
+        "fish" => home
+            .join(".config")
+            .join("fish")
+            .join("config.fish"),
+        _ => return None,
+    };
+    Some(path)
+}
+
+fn shell_init(shell_override: Option<&str>) -> Result<()> {
+    let shell = shell_override
+        .map(str::to_string)
+        .or_else(detect_shell)
+        .unwrap_or_else(|| "sh".to_string());
+    print!("{}", shell_init_code(&shell));
+    Ok(())
+}
+
+fn detect_shell() -> Option<String> {
+    std::env::var("SHELL").ok().and_then(|s| {
+        std::path::Path::new(&s)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+    })
+}
+
+fn collect_command_prefixes(cwd: &Path) -> Vec<String> {
+    let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    if let Ok(project_config) = config::read_project_config(cwd) {
+        for profile in project_config.profiles.values() {
+            if let Some(prefix) = profile.command.split_whitespace().next() {
+                prefixes.insert(prefix.to_string());
+            }
+        }
+        for preset in &project_config.presets {
+            for cmd in &preset.match_commands {
+                if let Some(prefix) = cmd.split_whitespace().next() {
+                    prefixes.insert(prefix.to_string());
+                }
+            }
+        }
+    }
+
+    if let Ok(mode_configs) = modes::load_local_modes(cwd) {
+        for mode in &mode_configs {
+            for cmd in &mode.allowed_commands {
+                if let Some(raw) = cmd.split_whitespace().next() {
+                    let prefix = raw.trim_matches('*').trim_matches('/');
+                    if !prefix.is_empty() {
+                        prefixes.insert(prefix.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    prefixes
+        .into_iter()
+        .filter(|p| is_safe_shell_function_name(p))
+        .collect()
+}
+
+fn is_safe_shell_function_name(name: &str) -> bool {
+    if name == "ward" {
+        return false;
+    }
+    const BUILTINS: &[&str] = &[
+        "cd", "echo", "export", "source", ".", "exec", "exit", "set", "unset", "alias", "eval",
+        "read", "printf", "test", "[", "[[", "true", "false", "return", "break", "continue",
+        "shift", "trap",
+    ];
+    if BUILTINS.iter().any(|b| *b == name) {
+        return false;
+    }
+    name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') && !name.starts_with('-')
+}
+
+fn shell_init_code(shell: &str) -> String {
+    let ward_home = audit_logs::ward_home();
+    let sock_path = ward_home
+        .join("run")
+        .join("human-$$/guardian.sock")
+        .display()
+        .to_string();
+
+    let cwd = env::current_dir().unwrap_or_default();
+    let cmds = collect_command_prefixes(&cwd);
+    let cmds_ref: Vec<&str> = cmds.iter().map(String::as_str).collect();
+
+    if shell == "fish" {
+        fish_init_code(&ward_home, &cmds_ref)
+    } else {
+        posix_init_code(&ward_home, &sock_path, &cmds_ref)
+    }
+}
+
+fn posix_init_code(ward_home: &std::path::Path, sock_path: &str, cmds: &[&str]) -> String {
+    let mut out = String::from(
+        "# ward shell integration — only active in human mode inside ward projects\n",
+    );
+    out.push_str("__ward_wrap() {\n");
+    out.push_str(&format!(
+        "  if [ -S \"{sock_path}\" ] && [ -f \".ward.json\" ]; then\n"
+    ));
+    out.push_str("    command ward run -- \"$@\"\n");
+    out.push_str("  else\n");
+    out.push_str("    command \"$@\"\n");
+    out.push_str("  fi\n");
+    out.push_str("}\n");
+    let reload_marker = ward_home.join("run").join("shell-reload").display().to_string();
+    out.push_str("ward() {\n");
+    out.push_str("  command ward \"$@\"\n");
+    out.push_str("  __ward_exit=$?\n");
+    out.push_str("  case \"$1\" in\n");
+    out.push_str("    setup|init)\n");
+    out.push_str(&format!("      if [ -f \"{reload_marker}\" ]; then\n"));
+    out.push_str(&format!("        rm -f \"{reload_marker}\"\n"));
+    out.push_str("        exec $SHELL\n");
+    out.push_str("      fi\n");
+    out.push_str("      ;;\n");
+    out.push_str("  esac\n");
+    out.push_str("  return $__ward_exit\n");
+    out.push_str("}\n");
+    for cmd in cmds {
+        out.push_str(&format!("{cmd}() {{ __ward_wrap {cmd} \"$@\"; }}\n"));
+    }
+    // Catch-all fallback: routes unknown commands through ward when in human mode.
+    // bash uses command_not_found_handle, zsh uses command_not_found_handler.
+    out.push_str("command_not_found_handle() { __ward_wrap \"$@\"; }\n");
+    out.push_str("command_not_found_handler() { __ward_wrap \"$@\"; }\n");
+    out
+}
+
+fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
+    let sock_dir = ward_home.join("run").display().to_string();
+    let mut out = String::from(
+        "# ward shell integration — only active in human mode inside ward projects\n",
+    );
+    out.push_str("function __ward_wrap\n");
+    // Use $fish_pid directly — it's the fish shell PID, matching getppid() in child processes.
+    out.push_str(&format!(
+        "    set sock \"{sock_dir}/human-$fish_pid/guardian.sock\"\n"
+    ));
+    out.push_str("    if test -S $sock; and test -f \".ward.json\"\n");
+    out.push_str("        command ward run -- $argv\n");
+    out.push_str("    else\n");
+    out.push_str("        command $argv\n");
+    out.push_str("    end\n");
+    out.push_str("end\n");
+    out.push_str("function ward\n");
+    out.push_str("    command ward $argv\n");
+    out.push_str("    set __ward_exit $status\n");
+    out.push_str("    if contains -- $argv[1] setup init\n");
+    out.push_str("        source ~/.config/fish/config.fish 2>/dev/null\n");
+    out.push_str("    end\n");
+    out.push_str("    return $__ward_exit\n");
+    out.push_str("end\n");
+    for cmd in cmds {
+        out.push_str(&format!("function {cmd}; __ward_wrap {cmd} $argv; end\n"));
+    }
+    // Catch-all fallback for any command not found in PATH while in human mode.
+    out.push_str("function __ward_command_not_found --on-event fish_command_not_found\n");
+    out.push_str("    __ward_wrap $argv\n");
+    out.push_str("end\n");
+    out
 }
 
 fn modes_command(command: ModesCommand) -> Result<()> {
