@@ -14,6 +14,7 @@ use crate::{approval_receipts, fs_util, key_store, logs};
 
 const RUN_UNLOCK_PREFIX: &str = "unlock/run";
 const LOG_UNLOCK_PREFIX: &str = "unlock/logs";
+const MODE_UNLOCK_PREFIX: &str = "unlock/mode";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,11 +30,12 @@ pub struct UnlockSession {
     pub signing_key_ciphertext: Option<approval_receipts::SigningKeyCiphertext>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum UnlockPurpose {
     Run,
     Logs,
+    Mode(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +104,16 @@ pub fn create_run_unlock(
 
 pub fn create_logs_unlock(project: &str, vault: &Path, ttl: Duration) -> Result<UnlockSession> {
     create_unlock(project, vault, "", ttl, UnlockPurpose::Logs)
+}
+
+pub fn create_mode_unlock(
+    project: &str,
+    vault: &Path,
+    passphrase: &str,
+    ttl: Duration,
+    mode_name: &str,
+) -> Result<UnlockSession> {
+    create_unlock(project, vault, passphrase, ttl, UnlockPurpose::Mode(mode_name.to_string()))
 }
 
 pub fn active_run_passphrase(project: &str, vault: &Path) -> Result<Option<String>> {
@@ -231,9 +243,9 @@ fn create_unlock(
 ) -> Result<UnlockSession> {
     let mut state = load_state(&unlocks_path())?;
     let now = Utc::now();
-    remove_expired_and_matching(&mut state, project, vault, purpose, now)?;
+    remove_expired_and_matching(&mut state, project, vault, &purpose, now)?;
 
-    let key_name = key_name(project, vault, purpose);
+    let key_name = key_name(project, vault, &purpose);
     #[cfg(test)]
     if purpose == UnlockPurpose::Run {
         key_store::set_secret(&key_name, _secret)?;
@@ -292,13 +304,13 @@ fn remove_expired_and_matching(
     state: &mut UnlockState,
     project: &str,
     vault: &Path,
-    purpose: UnlockPurpose,
+    purpose: &UnlockPurpose,
     now: DateTime<Utc>,
 ) -> Result<()> {
     let mut removed = Vec::new();
     state.sessions.retain(|session| {
         let should_remove = session.expires_at <= now
-            || (session.project == project && session.vault == vault && session.purpose == purpose);
+            || (session.project == project && session.vault == vault && session.purpose == *purpose);
         if should_remove {
             if session.purpose == UnlockPurpose::Logs {
                 removed.push(session.key_name.clone());
@@ -345,10 +357,11 @@ fn write_state(path: &Path, state: &UnlockState) -> Result<()> {
     fs_util::write_private_file(path, format!("{contents}\n").as_bytes())
 }
 
-fn key_name(project: &str, vault: &Path, purpose: UnlockPurpose) -> String {
+fn key_name(project: &str, vault: &Path, purpose: &UnlockPurpose) -> String {
     let prefix = match purpose {
         UnlockPurpose::Run => RUN_UNLOCK_PREFIX,
         UnlockPurpose::Logs => LOG_UNLOCK_PREFIX,
+        UnlockPurpose::Mode(_) => MODE_UNLOCK_PREFIX,
     };
     let mut hasher = Sha256::new();
     hasher.update(project.as_bytes());

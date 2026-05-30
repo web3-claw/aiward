@@ -266,6 +266,7 @@ mod tests {
         PolicyEvaluation {
             matched_profile: None,
             matched_preset: Some("Next.js Dev Server".to_string()),
+            matched_mode: None,
             approval_mode: ApprovalMode::Prompt,
             requested_env: vec!["DATABASE_URL".to_string()],
             approved_env: vec!["DATABASE_URL".to_string()],

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
-    fs_util, logs,
+    fs_util, logs, modes,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     vault,
 };
@@ -39,6 +39,8 @@ pub struct BrokerSessionStatus {
     pub project: String,
     pub vault: PathBuf,
     pub expires_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,11 +53,22 @@ enum BrokerRequest {
         vault: PathBuf,
         passphrase: String,
         ttl_seconds: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
     },
     Sign {
         project: String,
         vault: PathBuf,
         payload: ApprovalReceiptPayload,
+    },
+    RegisterHumanSession {
+        shell_pid: u32,
+        session_token: String,
+        ttl_seconds: i64,
+    },
+    DeregisterHumanSession {
+        shell_pid: u32,
+        session_token: String,
     },
     Execute {
         project: String,
@@ -110,9 +123,16 @@ impl std::fmt::Display for BrokerError {
 
 impl std::error::Error for BrokerError {}
 
+struct HumanSessionEntry {
+    session_token: String,
+    #[allow(dead_code)]
+    expires_at: DateTime<Utc>,
+}
+
 #[derive(Default)]
 struct BrokerState {
     sessions: BTreeMap<String, BrokerSession>,
+    human_sessions: HashMap<u32, HumanSessionEntry>,
 }
 
 struct BrokerSession {
@@ -120,6 +140,7 @@ struct BrokerSession {
     vault: PathBuf,
     passphrase: String,
     expires_at: DateTime<Utc>,
+    active_mode: Option<modes::ActiveMode>,
 }
 
 pub fn run_dir() -> PathBuf {
@@ -198,8 +219,30 @@ pub fn unlock_project(
     Ok(())
 }
 
+#[cfg(test)]
+pub fn unlock_project_with_mode(
+    _project: &str,
+    _vault: &Path,
+    _passphrase: &str,
+    _ttl: Duration,
+    _mode: Option<String>,
+) -> Result<()> {
+    Ok(())
+}
+
 #[cfg(not(test))]
 pub fn unlock_project(project: &str, vault: &Path, passphrase: &str, ttl: Duration) -> Result<()> {
+    unlock_project_with_mode(project, vault, passphrase, ttl, None)
+}
+
+#[cfg(not(test))]
+pub fn unlock_project_with_mode(
+    project: &str,
+    vault: &Path,
+    passphrase: &str,
+    ttl: Duration,
+    mode: Option<String>,
+) -> Result<()> {
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
@@ -211,6 +254,7 @@ pub fn unlock_project(project: &str, vault: &Path, passphrase: &str, ttl: Durati
         vault: vault.to_path_buf(),
         passphrase: passphrase.to_string(),
         ttl_seconds,
+        mode,
     })? {
         BrokerResponse::Ok => Ok(()),
         BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
@@ -360,6 +404,41 @@ pub fn stop() -> Result<()> {
     }
 }
 
+#[cfg(test)]
+pub fn register_human_session(_shell_pid: u32, _session_token: &str, _ttl_seconds: i64) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn deregister_human_session(_shell_pid: u32, _session_token: &str) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(test))]
+pub fn register_human_session(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> Result<()> {
+    match send_simple(BrokerRequest::RegisterHumanSession {
+        shell_pid,
+        session_token: session_token.to_string(),
+        ttl_seconds,
+    })? {
+        BrokerResponse::Ok => Ok(()),
+        BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+#[cfg(not(test))]
+pub fn deregister_human_session(shell_pid: u32, session_token: &str) -> Result<()> {
+    match send_simple(BrokerRequest::DeregisterHumanSession {
+        shell_pid,
+        session_token: session_token.to_string(),
+    }) {
+        Ok(BrokerResponse::Ok) | Err(_) => Ok(()),
+        Ok(BrokerResponse::Error { message, .. }) => anyhow::bail!("{message}"),
+        Ok(other) => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
 pub fn serve() -> Result<()> {
     cleanup_stale_files()?;
     fs_util::ensure_private_dir(&run_dir())?;
@@ -399,12 +478,46 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             vault,
             passphrase,
             ttl_seconds,
+            mode,
         } => {
             match vault::decrypt_vault_file(&vault, &passphrase).and_then(|_| {
                 approval_receipts::ensure_project_key(&project, &passphrase).map(|_| ())
             }) {
                 Ok(()) => {
                     let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+
+                    // Load active mode config from broker vault if requested
+                    let active_mode = if let Some(mode_name) = &mode {
+                        match modes::load_broker_modes(&project, &passphrase) {
+                            Ok(mode_configs) => {
+                                match modes::find_mode(&mode_configs, mode_name) {
+                                    Some(config) => Some(modes::ActiveMode {
+                                        config: config.clone(),
+                                        expires_at,
+                                    }),
+                                    None => {
+                                        let response = broker_error(
+                                            "mode_not_found",
+                                            format!("mode '{mode_name}' not found — run `ward modes push` first"),
+                                        );
+                                        write_response(&mut stream, &response)?;
+                                        return Ok(false);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let response = broker_error(
+                                    "modes_vault_unavailable",
+                                    format!("could not load modes vault: {error} — run `ward modes push` first"),
+                                );
+                                write_response(&mut stream, &response)?;
+                                return Ok(false);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     state
                         .lock()
                         .expect("broker state poisoned")
@@ -416,6 +529,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                                 vault,
                                 passphrase,
                                 expires_at,
+                                active_mode,
                             },
                         );
                     write_response(&mut stream, &BrokerResponse::Ok)?;
@@ -444,6 +558,38 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 }
             }
         }
+        BrokerRequest::RegisterHumanSession {
+            shell_pid,
+            session_token,
+            ttl_seconds,
+        } => {
+            let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+            state
+                .lock()
+                .expect("broker state poisoned")
+                .human_sessions
+                .insert(shell_pid, HumanSessionEntry { session_token, expires_at });
+            write_response(&mut stream, &BrokerResponse::Ok)?;
+        }
+        BrokerRequest::DeregisterHumanSession {
+            shell_pid,
+            session_token,
+        } => {
+            let mut state = state.lock().expect("broker state poisoned");
+            match state.human_sessions.get(&shell_pid) {
+                Some(entry) if entry.session_token == session_token => {
+                    state.human_sessions.remove(&shell_pid);
+                    write_response(&mut stream, &BrokerResponse::Ok)?;
+                }
+                Some(_) => {
+                    let response = broker_error("invalid_token", "session token mismatch");
+                    write_response(&mut stream, &response)?;
+                }
+                None => {
+                    write_response(&mut stream, &BrokerResponse::Ok)?;
+                }
+            }
+        }
         BrokerRequest::Execute {
             project,
             vault,
@@ -465,14 +611,56 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 let state = state.lock().expect("broker state poisoned");
                 active_session(&state, &project, &vault).map(|session| session.passphrase.clone())
             };
-            let passphrase = match passphrase {
-                Ok(passphrase) => passphrase,
+            let (passphrase, active_mode) = match passphrase {
+                Ok(passphrase) => {
+                    let active_mode = {
+                        let state = state.lock().expect("broker state poisoned");
+                        active_session(&state, &project, &vault)
+                            .ok()
+                            .and_then(|s| s.active_mode.clone())
+                    };
+                    (passphrase, active_mode)
+                }
                 Err(error) => {
                     let response = broker_error("unlock_required", error.to_string());
                     write_response(&mut stream, &response)?;
                     return Ok(false);
                 }
             };
+
+            // Mode enforcement — runs before any env decryption
+            if let Some(ref mode) = active_mode {
+                // Env scope is always enforced regardless of mode level
+                for env_name in &env_names {
+                    if !modes::mode_allows_env(mode, env_name) {
+                        let response = broker_error(
+                            "mode_env_violation",
+                            format!(
+                                "{env_name} is not allowed by active mode '{}' (allowedEnv: {})",
+                                mode.config.name,
+                                mode.config.allowed_env.join(", ")
+                            ),
+                        );
+                        write_response(&mut stream, &response)?;
+                        return Ok(false);
+                    }
+                }
+                // Command blocking only applies in supervised mode
+                if mode.config.level == modes::ModeLevel::Supervised
+                    && !modes::mode_allows_command(mode, &command.join(" "))
+                {
+                    let response = broker_error(
+                        "mode_confirmation_required",
+                        format!(
+                            "supervised mode '{}': command not in allowedCommands — explicit confirmation required",
+                            mode.config.name
+                        ),
+                    );
+                    write_response(&mut stream, &response)?;
+                    return Ok(false);
+                }
+            }
+
             let output = Arc::new(Mutex::new(stream.try_clone()?));
             let emitter = {
                 let output = Arc::clone(&output);
@@ -561,6 +749,7 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
                 project: session.project.clone(),
                 vault: session.vault.clone(),
                 expires_at: session.expires_at,
+                active_mode: session.active_mode.as_ref().map(|m| m.config.name.clone()),
             })
             .collect(),
     }
@@ -898,21 +1087,25 @@ mod tests {
                     project: "other".to_string(),
                     vault: vault.clone(),
                     expires_at,
+                    active_mode: None,
                 },
                 BrokerSessionStatus {
                     project: "demo".to_string(),
                     vault: PathBuf::from("/missing/.env.vault"),
                     expires_at,
+                    active_mode: None,
                 },
                 BrokerSessionStatus {
                     project: "demo".to_string(),
                     vault: same_vault,
                     expires_at,
+                    active_mode: None,
                 },
                 BrokerSessionStatus {
                     project: "demo".to_string(),
                     vault: vault.clone(),
                     expires_at: now - Duration::minutes(1),
+                    active_mode: None,
                 },
             ],
         };
@@ -950,6 +1143,7 @@ mod tests {
                 vault: vault_path.clone(),
                 passphrase: "wrong".to_string(),
                 ttl_seconds: 60,
+                mode: None,
             },
             Arc::clone(&state),
         );
@@ -967,6 +1161,7 @@ mod tests {
                 vault: vault_path.clone(),
                 passphrase: passphrase.to_string(),
                 ttl_seconds: 60,
+                mode: None,
             },
             Arc::clone(&state),
         );
@@ -1016,6 +1211,7 @@ mod tests {
                 vault: vault_path.clone(),
                 passphrase: passphrase.to_string(),
                 expires_at: Utc::now() - Duration::seconds(1),
+                active_mode: None,
             },
         );
         let (_, response) = broker_pair(

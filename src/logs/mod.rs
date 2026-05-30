@@ -83,6 +83,17 @@ pub fn logs_dir() -> PathBuf {
     ward_home().join("logs")
 }
 
+pub fn project_modes_dir(project: &str) -> PathBuf {
+    ward_home().join("projects").join(slugify(project))
+}
+
+fn slugify(project: &str) -> String {
+    project
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .collect()
+}
+
 fn cache_dir() -> PathBuf {
     ward_home().join("cache")
 }

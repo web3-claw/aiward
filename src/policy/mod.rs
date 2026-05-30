@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::{PresetConfig, ProfileConfig, ProjectConfig},
     detection::{self, Finding},
+    modes,
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +29,8 @@ pub struct AccessRequest {
 pub struct PolicyEvaluation {
     pub matched_profile: Option<String>,
     pub matched_preset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_mode: Option<String>,
     pub approval_mode: ApprovalMode,
     pub requested_env: Vec<String>,
     pub approved_env: Vec<String>,
@@ -39,8 +42,27 @@ pub struct PolicyEvaluation {
 pub fn evaluate_request(
     config: &ProjectConfig,
     request: &AccessRequest,
+    active_mode: Option<&modes::ActiveMode>,
     mut findings: Vec<Finding>,
 ) -> PolicyEvaluation {
+    // If an active mode covers all requested env vars, auto-approve without prompting.
+    if let Some(mode) = active_mode {
+        if request.env.iter().all(|e| modes::mode_allows_env(mode, e)) {
+            return PolicyEvaluation {
+                matched_profile: None,
+                matched_preset: None,
+                matched_mode: Some(mode.config.name.clone()),
+                approval_mode: ApprovalMode::Auto,
+                requested_env: request.env.clone(),
+                approved_env: request.env.clone(),
+                denied_env: vec![],
+                requires_prompt: detection::has_critical_findings(&findings)
+                    || detection::has_suspicious_action_findings(&findings),
+                findings,
+            };
+        }
+    }
+
     let profile = find_matching_profile(&config.profiles, &request.command);
     let preset = find_matching_preset(&config.presets, &request.command);
     let approval_mode = preset
@@ -78,6 +100,7 @@ pub fn evaluate_request(
     PolicyEvaluation {
         matched_profile: profile.map(|(_, name)| name.clone()),
         matched_preset: preset.map(|preset| preset.name.clone()),
+        matched_mode: None,
         approval_mode,
         requested_env: request.env.clone(),
         approved_env,
@@ -168,7 +191,7 @@ mod tests {
             env: vec!["DATABASE_URL".to_string(), "OPENAI_API_KEY".to_string()],
         };
 
-        let evaluation = evaluate_request(&config, &request, Vec::new());
+        let evaluation = evaluate_request(&config, &request, None, Vec::new());
 
         assert_eq!(evaluation.matched_preset, Some("Dev".to_string()));
         assert_eq!(evaluation.approval_mode, ApprovalMode::Auto);
@@ -210,7 +233,7 @@ mod tests {
             env: vec!["DATABASE_URI".to_string(), "PAYLOAD_SECRET".to_string()],
         };
 
-        let evaluation = evaluate_request(&config, &request, Vec::new());
+        let evaluation = evaluate_request(&config, &request, None, Vec::new());
 
         assert_eq!(evaluation.matched_profile, Some("dev".to_string()));
         assert!(evaluation.denied_env.is_empty());
@@ -250,6 +273,7 @@ mod tests {
         let evaluation = evaluate_request(
             &config,
             &request,
+            None,
             vec![Finding::critical("critical.test", "critical")],
         );
 
@@ -291,7 +315,7 @@ mod tests {
             request.action.as_deref(),
         );
 
-        let evaluation = evaluate_request(&config, &request, findings);
+        let evaluation = evaluate_request(&config, &request, None, findings);
 
         assert_eq!(evaluation.approval_mode, ApprovalMode::Auto);
         assert!(evaluation.requires_prompt);

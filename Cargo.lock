@@ -639,6 +639,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1509,9 +1515,11 @@ dependencies = [
  "dirs",
  "dotenvy",
  "ed25519-dalek",
+ "glob",
  "hex",
  "inquire",
  "keyring",
+ "libc",
  "predicates",
  "rand",
  "rpassword",

@@ -291,6 +291,7 @@ mod tests {
             policy: PolicyEvaluation {
                 matched_profile: None,
                 matched_preset: None,
+                matched_mode: None,
                 approval_mode: ApprovalMode::Prompt,
                 requested_env: vec!["DATABASE_URL".to_string()],
                 approved_env: Vec::new(),

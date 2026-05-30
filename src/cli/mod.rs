@@ -14,7 +14,7 @@ use crate::{
     approvals::{self, ApprovalDecision, ApprovalScope},
     broker, config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, LogKind},
-    pending_requests,
+    modes, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
     registry,
     runner::{self, RunCommandRequest},
@@ -277,6 +277,14 @@ pub enum Commands {
     Unlock {
         #[arg(long, default_value = "8h")]
         ttl: String,
+        /// Activate a named session mode after unlocking (must be pushed first via `ward modes push`).
+        #[arg(long)]
+        mode: Option<String>,
+    },
+    /// Manage session mode permission envelopes.
+    Modes {
+        #[command(subcommand)]
+        command: ModesCommand,
     },
     /// Clear unlock sessions and revoke session-scoped approval grants.
     Lock,
@@ -296,6 +304,21 @@ pub enum Commands {
     Coverage,
     #[command(hide = true, name = "__broker")]
     BrokerServe,
+    /// Activate human mode for this terminal window.
+    Human {
+        /// Unlock duration (e.g. 8h, 30m).
+        #[arg(long, default_value = "8h")]
+        ttl: String,
+    },
+    #[command(hide = true, name = "__human-guardian")]
+    HumanGuardian {
+        #[arg(long)]
+        shell_pid: u32,
+        #[arg(long)]
+        session_token: String,
+        #[arg(long)]
+        ttl_seconds: i64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -447,6 +470,23 @@ pub enum LogsCommand {
         #[arg(long, default_value = "15m")]
         ttl: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModesCommand {
+    /// List modes defined in .ward.modes.json.
+    List,
+    /// Push local .ward.modes.json to broker vault (PIN required).
+    Push {
+        /// Apply globally across all projects.
+        #[arg(long)]
+        global: bool,
+        /// Apply to a specific project by name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Show the active session mode (if any).
+    Status,
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
@@ -638,7 +678,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Worktrees { command } => worktrees_command(command),
         Commands::Logs { command, kind } => logs(command, kind),
         Commands::Edit => edit(),
-        Commands::Unlock { ttl } => unlock_vault(&ttl),
+        Commands::Unlock { ttl, mode } => unlock_vault(&ttl, mode.as_deref()),
+        Commands::Modes { command } => modes_command(command),
         Commands::Lock => lock(),
         Commands::Teardown {
             project,
@@ -649,6 +690,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         #[cfg(all(coverage, not(test)))]
         Commands::Coverage => coverage_exercise_cli_edges(),
         Commands::BrokerServe => broker::serve(),
+        Commands::Human { ttl } => crate::human::activate_human_mode(&ttl),
+        Commands::HumanGuardian {
+            shell_pid,
+            session_token,
+            ttl_seconds,
+        } => crate::human::serve_guardian(shell_pid, &session_token, ttl_seconds),
     }
 }
 
@@ -1085,6 +1132,7 @@ fn setup(options: SetupOptions) -> Result<()> {
             &vault_path,
             &passphrase,
             &options.unlock_ttl,
+            None,
         ) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -2491,17 +2539,22 @@ fn edit() -> Result<()> {
     Ok(())
 }
 
-fn create_run_unlock_session(
+pub(crate) fn create_run_unlock_session(
     project: &str,
     vault_path: &Path,
     passphrase: &str,
     ttl: &str,
+    mode: Option<&str>,
 ) -> Result<unlock::UnlockSession> {
     let ttl = unlock::parse_ttl(ttl)?;
     match vault::decrypt_vault_file(vault_path, passphrase) {
         Ok(_) => {
-            let session = unlock::create_run_unlock(project, vault_path, passphrase, ttl)?;
-            broker::unlock_project(project, vault_path, passphrase, ttl)?;
+            let session = if let Some(mode_name) = mode {
+                unlock::create_mode_unlock(project, vault_path, passphrase, ttl, mode_name)?
+            } else {
+                unlock::create_run_unlock(project, vault_path, passphrase, ttl)?
+            };
+            broker::unlock_project_with_mode(project, vault_path, passphrase, ttl, mode.map(str::to_string))?;
             let event = VaultUnlockEvent {
                 event_type: "vault.unlock",
                 status: "success",
@@ -2529,16 +2582,23 @@ fn create_run_unlock_session(
     }
 }
 
-fn unlock_vault(ttl: &str) -> Result<()> {
+fn unlock_vault(ttl: &str, mode: Option<&str>) -> Result<()> {
     let cwd = env::current_dir()?;
     let resolved = registry::resolve_project(None, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
-    let session = create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl)?;
-    println!("Vault unlocked until {}.", session.expires_at.to_rfc3339());
+    let session = create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, mode)?;
+    if let Some(mode_name) = mode {
+        println!("Vault unlocked with mode '{}' until {}.", mode_name, session.expires_at.to_rfc3339());
+    } else {
+        println!("Vault unlocked until {}.", session.expires_at.to_rfc3339());
+    }
     Ok(())
 }
 
 fn lock() -> Result<()> {
+    if crate::human::is_human_terminal() {
+        let _ = crate::human::send_guardian_shutdown();
+    }
     let revoked = grants::revoke_session_grants()?;
     let cleared_unlocks = unlock::clear_all_unlocks()?;
     broker::stop()?;
@@ -2550,7 +2610,59 @@ fn lock() -> Result<()> {
     audit_logs::append_event(LogKind::Sessions, event)?;
     println!("Revoked {revoked} session grant(s).");
     println!("Cleared {cleared_unlocks} unlock session(s).");
+    if crate::human::is_human_terminal() {
+        crate::human::display::print_padlock_closing();
+    }
     Ok(())
+}
+
+fn modes_command(command: ModesCommand) -> Result<()> {
+    match command {
+        ModesCommand::List => {
+            let cwd = env::current_dir()?;
+            let resolved = registry::resolve_project(None, &cwd)?;
+            let modes = modes::load_local_modes(&resolved.path)?;
+            if modes.is_empty() {
+                println!("No modes defined in .ward.modes.json");
+            } else {
+                for mode in &modes {
+                    println!("{} ({})", mode.name, serde_json::to_string(&mode.level).unwrap_or_default().trim_matches('"'));
+                }
+            }
+            Ok(())
+        }
+        ModesCommand::Push { project, .. } => {
+            let cwd = env::current_dir()?;
+            let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
+            let modes_path = modes::local_modes_path(&resolved.path);
+            let local_modes = modes::load_local_modes(&resolved.path)?;
+            if local_modes.is_empty() {
+                anyhow::bail!("no modes found in {}", modes_path.display());
+            }
+            let passphrase = vault::read_existing_passphrase()?;
+            // Validate passphrase by decrypting the vault
+            vault::decrypt_vault_file(&resolved.vault, &passphrase)
+                .context("invalid passphrase — cannot push modes")?;
+            modes::push_modes(&local_modes, &resolved.name, &passphrase, &modes_path)?;
+            println!("Pushed {} mode(s) for project '{}'.", local_modes.len(), resolved.name);
+            Ok(())
+        }
+        ModesCommand::Status => {
+            let cwd = env::current_dir()?;
+            let resolved = registry::resolve_project(None, &cwd)?;
+            match broker::status() {
+                Ok(status) => {
+                    let session = status.sessions.iter().find(|s| s.project == resolved.name);
+                    match session.and_then(|s| s.active_mode.as_deref()) {
+                        Some(mode_name) => println!("Active mode: {mode_name}"),
+                        None => println!("No active mode for project '{}'.", resolved.name),
+                    }
+                }
+                Err(_) => println!("Broker not running — no active mode."),
+            }
+            Ok(())
+        }
+    }
 }
 
 fn teardown(
@@ -2825,7 +2937,7 @@ fn evaluate_access(
 ) -> policy::PolicyEvaluation {
     let findings =
         detection::preflight_findings(&access.command, &access.env, access.action.as_deref());
-    policy::evaluate_request(config, access, findings)
+    policy::evaluate_request(config, access, None, findings)
 }
 
 fn approval_human_proof(source: approvals::ApprovalSource) -> Option<&'static str> {
@@ -3509,7 +3621,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     };
     run(critical_run)?;
     let grant_source = approvals::ApprovalSource::ManualAllow;
-    unlock_vault("1h")?;
+    unlock_vault("1h", None)?;
     let receipt_context = Some(grants::GrantReceiptContext::synthetic(false));
     let scope = ApprovalScope::Always;
     let vault = &resolved_main.vault;
@@ -3677,7 +3789,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         Some(grants::GrantReceiptContext::synthetic(false)),
     )
     .is_err());
-    unlock_vault("1h")?;
+    unlock_vault("1h", None)?;
     let verify_logs = Some(LogsCommand::Verify {
         kind: Some(LogKind::Requests),
         full: true,
@@ -4033,6 +4145,7 @@ mod tests {
         PolicyEvaluation {
             matched_profile: None,
             matched_preset: None,
+            matched_mode: None,
             approval_mode: mode,
             requested_env: vec!["DATABASE_URL".to_string()],
             approved_env: vec!["DATABASE_URL".to_string()],
@@ -4672,7 +4785,7 @@ mod tests {
             .command = "sh -c true".to_string();
         config::write_project_config(project.path(), &project_config, true).unwrap();
 
-        unlock_vault("1h").unwrap();
+        unlock_vault("1h", None).unwrap();
         let agent_context = prepare_git_context(project.path(), "codex", Some("feature/dispatch"));
 
         dispatch(Cli {
@@ -4996,7 +5109,7 @@ mod tests {
         migrate_profile.env = vec!["DATABASE_URL".to_string(), "PAYLOAD_SECRET".to_string()];
         migrate_profile.default_scope = ApprovalScope::Always;
         config::write_project_config(project.path(), &project_config, true).unwrap();
-        unlock_vault("1h").unwrap();
+        unlock_vault("1h", None).unwrap();
         let agent_context = prepare_git_context(project.path(), "codex", Some("feature/dispatch"));
 
         assert!(request(
@@ -5146,6 +5259,7 @@ mod tests {
         dispatch(Cli {
             command: Commands::Unlock {
                 ttl: "1h".to_string(),
+                mode: None,
             },
         })
         .unwrap();
@@ -5370,7 +5484,7 @@ mod tests {
         import(".env".into(), None).unwrap();
         std::fs::remove_file(project.path().join(".env")).unwrap();
         register("demo".to_string(), None, None).unwrap();
-        unlock_vault("1h").unwrap();
+        unlock_vault("1h", None).unwrap();
         ensure_logs_passphrase().unwrap();
         ensure_logs_passphrase().unwrap();
         request(
@@ -5568,7 +5682,7 @@ mod tests {
         )
         .is_err());
         std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase");
-        assert!(unlock_vault("1h").is_err());
+        assert!(unlock_vault("1h", None).is_err());
         std::env::set_current_dir(old_cwd).unwrap();
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         std::env::remove_var("WARD_HOME");
@@ -6575,6 +6689,7 @@ mod tests {
                 "{:?}",
                 Commands::Unlock {
                     ttl: "1h".to_string(),
+                    mode: None,
                 }
             ),
             format!("{:?}", Commands::Lock),

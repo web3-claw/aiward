@@ -3357,6 +3357,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     dispatch(Cli {
         command: Commands::Unlock {
             ttl: "1h".to_string(),
+            mode: None,
         },
     })
     .unwrap();
@@ -3434,6 +3435,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     dispatch(Cli {
         command: Commands::Unlock {
             ttl: "1h".to_string(),
+            mode: None,
         },
     })
     .unwrap();
