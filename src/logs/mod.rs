@@ -63,28 +63,28 @@ pub struct LogVerification {
     pub valid: bool,
 }
 
-pub fn envgate_home() -> PathBuf {
-    match std::env::var("ENVGATE_HOME")
+pub fn ward_home() -> PathBuf {
+    match std::env::var("WARD_HOME")
         .ok()
         .filter(|path| !path.trim().is_empty())
     {
         Some(path) => PathBuf::from(path),
-        None => default_envgate_home(),
+        None => default_ward_home(),
     }
 }
 
-fn default_envgate_home() -> PathBuf {
+fn default_ward_home() -> PathBuf {
     dirs::home_dir()
         .unwrap_or(PathBuf::from("."))
-        .join(".envgate")
+        .join(".ward")
 }
 
 pub fn logs_dir() -> PathBuf {
-    envgate_home().join("logs")
+    ward_home().join("logs")
 }
 
 fn cache_dir() -> PathBuf {
-    envgate_home().join("cache")
+    ward_home().join("cache")
 }
 
 fn log_key_path() -> PathBuf {
@@ -110,7 +110,7 @@ pub fn append_event<T: Serialize>(kind: LogKind, payload: T) -> Result<()> {
 }
 
 fn append_encrypted_payload(kind: LogKind, payload: &[u8]) -> Result<()> {
-    fs_util::ensure_private_dir(&envgate_home())?;
+    fs_util::ensure_private_dir(&ward_home())?;
     let dir = logs_dir();
     fs_util::ensure_private_dir(&dir)?;
 
@@ -324,7 +324,7 @@ fn log_key() -> Result<[u8; KEY_LEN]> {
 }
 
 fn write_log_key(path: &Path, key: &[u8; KEY_LEN]) -> Result<()> {
-    fs_util::ensure_private_dir(&envgate_home())?;
+    fs_util::ensure_private_dir(&ward_home())?;
     fs_util::ensure_private_dir(&cache_dir())?;
     let stored = LogKeyFile {
         version: 1,
@@ -418,17 +418,17 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn envgate_home_uses_override_and_falls_back_to_home() {
+    fn ward_home_uses_override_and_falls_back_to_home() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
 
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        assert_eq!(envgate_home(), tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
+        assert_eq!(ward_home(), tempdir.path());
 
-        std::env::set_var("ENVGATE_HOME", "");
-        assert!(envgate_home().ends_with(".envgate"));
+        std::env::set_var("WARD_HOME", "");
+        assert!(ward_home().ends_with(".ward"));
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -436,8 +436,8 @@ mod tests {
     fn append_decrypt_and_verify_encrypted_events() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         append_event(
             LogKind::Requests,
@@ -452,8 +452,8 @@ mod tests {
         assert_eq!(events[0]["payload"]["kind"], "request");
         assert!(verify_logs(Some(LogKind::Requests)).unwrap()[0].valid);
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
     fn log_key_is_stored_in_private_local_cache_file() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
 
         let first = log_key().unwrap();
         let second = log_key().unwrap();
@@ -498,7 +498,7 @@ mod tests {
             assert_eq!(file_mode, 0o600);
         }
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -506,8 +506,8 @@ mod tests {
     fn verification_detects_tampered_entries() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         append_event(LogKind::Sessions, json!({ "kind": "session" })).unwrap();
         let path = log_path(LogKind::Sessions);
@@ -522,8 +522,8 @@ mod tests {
 
         assert!(verify_logs(Some(LogKind::Sessions)).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -531,8 +531,8 @@ mod tests {
     fn verifies_all_logs_and_detects_chain_kind_hash_and_parse_errors() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         for kind in LogKind::all() {
             append_event(*kind, json!({ "kind": kind.as_str() })).unwrap();
@@ -581,8 +581,8 @@ mod tests {
         std::fs::write(log_path(LogKind::Approvals), "{bad-json}\n").unwrap();
         assert!(verify_logs(Some(LogKind::Approvals)).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -590,8 +590,8 @@ mod tests {
     fn decrypt_rejects_invalid_entry_metadata_and_key_material() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         append_event(LogKind::Requests, json!({ "kind": "request" })).unwrap();
         let mut entry = read_entries(&log_path(LogKind::Requests)).unwrap()[0].clone();
@@ -629,8 +629,8 @@ mod tests {
         .unwrap();
         assert!(log_key().is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -640,14 +640,14 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let blocked = tempdir.path().join("blocked");
         std::fs::write(&blocked, "").unwrap();
-        std::env::set_var("ENVGATE_HOME", &blocked);
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", &blocked);
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         append_event(LogKind::Requests, json!({ "kind": "request" }))
             .expect_err("read-only log directory should reject append");
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -655,15 +655,15 @@ mod tests {
     fn append_event_reports_log_file_open_failures() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         std::fs::create_dir_all(log_path(LogKind::Requests)).unwrap();
 
         assert!(append_event(LogKind::Requests, json!({ "kind": "request" })).is_err());
 
         std::fs::remove_dir_all(log_path(LogKind::Requests)).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -671,8 +671,8 @@ mod tests {
     fn log_helpers_report_serialization_read_decrypt_and_key_creation_failures() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         append_event(LogKind::Requests, json!({ "kind": "request" })).unwrap();
         let path = log_path(LogKind::Requests);
@@ -709,26 +709,26 @@ mod tests {
         assert!(append_event(LogKind::Alerts, json!({ "kind": "alert" })).is_err());
         assert!(decrypt_events(LogKind::Requests).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
 
         let corrupt_home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", corrupt_home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", corrupt_home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let cache = corrupt_home.path().join("cache");
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join("log-key.json"), "{bad-json}").unwrap();
         assert!(log_key().is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
 
         let blocked_home = tempfile::NamedTempFile::new().unwrap();
-        std::env::set_var("ENVGATE_HOME", blocked_home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", blocked_home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         assert!(log_key().is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 }

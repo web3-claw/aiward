@@ -1,12 +1,12 @@
-# EnvGate User Flow Infographics
+# Ward User Flow Infographics
 
-This page is a simple visual explainer for EnvGate's passive MVP. The diagrams
+This page is a simple visual explainer for Ward's passive MVP. The diagrams
 are written in Mermaid so they render on GitHub and remain easy to edit.
 
 ## One Sentence
 
 ```txt
-EnvGate encrypts local env secrets, lets agents request only the env names they
+Ward encrypts local env secrets, lets agents request only the env names they
 need, injects them only into approved commands, and records encrypted audit logs.
 ```
 
@@ -15,8 +15,8 @@ need, injects them only into approved commands, and records encrypted audit logs
 ```mermaid
 flowchart LR
     A["Developer or AI agent"] --> B{"How is the command run?"}
-    B -->|"Plain shell command"| C["Not protected by EnvGate<br/>Example: pnpm dev"]
-    B -->|"envgate run or profile shortcut"| D["Protected path"]
+    B -->|"Plain shell command"| C["Not protected by Ward<br/>Example: pnpm dev"]
+    B -->|"ward run or profile shortcut"| D["Protected path"]
     D --> E["Policy and exploit checks"]
     E --> F["Approval or matching grant"]
     F --> G["Unlock session or PIN/passphrase"]
@@ -34,7 +34,7 @@ flowchart LR
 Use this when explaining the product boundary:
 
 ```txt
-EnvGate is not a shell monitor. It protects the explicit EnvGate path.
+Ward is not a shell monitor. It protects the explicit Ward path.
 ```
 
 ## Onboarding Flow
@@ -42,15 +42,15 @@ EnvGate is not a shell monitor. It protects the explicit EnvGate path.
 ```mermaid
 flowchart TD
     A["Start with project .env"] --> B["./install.sh"]
-    B --> C["envgate init --project my-app"]
-    C --> D["Create .envgate.json"]
+    B --> C["ward init --project my-app"]
+    C --> D["Create .ward.json"]
     C --> E["Encrypt .env into .env.vault"]
     C --> F["Create .env.example"]
     C --> G["Register project in local registry"]
     C --> H["Generate AGENTS.md or CLAUDE.md"]
     C --> I["Replace .env with locked marker"]
     C --> J["Create initial run unlock session"]
-    I --> K["envgate doctor"]
+    I --> K["ward doctor"]
     J --> K
     K --> L["Ready for agent-safe local development"]
 
@@ -66,8 +66,8 @@ Command version:
 
 ```bash
 ./install.sh
-envgate init --project my-app
-envgate doctor
+ward init --project my-app
+ward doctor
 ```
 
 What to explain:
@@ -75,7 +75,7 @@ What to explain:
 | Before setup | After setup |
 | --- | --- |
 | Plain `.env` in the repo | Locked `.env` marker plus encrypted `.env.vault` |
-| Manual secret copying | `envgate env unlock` / `envgate env lock` |
+| Manual secret copying | `ward env unlock` / `ward env lock` |
 | Agents can accidentally read secrets | Agents get profile commands |
 | No local audit trail | Encrypted local logs |
 | Manual env copying across worktrees | Registry resolves the project vault |
@@ -84,10 +84,10 @@ What to explain:
 
 ```mermaid
 flowchart LR
-    A["Start of work day"] --> B["envgate unlock --ttl 8h"]
-    B --> C["envgate allow --profile dev --scope always --agent codex"]
-    C --> D["envgate dev --agent codex"]
-    D --> E["EnvGate expands dev profile"]
+    A["Start of work day"] --> B["ward unlock --ttl 8h"]
+    B --> C["ward allow --profile dev --scope always --agent codex"]
+    C --> D["ward dev --agent codex"]
+    D --> E["Ward expands dev profile"]
     E --> F["Inject only approved env names"]
     F --> G["Run dev server"]
     G --> H["Write encrypted execution log"]
@@ -103,14 +103,14 @@ flowchart LR
 Command version:
 
 ```bash
-envgate unlock --ttl 8h
-envgate allow --profile dev --scope always --agent codex
-envgate dev --agent codex
+ward unlock --ttl 8h
+ward allow --profile dev --scope always --agent codex
+ward dev --agent codex
 ```
 
-On the first setup run, the unlock is already created by `envgate setup`.
-Use `envgate unlock --ttl 8h` here after that session expires or after
-`envgate lock`.
+On the first setup run, the unlock is already created by `ward setup`.
+Use `ward unlock --ttl 8h` here after that session expires or after
+`ward lock`.
 
 The important point:
 
@@ -123,10 +123,10 @@ approval prompts for the same safe command scope.
 
 ```mermaid
 flowchart LR
-    A["Agent asks for profile dev"] --> B[".envgate.json"]
+    A["Agent asks for profile dev"] --> B[".ward.json"]
     B --> C["Command: pnpm dev"]
     B --> D["Env names: DATABASE_URL, PAYLOAD_SECRET"]
-    C --> E["envgate run --profile dev"]
+    C --> E["ward run --profile dev"]
     D --> E
     E --> F["Grant check"]
     F --> G["Unlock check"]
@@ -151,19 +151,19 @@ The agent can ask for "dev" without reading decrypted vault contents.
 ```mermaid
 sequenceDiagram
     participant Agent as AI Agent
-    participant EnvGate as EnvGate CLI
+    participant Ward as Ward CLI
     participant Broker as Local Broker
     participant User as User
     participant Vault as Encrypted Vault
 
-    Agent->>EnvGate: envgate request --profile dev --json --no-prompt plus full context
-    EnvGate-->>Agent: JSON request id, findings, approval options
+    Agent->>Ward: ward request --profile dev --json --no-prompt plus full context
+    Ward-->>Agent: JSON request id, findings, approval options
     Agent->>User: Show requested command and env names
     User-->>Agent: Approve session, branch, always, once, or deny
-    Agent->>EnvGate: envgate approve <request-id> --scope session --agent-mediated --json
-    EnvGate-->>Agent: Grant created
-    Agent->>EnvGate: envgate run --profile dev --json --no-prompt plus full context
-    EnvGate->>Broker: Send verified command and approved env names
+    Agent->>Ward: ward approve <request-id> --scope session --agent-mediated --json
+    Ward-->>Agent: Grant created
+    Agent->>Ward: ward run --profile dev --json --no-prompt plus full context
+    Ward->>Broker: Send verified command and approved env names
     Broker->>Vault: Decrypt internally from active unlock
     Broker-->>Agent: Run command with scoped env injection
 ```
@@ -171,9 +171,9 @@ sequenceDiagram
 Command version:
 
 ```bash
-envgate request --profile dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/x --json --no-prompt
-envgate approve <request-id> --scope session --agent-mediated --json
-envgate run --profile dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/x --json --no-prompt
+ward request --profile dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/x --json --no-prompt
+ward approve <request-id> --scope session --agent-mediated --json
+ward run --profile dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/x --json --no-prompt
 ```
 
 What the agent must never do:
@@ -186,9 +186,9 @@ Never ask for, store, print, or handle the vault PIN/passphrase.
 
 ```mermaid
 flowchart TD
-    A["envgate unlock --ttl 8h"] --> B["Start or refresh local broker"]
+    A["ward unlock --ttl 8h"] --> B["Start or refresh local broker"]
     B --> C["Broker keeps unlock/signing capability in memory"]
-    D["Agent contacts EnvGate from worktree"] --> E["Agent sends full context"]
+    D["Agent contacts Ward from worktree"] --> E["Agent sends full context"]
     E --> F["Verify path, branch, remote, and commit with local Git"]
     F --> G{"Trusted worktree?"}
     G -->|"Registered root or allowed root match"| H["Reuse matching signed grant or create approval request"]
@@ -210,7 +210,7 @@ flowchart TD
 The rule:
 
 ```txt
-EnvGate detects worktrees only when an EnvGate command contacts it. It does not
+Ward detects worktrees only when an Ward command contacts it. It does not
 scan folders in the background, and automatic delivery means process env
 injection, not writing plaintext .env files.
 ```
@@ -219,14 +219,14 @@ injection, not writing plaintext .env files.
 
 ```mermaid
 flowchart TD
-    A["Agent requests a command"] --> B["EnvGate preflight detection"]
+    A["Agent requests a command"] --> B["Ward preflight detection"]
     B --> C{"Critical finding?"}
     C -->|"No"| D["Normal approval options<br/>once, session, branch, always, deny"]
     C -->|"Yes"| E["confirmationRequired: true"]
     E --> F["Agent must show warning to user"]
     F --> G{"User explicitly allows exact command?"}
-    G -->|"No"| H["envgate deny <request-id> --agent-mediated --json"]
-    G -->|"Yes"| I["envgate approve <request-id> --scope once --confirm-critical --agent-mediated --json"]
+    G -->|"No"| H["ward deny <request-id> --agent-mediated --json"]
+    G -->|"Yes"| I["ward approve <request-id> --scope once --confirm-critical --agent-mediated --json"]
     I --> J["One-use approval only"]
     J --> K["Durable grants are blocked"]
 
@@ -252,7 +252,7 @@ Critical examples:
 Command version:
 
 ```bash
-envgate request \
+ward request \
   --agent codex \
   --action "Debug env" \
   --command "sh -c printenv" \
@@ -260,9 +260,9 @@ envgate request \
   --json \
   --no-prompt
 
-envgate deny <request-id> --agent-mediated --json
+ward deny <request-id> --agent-mediated --json
 
-envgate approve <request-id> \
+ward approve <request-id> \
   --scope once \
   --confirm-critical \
   --agent-mediated \
@@ -280,7 +280,7 @@ always grants.
 
 ```mermaid
 flowchart LR
-    A["Need one command"] --> B["envgate run --env DATABASE_URL -- command"]
+    A["Need one command"] --> B["ward run --env DATABASE_URL -- command"]
     B --> C["Preflight checks"]
     C --> D{"Grant exists?"}
     D -->|"Yes"| E["Skip approval prompt"]
@@ -302,7 +302,7 @@ flowchart LR
 Command version:
 
 ```bash
-envgate run \
+ward run \
   --agent codex \
   --action "Run migration" \
   --env DATABASE_URL \
@@ -320,9 +320,9 @@ flowchart TD
     B --> E["executions"]
     B --> F["alerts"]
     B --> G["sessions"]
-    H["User wants to inspect logs"] --> J["envgate logs view executions"]
+    H["User wants to inspect logs"] --> J["ward logs view executions"]
     J --> K["Decrypted view in terminal"]
-    H --> L["envgate logs verify"]
+    H --> L["ward logs verify"]
     L --> M["Detect modified, malformed, or reordered log entries"]
 
     classDef log fill:#fef3c7,stroke:#b45309,color:#111827;
@@ -336,10 +336,10 @@ flowchart TD
 Command version:
 
 ```bash
-envgate logs
-envgate logs view executions
-envgate logs verify
-envgate logs verify --full
+ward logs
+ward logs view executions
+ward logs verify
+ward logs verify --full
 ```
 
 The limitation to explain clearly:
@@ -354,36 +354,36 @@ OS user.
 | Goal | Command |
 | --- | --- |
 | Install locally | `./install.sh` |
-| One-command onboarding | `envgate init --project my-app` |
-| Check project safety | `envgate doctor` |
-| Refresh vault unlock for runs | `envgate unlock --ttl 8h` |
-| Lock session grants and unlocks | `envgate lock` |
-| Allow safe dev profile | `envgate allow --profile dev --scope always --agent codex` |
-| Run dev profile | `envgate dev --agent codex` |
-| Run migrate profile | `envgate migrate --agent codex` |
-| Manual plaintext env | `envgate env unlock && pnpm dev && envgate env lock` |
-| List projects | `envgate projects list` |
-| Set encrypted env | `envgate env set KEY=value` |
-| Run explicit command | `envgate run --env DATABASE_URL -- pnpm dev` |
-| Agent creates pending request | `envgate request --profile dev --json --no-prompt --agent codex` |
-| Approve normal request | `envgate approve <request-id> --scope session --agent-mediated --json` |
-| Deny request | `envgate deny <request-id> --agent-mediated --json` |
-| Approve critical request once | `envgate approve <request-id> --scope once --confirm-critical --agent-mediated --json` |
-| List grants | `envgate grants list` |
-| Revoke grant | `envgate grants revoke <grant-id>` |
-| Edit vault | `envgate edit` |
-| Show log paths | `envgate logs` |
-| View encrypted logs | `envgate logs view executions` |
-| Verify log chain | `envgate logs verify` |
-| Remove EnvGate from project | `envgate teardown --yes` |
+| One-command onboarding | `ward init --project my-app` |
+| Check project safety | `ward doctor` |
+| Refresh vault unlock for runs | `ward unlock --ttl 8h` |
+| Lock session grants and unlocks | `ward lock` |
+| Allow safe dev profile | `ward allow --profile dev --scope always --agent codex` |
+| Run dev profile | `ward dev --agent codex` |
+| Run migrate profile | `ward migrate --agent codex` |
+| Manual plaintext env | `ward env unlock && pnpm dev && ward env lock` |
+| List projects | `ward projects list` |
+| Set encrypted env | `ward env set KEY=value` |
+| Run explicit command | `ward run --env DATABASE_URL -- pnpm dev` |
+| Agent creates pending request | `ward request --profile dev --json --no-prompt --agent codex` |
+| Approve normal request | `ward approve <request-id> --scope session --agent-mediated --json` |
+| Deny request | `ward deny <request-id> --agent-mediated --json` |
+| Approve critical request once | `ward approve <request-id> --scope once --confirm-critical --agent-mediated --json` |
+| List grants | `ward grants list` |
+| Revoke grant | `ward grants revoke <grant-id>` |
+| Edit vault | `ward edit` |
+| Show log paths | `ward logs` |
+| View encrypted logs | `ward logs view executions` |
+| Verify log chain | `ward logs verify` |
+| Remove Ward from project | `ward teardown --yes` |
 
 ## Short Talk Track
 
-Use this when presenting EnvGate quickly:
+Use this when presenting Ward quickly:
 
 1. Setup encrypts `.env` into `.env.vault` and replaces `.env` with a locked marker.
-2. Agents use profiles like `envgate dev` instead of reading `.env`.
+2. Agents use profiles like `ward dev` instead of reading `.env`.
 3. Grants reduce approval noise but do not decrypt secrets by themselves.
-4. Unlock sessions let EnvGate decrypt internally for a limited time.
+4. Unlock sessions let Ward decrypt internally for a limited time.
 5. Critical commands like `printenv` require a second, once-only confirmation.
 6. Every protected secret-bearing action writes encrypted tamper-evident logs.

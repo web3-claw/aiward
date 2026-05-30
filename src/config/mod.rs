@@ -9,13 +9,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{approvals::ApprovalScope, policy::ApprovalMode};
 
-pub const PROJECT_CONFIG_FILE: &str = ".envgate.json";
+pub const PROJECT_CONFIG_FILE: &str = ".ward.json";
 pub const DEFAULT_VAULT_FILE: &str = ".env.vault";
 pub const AGENT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 pub const CLAUDE_INSTRUCTIONS_FILE: &str = "CLAUDE.md";
 
-const ENV_EXAMPLE_HEADER: &str = "# EnvGate managed environment.\n# Plaintext .env files should not be committed or shared with AI agents.\n# Agents should request scoped access with envgate request, then run approved commands with envgate run.\n\n";
-const AGENT_INSTRUCTIONS_MARKER: &str = "<!-- envgate-agent-instructions -->";
+const ENV_EXAMPLE_HEADER: &str = "# Ward managed environment.\n# Plaintext .env files should not be committed or shared with AI agents.\n# Agents should request scoped access with ward request, then run approved commands with ward run.\n\n";
+const AGENT_INSTRUCTIONS_MARKER: &str = "<!-- ward-agent-instructions -->";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -225,7 +225,7 @@ pub fn ensure_env_example(cwd: &Path) -> Result<Option<PathBuf>> {
     if path.exists() {
         let contents =
             fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
-        if contents.contains("EnvGate managed environment") {
+        if contents.contains("Ward managed environment") {
             return Ok(None);
         }
 
@@ -275,9 +275,9 @@ pub fn ensure_agent_instructions(cwd: &Path, project: &str) -> Result<Option<Pat
 fn agent_instructions_section(project: &str) -> String {
     format!(
         r#"{AGENT_INSTRUCTIONS_MARKER}
-# EnvGate Secret Access
+# Ward Secret Access
 
-This repository uses EnvGate for local secret access. Do not read, print, copy,
+This repository uses Ward for local secret access. Do not read, print, copy,
 or modify plaintext `.env` files. Request only the env vars needed for the
 declared command.
 
@@ -286,28 +286,28 @@ Project: {project}
 Use profiles where available:
 
 ```bash
-envgate request --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
-envgate run --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
-envgate dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
-envgate migrate --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
+ward request --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
+ward run --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
+ward dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
+ward migrate --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
 ```
 
 Profiles are the user-facing command layer. They map a short name such as
 `dev` or `migrate` to one command and exact env names. Presets may be added to
-`.envgate.json` as lower-level policy rules for raw command matching and
+`.ward.json` as lower-level policy rules for raw command matching and
 approval behavior; prefer profiles unless a profile does not exist.
 
 No-prompt agent calls must always send full context up front: `--agent`,
 `--worktree`, `--branch`, `--git-remote`, `--commit`, `--action`, and either
 `--profile` or an exact `--command` plus exact `--env` names. Do not wait for
-EnvGate to ask follow-up questions. EnvGate verifies the claimed branch, remote,
+Ward to ask follow-up questions. Ward verifies the claimed branch, remote,
 commit, and worktree path locally before creating or reusing approvals.
 For repositories with no `origin` remote, pass `--git-remote ""` explicitly.
 
 Manual request template:
 
 ```bash
-envgate request \
+ward request \
   --agent <agent-name> \
   --worktree <absolute-path> \
   --branch <branch-name> \
@@ -336,29 +336,29 @@ After the user approves in the agent UI, record that approval with the matching
 approve command:
 
 ```bash
-envgate unlock --ttl 8h
-envgate approve <request-id> --scope <session|branch|always> --agent-mediated --json
+ward unlock --ttl 8h
+ward approve <request-id> --scope <session|branch|always> --agent-mediated --json
 ```
 
-Approvals are signed. If `envgate approve` or `envgate allow` reports
+Approvals are signed. If `ward approve` or `ward allow` reports
 `"status": "unlock_required"` or `signing_key_unavailable`, ask the user to run
-`envgate unlock --ttl 8h` and then retry the approval. Never ask the user for
+`ward unlock --ttl 8h` and then retry the approval. Never ask the user for
 the PIN/passphrase directly.
 
 If a no-prompt command returns `"unlockRequired": true`, ask the user to run:
 
 ```bash
-envgate unlock --ttl 8h
+ward unlock --ttl 8h
 ```
 
 This usually means the init/setup-created unlock expired, setup was run with
-`--no-unlock`, or the user explicitly ran `envgate lock`.
+`--no-unlock`, or the user explicitly ran `ward lock`.
 
 If a no-prompt command returns `"status": "vault_key_missing"`, do not ask the
 user to unlock again. The broker is already reachable, but the approved profile
 or command requested an env var that is not present in `.env.vault`. Surface
-`missingEnv` and ask the user to update `.envgate.json` or run `envgate env
-unlock`, add the missing key, then run `envgate env lock`.
+`missingEnv` and ask the user to update `.ward.json` or run `ward env
+unlock`, add the missing key, then run `ward env lock`.
 
 If the JSON response contains `"confirmationRequired": true`, show the
 `confirmation.title`, `confirmation.body`, and recommended action to the user.
@@ -367,14 +367,14 @@ auto-approve it and do not create a durable grant. Critical requests can only be
 denied or approved once:
 
 ```bash
-envgate deny <request-id> --agent-mediated --json
-envgate approve <request-id> --scope once --confirm-critical --agent-mediated --json
+ward deny <request-id> --agent-mediated --json
+ward approve <request-id> --scope once --confirm-critical --agent-mediated --json
 ```
 
 Run template:
 
 ```bash
-envgate run \
+ward run \
   --agent <agent-name> \
   --worktree <absolute-path> \
   --branch <branch-name> \
@@ -387,18 +387,18 @@ envgate run \
   -- <command> <args>
 ```
 
-All EnvGate flags must appear before `--`. Everything after `--` is the child
+All Ward flags must appear before `--`. Everything after `--` is the child
 command and its arguments, so do not put `--json`, `--no-prompt`, `--agent`, or
-other EnvGate flags after `--`.
+other Ward flags after `--`.
 
-EnvGate is passive: commands that need secrets must be run through
-`envgate run`. Automatic worktree delivery means EnvGate injects scoped
+Ward is passive: commands that need secrets must be run through
+`ward run`. Automatic worktree delivery means Ward injects scoped
 environment variables into the approved child process. It does not write
 plaintext `.env` files for agents.
 
-Never ask for, echo, store, or pipe the EnvGate vault PIN/passphrase.
-`envgate init` and `envgate setup` create the initial run unlock by default; the
-user may run `envgate unlock --ttl 8h` locally later to refresh it. Viewing
+Never ask for, echo, store, or pipe the Ward vault PIN/passphrase.
+`ward init` and `ward setup` create the initial run unlock by default; the
+user may run `ward unlock --ttl 8h` locally later to refresh it. Viewing
 decrypted logs always requires the user's PIN/passphrase. Agent-mediated
 approvals are logged trust events, not cryptographic proof of human approval.
 "#
@@ -557,7 +557,7 @@ mod tests {
         let path = ensure_env_example(tempdir.path()).unwrap().unwrap();
         assert!(std::fs::read_to_string(&path)
             .unwrap()
-            .contains("EnvGate managed environment"));
+            .contains("Ward managed environment"));
         assert!(ensure_env_example(tempdir.path()).unwrap().is_none());
     }
 
@@ -572,7 +572,7 @@ mod tests {
             Some(path.clone())
         );
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.starts_with("# EnvGate managed environment."));
+        assert!(contents.starts_with("# Ward managed environment."));
         assert!(contents.contains("DATABASE_URL="));
     }
 
@@ -605,7 +605,7 @@ mod tests {
         assert!(contents.contains("Project: claude-demo"));
         assert!(contents.contains("Profiles are the user-facing command layer"));
         assert!(contents.contains("Presets may be added"));
-        assert!(contents.contains("All EnvGate flags must appear before `--`"));
+        assert!(contents.contains("All Ward flags must appear before `--`"));
 
         let tempdir = tempfile::tempdir().unwrap();
         let claude_path = tempdir.path().join(CLAUDE_INSTRUCTIONS_FILE);
@@ -616,7 +616,7 @@ mod tests {
             Some(claude_path.clone())
         );
         let contents = std::fs::read_to_string(&claude_path).unwrap();
-        assert!(contents.contains("# Existing instructions\n\n<!-- envgate-agent-instructions -->"));
+        assert!(contents.contains("# Existing instructions\n\n<!-- ward-agent-instructions -->"));
     }
 
     #[test]

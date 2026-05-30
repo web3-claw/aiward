@@ -68,7 +68,7 @@ mod tests {
             .output()
             .unwrap();
         Command::new("git")
-            .args(["config", "user.name", "EnvGate Tester"])
+            .args(["config", "user.name", "Ward Tester"])
             .current_dir(tempdir.path())
             .output()
             .unwrap();
@@ -85,7 +85,7 @@ mod tests {
 
         let context = collect_git_context(tempdir.path());
 
-        assert_eq!(context.user_name.as_deref(), Some("EnvGate Tester"));
+        assert_eq!(context.user_name.as_deref(), Some("Ward Tester"));
         assert_eq!(context.user_email.as_deref(), Some("tester@example.test"));
         assert_eq!(
             context.remote.as_deref(),

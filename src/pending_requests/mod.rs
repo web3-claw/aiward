@@ -68,7 +68,7 @@ pub struct CriticalConfirmation {
 }
 
 pub fn requests_dir() -> PathBuf {
-    logs::envgate_home().join("requests")
+    logs::ward_home().join("requests")
 }
 
 pub fn pending_request_path(id: uuid::Uuid) -> PathBuf {
@@ -167,14 +167,14 @@ pub fn response_for(pending: &PendingRequest) -> PendingRequestResponse<'_> {
         confirmation_required,
         confirmation: confirmation_required.then(|| critical_confirmation(pending)),
         approve_commands: approve_commands(pending.id, &approval_options, confirmation_required),
-        deny_command: format!("envgate deny {} --agent-mediated", pending.id),
+        deny_command: format!("ward deny {} --agent-mediated", pending.id),
         approval_options,
     }
 }
 
 fn write_pending_request(pending: &PendingRequest) -> Result<()> {
     let path = request_path(pending.id);
-    fs_util::ensure_private_dir(&logs::envgate_home())?;
+    fs_util::ensure_private_dir(&logs::ward_home())?;
     fs_util::ensure_private_parent_dir(&path)?;
     let contents =
         serde_json::to_string_pretty(pending).expect("pending request serialization is infallible");
@@ -190,9 +190,9 @@ fn critical_confirmation(pending: &PendingRequest) -> CriticalConfirmation {
         title: "Critical secret exposure warning",
         body: "This request matched deterministic secret-exfiltration patterns. Approve only if you explicitly expect this exact command to inspect, print, transform, copy, or transmit secrets.".to_string(),
         recommended_action: "deny",
-        deny_command: format!("envgate deny {} --agent-mediated", pending.id),
+        deny_command: format!("ward deny {} --agent-mediated", pending.id),
         approve_once_command: format!(
-            "envgate approve {} --scope once --confirm-critical --agent-mediated",
+            "ward approve {} --scope once --confirm-critical --agent-mediated",
             pending.id
         ),
     }
@@ -232,7 +232,7 @@ fn approve_commands(
             ApprovalCommand {
                 scope,
                 command: format!(
-                    "envgate approve {request_id} --scope {}{confirm} --agent-mediated",
+                    "ward approve {request_id} --scope {}{confirm} --agent-mediated",
                     scope.as_cli_value()
                 ),
             }
@@ -308,7 +308,7 @@ mod tests {
     fn creates_loads_consumes_and_summarizes_pending_request() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
 
         let created =
             create_pending_request(pending().access, pending().policy, GitContext::default())
@@ -324,7 +324,7 @@ mod tests {
         assert_eq!(consume_pending_request(created.id).unwrap().id, created.id);
         assert!(load_pending_request(created.id).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -332,14 +332,14 @@ mod tests {
     fn expired_pending_request_is_rejected() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
         let mut pending = pending();
         pending.expires_at = Utc::now() - Duration::minutes(1);
         write_pending_request(&pending).unwrap();
 
         assert!(load_pending_request(pending.id).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -371,7 +371,7 @@ mod tests {
         assert!(confirmation
             .approve_once_command
             .contains("--confirm-critical"));
-        assert!(confirmation.deny_command.contains("envgate deny"));
+        assert!(confirmation.deny_command.contains("ward deny"));
     }
 
     #[test]
@@ -404,14 +404,14 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let blocked_home = tempdir.path().join("blocked-home");
         std::fs::write(&blocked_home, "").unwrap();
-        std::env::set_var("ENVGATE_HOME", &blocked_home);
+        std::env::set_var("WARD_HOME", &blocked_home);
 
         assert!(
             create_pending_request(pending().access, pending().policy, GitContext::default())
                 .is_err()
         );
 
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
         let invalid_id = uuid::Uuid::new_v4();
         let path = request_path(invalid_id);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -444,7 +444,7 @@ mod tests {
             std::fs::remove_file(remove_path).unwrap();
         }
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -452,7 +452,7 @@ mod tests {
     fn removes_project_pending_requests_and_exposes_cli_scope_values() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
 
         assert_eq!(remove_project_requests("demo").unwrap(), 0);
 
@@ -478,6 +478,6 @@ mod tests {
         std::fs::write(request_path(demo.id), "{bad-json}").unwrap();
         assert!(remove_project_requests("demo").is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 }

@@ -1,5 +1,5 @@
 [package]
-name = "envgate"
+name = "ward"
 version = "0.1.0"
 edition = "2021"
 description = "Local-first AI secret firewall for development environments."

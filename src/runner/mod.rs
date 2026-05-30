@@ -256,7 +256,7 @@ fn redact_exact_secret_values(line: &str, candidates: &[RedactionCandidate]) -> 
 
     for candidate in candidates {
         if should_exact_redact(candidate) && redacted.contains(&candidate.value) {
-            redacted = redacted.replace(&candidate.value, "[ENVGATE_REDACTED]");
+            redacted = redacted.replace(&candidate.value, "[WARD_REDACTED]");
             hit = true;
         }
     }
@@ -298,7 +298,7 @@ fn redact_secret_assignments(line: &str) -> (String, bool) {
             if let Some((key, _value)) = token.split_once('=') {
                 if is_secret_like_key(key) {
                     hit = true;
-                    return format!("{key}=[ENVGATE_REDACTED]");
+                    return format!("{key}=[WARD_REDACTED]");
                 }
             }
             token.to_string()
@@ -384,7 +384,7 @@ mod tests {
             &[redaction_candidate("DATABASE_URL", "postgres://secret")],
         );
 
-        assert_eq!(redacted, "db=[ENVGATE_REDACTED]");
+        assert_eq!(redacted, "db=[WARD_REDACTED]");
         assert!(alerts
             .iter()
             .any(|alert| alert.code == "output.secret_redacted"));
@@ -394,7 +394,7 @@ mod tests {
     fn redacts_secret_shaped_assignments() {
         let (redacted, alerts) = inspect_output_line("stdout", "OPENAI_API_KEY=sk-local", &[]);
 
-        assert_eq!(redacted, "OPENAI_API_KEY=[ENVGATE_REDACTED]");
+        assert_eq!(redacted, "OPENAI_API_KEY=[WARD_REDACTED]");
         assert!(alerts
             .iter()
             .any(|alert| alert.code == "output.secret_assignment"));
@@ -421,7 +421,7 @@ mod tests {
             "public token sk-live-public",
             &[redaction_candidate("NEXT_PUBLIC_API_KEY", "sk-live-public")],
         );
-        assert_eq!(redacted, "public token [ENVGATE_REDACTED]");
+        assert_eq!(redacted, "public token [WARD_REDACTED]");
         assert!(alerts
             .iter()
             .any(|alert| alert.code == "output.secret_redacted"));

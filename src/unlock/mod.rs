@@ -67,7 +67,7 @@ struct UnlockState {
 }
 
 pub fn unlocks_path() -> PathBuf {
-    logs::envgate_home().join("sessions").join("unlocks.json")
+    logs::ward_home().join("sessions").join("unlocks.json")
 }
 
 pub fn parse_ttl(value: &str) -> Result<Duration> {
@@ -341,7 +341,7 @@ fn load_state(path: &Path) -> Result<UnlockState> {
 fn write_state(path: &Path, state: &UnlockState) -> Result<()> {
     let contents =
         serde_json::to_string_pretty(state).expect("unlock state serialization is infallible");
-    fs_util::ensure_private_dir(&logs::envgate_home())?;
+    fs_util::ensure_private_dir(&logs::ward_home())?;
     fs_util::write_private_file(path, format!("{contents}\n").as_bytes())
 }
 
@@ -391,8 +391,8 @@ mod tests {
     fn run_and_logs_unlocks_are_scoped_and_clearable() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
 
         create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).unwrap();
@@ -406,8 +406,8 @@ mod tests {
         assert_eq!(clear_all_unlocks().unwrap(), 2);
         assert!(active_run_passphrase("demo", &vault).unwrap().is_none());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -415,8 +415,8 @@ mod tests {
     fn run_unlock_lookup_distinguishes_missing_available_and_unavailable_material() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
 
         assert_eq!(
@@ -432,7 +432,7 @@ mod tests {
         ));
         assert!(create_run_unlock("demo", &vault, "wrong-passphrase", Duration::hours(1)).is_err());
 
-        let key_store_path = crate::logs::envgate_home()
+        let key_store_path = crate::logs::ward_home()
             .join("cache")
             .join("keystore.json");
         std::fs::remove_file(&key_store_path).unwrap();
@@ -450,8 +450,8 @@ mod tests {
         ));
         assert!(active_run_passphrase("demo", &vault).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -459,8 +459,8 @@ mod tests {
     fn signing_key_lookup_reports_missing_unreadable_and_bad_ciphertext() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
 
         create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).unwrap();
@@ -476,7 +476,7 @@ mod tests {
         ));
 
         create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).unwrap();
-        let key_store_path = crate::logs::envgate_home()
+        let key_store_path = crate::logs::ward_home()
             .join("cache")
             .join("keystore.json");
         std::fs::remove_file(&key_store_path).unwrap();
@@ -508,8 +508,8 @@ mod tests {
             RunSigningLookup::MaterialUnavailable { reason } if reason.starts_with("signing_key_unavailable:")
         ));
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -517,8 +517,8 @@ mod tests {
     fn clears_only_one_projects_unlock_sessions() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let demo_vault = tempdir.path().join("demo.env.vault");
         let other_vault = tempdir.path().join("other.env.vault");
 
@@ -544,8 +544,8 @@ mod tests {
             Some("other-passphrase")
         );
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -553,8 +553,8 @@ mod tests {
     fn expired_unlock_is_removed() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
 
         create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).unwrap();
@@ -564,8 +564,8 @@ mod tests {
 
         assert!(active_run_passphrase("demo", &vault).unwrap().is_none());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -573,8 +573,8 @@ mod tests {
     fn replacing_unlock_removes_previous_secret_and_load_errors_surface() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
 
         let first = create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).unwrap();
@@ -591,8 +591,8 @@ mod tests {
         std::fs::write(unlocks_path(), "{bad-json}").unwrap();
         assert!(active_run_passphrase("demo", &vault).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -600,8 +600,8 @@ mod tests {
     fn unlock_storage_and_key_store_failures_are_reported() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
 
         std::fs::create_dir_all(unlocks_path().parent().unwrap()).unwrap();
@@ -616,7 +616,7 @@ mod tests {
         assert!(write_state(&unlocks_path(), &UnlockState::default()).is_err());
         std::fs::remove_dir(unlocks_path()).unwrap();
 
-        let key_store_path = crate::logs::envgate_home()
+        let key_store_path = crate::logs::ward_home()
             .join("cache")
             .join("keystore.json");
         std::fs::create_dir_all(key_store_path.parent().unwrap()).unwrap();
@@ -643,7 +643,7 @@ mod tests {
         std::fs::write(&sessions_dir, "").unwrap();
         assert!(create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 }

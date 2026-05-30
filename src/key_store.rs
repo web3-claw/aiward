@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{fs_util, logs};
 
 #[cfg(not(coverage))]
-const SERVICE: &str = "envgate";
+const SERVICE: &str = "ward";
 
 #[cfg(coverage)]
 pub fn set_secret(name: &str, secret: &str) -> Result<()> {
@@ -77,17 +77,17 @@ pub fn delete_secret(name: &str) -> Result<()> {
 
 #[cfg(not(coverage))]
 fn use_keychain_store() -> bool {
-    std::env::var("ENVGATE_KEYCHAIN")
+    std::env::var("WARD_KEYCHAIN")
         .ok()
         .is_some_and(|value| value == "1")
 }
 
 fn file_store_path() -> PathBuf {
-    logs::envgate_home().join("cache").join("keystore.json")
+    logs::ward_home().join("cache").join("keystore.json")
 }
 
 fn legacy_file_store_path() -> PathBuf {
-    logs::envgate_home().join("cache").join("test-keyring.json")
+    logs::ward_home().join("cache").join("test-keyring.json")
 }
 
 fn set_file_secret(name: &str, secret: &str) -> Result<()> {
@@ -138,12 +138,12 @@ fn migrate_legacy_file_store(path: &Path) -> Result<()> {
 fn write_file_store(path: &Path, store: &FileStore) -> Result<()> {
     let contents =
         serde_json::to_string_pretty(store).expect("file store serialization is infallible");
-    ensure_envgate_home_for(path)?;
+    ensure_ward_home_for(path)?;
     fs_util::write_private_file(path, format!("{contents}\n").as_bytes())
 }
 
-fn ensure_envgate_home_for(path: &Path) -> Result<()> {
-    let home = logs::envgate_home();
+fn ensure_ward_home_for(path: &Path) -> Result<()> {
+    let home = logs::ward_home();
     if path.starts_with(&home) {
         fs_util::ensure_private_dir(&home)?;
     }
@@ -170,8 +170,8 @@ mod tests {
     fn file_store_sets_gets_and_deletes_secrets() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
 
         set_secret("demo", "secret").unwrap();
         assert!(file_store_path().ends_with("cache/keystore.json"));
@@ -179,8 +179,8 @@ mod tests {
         delete_secret("demo").unwrap();
         assert!(get_secret("demo").unwrap().is_none());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -188,7 +188,7 @@ mod tests {
     fn migrates_legacy_test_keyring_file_to_keystore() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
         let legacy = legacy_file_store_path();
         std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         std::fs::write(&legacy, r#"{"entries":{"demo":"secret"}}"#).unwrap();
@@ -197,7 +197,7 @@ mod tests {
         assert!(file_store_path().exists());
         assert!(!legacy.exists());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -205,13 +205,13 @@ mod tests {
     #[cfg(not(coverage))]
     fn keychain_is_explicit_opt_in_only() {
         let _guard = env_lock();
-        std::env::remove_var("ENVGATE_KEYCHAIN");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::remove_var("WARD_KEYCHAIN");
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         assert!(!use_keychain_store());
-        std::env::set_var("ENVGATE_KEYCHAIN", "1");
+        std::env::set_var("WARD_KEYCHAIN", "1");
         assert!(use_keychain_store());
-        std::env::remove_var("ENVGATE_KEYCHAIN");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_KEYCHAIN");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -233,8 +233,8 @@ mod tests {
     fn file_store_operations_report_corrupt_store() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let path = file_store_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{bad-json}").unwrap();
@@ -243,7 +243,7 @@ mod tests {
         assert!(get_secret("demo").is_err());
         assert!(delete_secret("demo").is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 }

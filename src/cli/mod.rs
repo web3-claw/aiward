@@ -46,7 +46,7 @@ impl std::error::Error for ChildExit {}
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "envgate",
+    name = "ward",
     version,
     about = "AI secret firewall for local development"
 )]
@@ -80,7 +80,7 @@ pub enum Commands {
         #[arg(long)]
         no_unlock: bool,
     },
-    /// Create .envgate.json and baseline local files.
+    /// Create .ward.json and baseline local files.
     Init {
         #[arg(long)]
         project: Option<String>,
@@ -95,7 +95,7 @@ pub enum Commands {
         #[arg(long)]
         vault: Option<PathBuf>,
     },
-    /// Register the current project in ~/.envgate/registry.json.
+    /// Register the current project in ~/.ward/registry.json.
     Register {
         project: String,
         #[arg(long)]
@@ -105,7 +105,7 @@ pub enum Commands {
     },
     /// Select an already registered project as the active project.
     Use { project: String },
-    /// Manage globally registered EnvGate projects.
+    /// Manage globally registered Ward projects.
     Projects {
         #[command(subcommand)]
         command: ProjectsCommand,
@@ -210,7 +210,7 @@ pub enum Commands {
         no_prompt: bool,
         #[arg(
             last = true,
-            help = "Child command and args after --. Put all EnvGate flags before --."
+            help = "Child command and args after --. Put all Ward flags before --."
         )]
         command: Vec<String>,
     },
@@ -252,9 +252,9 @@ pub enum Commands {
         #[arg(long)]
         no_prompt: bool,
     },
-    /// Validate the current EnvGate setup.
+    /// Validate the current Ward setup.
     Doctor,
-    /// Inspect and control the local EnvGate broker.
+    /// Inspect and control the local Ward broker.
     Broker {
         #[command(subcommand)]
         command: BrokerCommand,
@@ -280,7 +280,7 @@ pub enum Commands {
     },
     /// Clear unlock sessions and revoke session-scoped approval grants.
     Lock,
-    /// Export plaintext env and remove EnvGate files from a project.
+    /// Export plaintext env and remove Ward files from a project.
     Teardown {
         #[arg(long)]
         project: Option<String>,
@@ -1034,7 +1034,7 @@ fn setup(options: SetupOptions) -> Result<()> {
         if source_is_locked {
             if !vault_path.exists() {
                 anyhow::bail!(
-                    "{} is an EnvGate locked marker but {} is missing; restore a plaintext dotenv file or the vault before setup",
+                    "{} is an Ward locked marker but {} is missing; restore a plaintext dotenv file or the vault before setup",
                     options.source.display(),
                     vault_path.display()
                 );
@@ -1092,7 +1092,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                     return Err(error);
                 }
                 println!(
-                    "Warning: setup completed, but broker unlock failed: {error}. Run envgate unlock --ttl {} before running protected commands.",
+                    "Warning: setup completed, but broker unlock failed: {error}. Run ward unlock --ttl {} before running protected commands.",
                     options.unlock_ttl
                 );
                 None
@@ -1116,7 +1116,7 @@ fn setup(options: SetupOptions) -> Result<()> {
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
 
-    println!("EnvGate setup complete.");
+    println!("Ward setup complete.");
     println!("Config: {}", config_path.display());
     println!("Vault: {}", vault_path.display());
     println!("Gitignore: {}", gitignore.display());
@@ -1128,10 +1128,10 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
     if let Some(session) = &unlock_session {
         println!("Vault unlocked until {}.", session.expires_at.to_rfc3339());
-        println!("Next: envgate dev");
+        println!("Next: ward dev");
     } else {
-        println!("Next: envgate unlock --ttl {}", options.unlock_ttl);
-        println!("Then: envgate dev");
+        println!("Next: ward unlock --ttl {}", options.unlock_ttl);
+        println!("Then: ward dev");
     }
     if locked_env {
         println!("Locked env: {}", options.source.display());
@@ -1182,7 +1182,7 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
         println!("Created or updated {}", path.display());
     }
     if cwd.join(".env").exists() {
-        println!("Warning: plaintext .env exists. Run envgate import .env, then remove .env.");
+        println!("Warning: plaintext .env exists. Run ward import .env, then remove .env.");
     }
 
     Ok(())
@@ -1191,7 +1191,7 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
 fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     let cwd = env::current_dir()?;
     let mut config = config::read_project_config(&cwd)
-        .context("missing .envgate.json; run envgate init first")?;
+        .context("missing .ward.json; run ward init first")?;
     let vault_path = match explicit_vault {
         Some(vault) => {
             config.vault = vault.clone();
@@ -1206,7 +1206,7 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     };
     if env_file::is_locked_env_file(&source)? {
         anyhow::bail!(
-            "{} is already an EnvGate locked marker; use envgate env unlock to restore plaintext before importing",
+            "{} is already an Ward locked marker; use ward env unlock to restore plaintext before importing",
             source.display()
         );
     }
@@ -1236,7 +1236,7 @@ fn register(project: String, path: Option<PathBuf>, explicit_vault: Option<PathB
         Some(vault) => project_path.join(vault),
         None => {
             let project_config = config::read_project_config(&project_path)
-                .context("missing .envgate.json; run envgate init first")?;
+                .context("missing .ward.json; run ward init first")?;
             config::resolve_vault_path(&project_path, &project_config)
         }
     };
@@ -1250,7 +1250,7 @@ fn register(project: String, path: Option<PathBuf>, explicit_vault: Option<PathB
 
 fn use_project(project: &str) -> Result<()> {
     registry::set_active_project(project)?;
-    println!("Active EnvGate project: {project}");
+    println!("Active Ward project: {project}");
     Ok(())
 }
 
@@ -1303,7 +1303,7 @@ fn broker_command(command: BrokerCommand) -> Result<()> {
         }
         BrokerCommand::Stop => {
             broker::stop()?;
-            println!("EnvGate broker stopped.");
+            println!("Ward broker stopped.");
         }
         BrokerCommand::SocketPath => println!("{}", broker::socket_path().display()),
     }
@@ -1429,7 +1429,7 @@ fn env_command(command: EnvCommand) -> Result<()> {
             env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)?;
             log_env_file_event("env.unlock", &resolved, Some(&output), None)?;
             println!("Wrote plaintext env {}", output.display());
-            println!("Run envgate env lock when you are done.");
+            println!("Run ward env lock when you are done.");
         }
         EnvCommand::Lock { project, source } => {
             let resolved = resolve_env_project(project.as_deref())?;
@@ -1506,22 +1506,22 @@ fn refresh_broker_after_env_lock(
 ) -> Result<()> {
     let Some(expires_at) = active_broker_expires_at else {
         println!(
-            "No active agent unlock session. Run envgate unlock --ttl 8h if agents need access."
+            "No active agent unlock session. Run ward unlock --ttl 8h if agents need access."
         );
         return Ok(());
     };
     let Some(ttl) = remaining_session_ttl(expires_at, chrono::Utc::now()) else {
         println!(
-            "No active agent unlock session. Run envgate unlock --ttl 8h if agents need access."
+            "No active agent unlock session. Run ward unlock --ttl 8h if agents need access."
         );
         return Ok(());
     };
 
     if let Err(error) = broker::unlock_project(&resolved.name, &resolved.vault, passphrase, ttl) {
         eprintln!(
-            "Warning: .env was locked, but EnvGate could not refresh the active agent unlock session: {error}"
+            "Warning: .env was locked, but Ward could not refresh the active agent unlock session: {error}"
         );
-        anyhow::bail!("active agent unlock session refresh failed; run envgate unlock --ttl 8h");
+        anyhow::bail!("active agent unlock session refresh failed; run ward unlock --ttl 8h");
     }
 
     println!(
@@ -1610,8 +1610,8 @@ fn enforce_worktree_for_no_prompt(
                 branch: &request.branch,
                 commit: &request.commit,
                 reason: &request.reason,
-                approve_command: format!("envgate worktrees approve {}", request.id),
-                deny_command: format!("envgate worktrees deny {}", request.id),
+                approve_command: format!("ward worktrees approve {}", request.id),
+                deny_command: format!("ward worktrees deny {}", request.id),
             };
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(false)
@@ -1744,7 +1744,7 @@ fn allow(
         None => anyhow::bail!("--scope is required unless --profile is used"),
     };
     if matches!(scope, ApprovalScope::Once | ApprovalScope::Deny) {
-        anyhow::bail!("envgate allow supports session, branch, and always scopes");
+        anyhow::bail!("ward allow supports session, branch, and always scopes");
     }
 
     let git = git_context::collect_git_context(&cwd);
@@ -1760,7 +1760,7 @@ fn allow(
     let evaluation = evaluate_access(&config, &access);
     if detection::has_critical_findings(&evaluation.findings) {
         anyhow::bail!(
-            "critical exploit findings cannot be stored as durable allow grants; use envgate request and approve once with --confirm-critical"
+            "critical exploit findings cannot be stored as durable allow grants; use ward request and approve once with --confirm-critical"
         );
     }
     approvals::validate_scope_for_findings(scope, &evaluation.findings)?;
@@ -1881,7 +1881,7 @@ fn approve_inner(
     agent_mediated: bool,
 ) -> Result<ApproveJsonResponse> {
     if scope == ApprovalScope::Deny {
-        anyhow::bail!("use envgate deny for denied requests");
+        anyhow::bail!("use ward deny for denied requests");
     }
     let pending = pending_requests::load_pending_request(request_id)?;
     let cwd = env::current_dir()?;
@@ -1995,7 +1995,7 @@ fn is_unlock_or_signing_error(error: &anyhow::Error) -> bool {
         || message.contains("unlock_required")
         || message.contains("missing broker unlock session")
         || message.contains("expired broker unlock session")
-        || message.contains("EnvGate broker is unavailable")
+        || message.contains("Ward broker is unavailable")
 }
 
 fn print_unlock_required_json(reason: String) -> Result<()> {
@@ -2004,7 +2004,7 @@ fn print_unlock_required_json(reason: String) -> Result<()> {
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "unlock_required",
             "reason": reason,
-            "unlockCommand": "envgate unlock --ttl 8h",
+            "unlockCommand": "ward unlock --ttl 8h",
         }))?
     );
     Ok(())
@@ -2142,7 +2142,7 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
 
     if !decision.approved {
-        anyhow::bail!("EnvGate access denied");
+        anyhow::bail!("Ward access denied");
     }
 
     let grant_id = effective_grant_id(&decision, persisted_grant.as_ref());
@@ -2271,9 +2271,9 @@ fn reject_misplaced_run_flags(command: &[String]) -> Result<bool> {
     }
     let response = InvalidInvocationResponse {
         status: "invalid_invocation",
-        reason: "envgate_flags_after_separator",
-        message: "Move EnvGate flags before --.",
-        correct_example: "envgate run --json --no-prompt --env DATABASE_URI -- <command>",
+        reason: "ward_flags_after_separator",
+        message: "Move Ward flags before --.",
+        correct_example: "ward run --json --no-prompt --env DATABASE_URI -- <command>",
     };
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(true)
@@ -2284,7 +2284,7 @@ fn doctor() -> Result<()> {
     let config_path = config::config_path(&cwd);
     let plaintext_env = cwd.join(".env");
 
-    println!("EnvGate doctor");
+    println!("Ward doctor");
     println!("{} {}", marker(config_path.exists()), config_path.display());
 
     match config::read_project_config(&cwd) {
@@ -2297,7 +2297,7 @@ fn doctor() -> Result<()> {
             println!("! Project config does not parse: {error}");
         }
         Err(_) => {
-            println!("! Project config missing. Run envgate init.");
+            println!("! Project config missing. Run ward init.");
         }
     }
 
@@ -2305,19 +2305,19 @@ fn doctor() -> Result<()> {
         Ok(project_config) => {
             let vault_path = config::resolve_vault_path(&cwd, &project_config);
             match env_file::inspect_env_file(&plaintext_env, &vault_path) {
-                Ok(env_file::EnvFileState::Locked) => println!("[ok] .env is EnvGate locked."),
+                Ok(env_file::EnvFileState::Locked) => println!("[ok] .env is Ward locked."),
                 Ok(env_file::EnvFileState::StaleLocked) => {
-                    println!("! .env is EnvGate locked but stale; run envgate env lock.")
+                    println!("! .env is Ward locked but stale; run ward env lock.")
                 }
                 Ok(env_file::EnvFileState::Plaintext) => {
-                    println!("! Plaintext .env exists. Run envgate env lock.")
+                    println!("! Plaintext .env exists. Run ward env lock.")
                 }
                 Ok(env_file::EnvFileState::Missing) => println!("! .env missing."),
                 Err(error) => println!("! .env state check failed: {error}"),
             }
         }
         Err(_) if plaintext_env.exists() => {
-            println!("! Plaintext .env exists. Run envgate setup or envgate import .env.");
+            println!("! Plaintext .env exists. Run ward setup or ward import .env.");
         }
         Err(_) => println!("! .env missing."),
     }
@@ -2351,11 +2351,11 @@ fn doctor() -> Result<()> {
                         println!("[ok] Active broker unlock session is available.");
                         println!("[ok] Active signing key capability is broker-held.");
                     } else {
-                        println!("! Broker is running without an active session for this project. Run envgate unlock --ttl 8h.");
+                        println!("! Broker is running without an active session for this project. Run ward unlock --ttl 8h.");
                     }
                 }
                 Ok(_) => {
-                    println!("! Broker is not running. Run envgate unlock --ttl 8h.")
+                    println!("! Broker is not running. Run ward unlock --ttl 8h.")
                 }
                 Err(error) => {
                     println!("! Broker status check failed: {error}")
@@ -2391,7 +2391,7 @@ fn doctor() -> Result<()> {
 
     match audit_logs::entry_count(LogKind::Alerts) {
         Ok(0) => println!("[ok] No encrypted alerts logged."),
-        Ok(count) => println!("! Encrypted alerts: {count}. Run envgate logs view alerts."),
+        Ok(count) => println!("! Encrypted alerts: {count}. Run ward logs view alerts."),
         Err(error) => println!("! Alert log check failed: {error}"),
     }
 
@@ -2405,11 +2405,11 @@ fn signing_lookup_message(result: Result<unlock::RunSigningLookup>) -> String {
             "[ok] Active signing key session is readable.".to_string()
         }
         Ok(unlock::RunSigningLookup::Missing) => {
-            "! No active signing key session. Run envgate unlock --ttl 8h.".to_string()
+            "! No active signing key session. Run ward unlock --ttl 8h.".to_string()
         }
         Ok(unlock::RunSigningLookup::MaterialUnavailable { reason }) => {
             format!(
-                "! Active signing key session is unavailable ({reason}). Run envgate unlock --ttl 8h."
+                "! Active signing key session is unavailable ({reason}). Run ward unlock --ttl 8h."
             )
         }
         Err(error) => format!("! Signing key session check failed: {error}"),
@@ -2573,7 +2573,7 @@ fn teardown(
     if output == resolved.path.join(".env") && !restore_env {
         anyhow::bail!("restoring plaintext .env requires --restore-env");
     }
-    if env::var_os("ENVGATE_UNSAFE_TEST_PASSPHRASE").is_none() && !std::io::stdin().is_terminal() {
+    if env::var_os("WARD_UNSAFE_TEST_PASSPHRASE").is_none() && !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "teardown requires the vault PIN/passphrase; --yes only skips destructive confirmation and does not bypass secret export approval"
         );
@@ -2616,7 +2616,7 @@ fn teardown(
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
     println!("Exported plaintext env {}", output.display());
-    println!("Removed EnvGate project {}", resolved.name);
+    println!("Removed Ward project {}", resolved.name);
     println!("Encrypted audit logs were preserved.");
     Ok(())
 }
@@ -2648,7 +2648,7 @@ fn remove_agent_instruction_section(path: &Path) -> Result<bool> {
     }
     let contents =
         fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
-    let Some(index) = contents.find("<!-- envgate-agent-instructions -->") else {
+    let Some(index) = contents.find("<!-- ward-agent-instructions -->") else {
         return Ok(false);
     };
     let retained = contents[..index].trim_end();
@@ -2674,7 +2674,7 @@ fn unlock_logs(ttl: &str) -> Result<()> {
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
     println!(
-        "Log passphrase validated. Note: envgate logs unlock is deprecated; logs view/export prompts every time."
+        "Log passphrase validated. Note: ward logs unlock is deprecated; logs view/export prompts every time."
     );
     println!("Requested TTL {ttl} was ignored.");
     Ok(())
@@ -2690,7 +2690,7 @@ fn ensure_logs_passphrase() -> Result<()> {
 
 fn warn_log_view_access() {
     eprintln!(
-        "EnvGate warning: decrypted logs are for review only. Edits are tamper-evident through the hash chain; deleted logs should be treated as a high-severity signal."
+        "Ward warning: decrypted logs are for review only. Edits are tamper-evident through the hash chain; deleted logs should be treated as a high-severity signal."
     );
 }
 
@@ -2706,7 +2706,7 @@ fn resolve_profile(
             anyhow::bail!("--profile cannot be combined with --command or --env");
         }
         let Some(profile) = config.profiles.get(profile_name) else {
-            anyhow::bail!("profile {profile_name} is not defined in .envgate.json");
+            anyhow::bail!("profile {profile_name} is not defined in .ward.json");
         };
         return Ok(ResolvedProfile {
             command: profile.command.clone(),
@@ -2742,7 +2742,7 @@ fn resolve_run_profile(
             anyhow::bail!("--profile cannot be combined with explicit command args or --env");
         }
         let Some(profile) = config.profiles.get(profile_name) else {
-            anyhow::bail!("profile {profile_name} is not defined in .envgate.json");
+            anyhow::bail!("profile {profile_name} is not defined in .ward.json");
         };
         return Ok(ResolvedProfile {
             command: profile.command.clone(),
@@ -2848,9 +2848,9 @@ fn critical_confirmation_for_decision(
 
 fn handle_post_run_logging_result(exit_code: i32, result: Result<()>) -> Result<()> {
     if let Err(error) = result {
-        eprintln!("EnvGate warning: post-run audit logging failed: {error}");
+        eprintln!("Ward warning: post-run audit logging failed: {error}");
         if exit_code == 0 {
-            anyhow::bail!("EnvGate post-run audit logging failed");
+            anyhow::bail!("Ward post-run audit logging failed");
         }
     }
     Ok(())
@@ -2858,7 +2858,7 @@ fn handle_post_run_logging_result(exit_code: i32, result: Result<()>) -> Result<
 
 fn warn_anomaly_failure(result: Result<()>) {
     if let Err(error) = result {
-        eprintln!("EnvGate warning: anomaly detection failed: {error}");
+        eprintln!("Ward warning: anomaly detection failed: {error}");
     }
 }
 
@@ -3023,7 +3023,7 @@ fn print_run_unlock_required(
         env: &access.env,
         findings: &evaluation.findings,
         risk: run_risk_summary(evaluation),
-        unlock_command: "envgate unlock --ttl 8h",
+        unlock_command: "ward unlock --ttl 8h",
     };
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -3045,7 +3045,7 @@ fn print_run_vault_key_missing(
         findings: &evaluation.findings,
         risk: run_risk_summary(evaluation),
         message: "One or more approved env vars are not present in the vault.",
-        remediation: "Update .envgate.json to request only vault-present keys, or run envgate env unlock, add the missing key, then envgate env lock.",
+        remediation: "Update .ward.json to request only vault-present keys, or run ward env unlock, add the missing key, then ward env lock.",
     };
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -3139,9 +3139,9 @@ fn verified_agent_key_id(context: Option<&context::VerifiedContext>) -> Option<&
 pub fn coverage_exercise_cli_edges() -> Result<()> {
     let old_cwd = env::current_dir()?;
     let home = tempfile::tempdir()?;
-    env::set_var("ENVGATE_HOME", home.path());
-    env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-    env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+    env::set_var("WARD_HOME", home.path());
+    env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+    env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
 
     let project = tempfile::tempdir()?;
     env::set_current_dir(project.path())?;
@@ -3480,7 +3480,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     fs::write(&no_marker, "Intro\n")?;
     let _ = remove_agent_instruction_section(&no_marker)?;
     let retained = project.path().join("AGENTS.retained.md");
-    let retained_contents = "Intro\n\n<!-- envgate-agent-instructions -->\nGenerated\n";
+    let retained_contents = "Intro\n\n<!-- ward-agent-instructions -->\nGenerated\n";
     fs::write(&retained, retained_contents)?;
     let _ = remove_agent_instruction_section(&retained)?;
 
@@ -3754,9 +3754,9 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     crate::broker::coverage_exercise_broker_edges()?;
 
     env::set_current_dir(old_cwd)?;
-    env::remove_var("ENVGATE_HOME");
-    env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-    env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+    env::remove_var("WARD_HOME");
+    env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+    env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     Ok(())
 }
 
@@ -3932,7 +3932,7 @@ mod tests {
     fn broker_and_worktree_command_helpers_execute_all_branches() {
         let _guard = cwd_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         broker_command(BrokerCommand::SocketPath).unwrap();
         broker_command(BrokerCommand::Status).unwrap();
@@ -3969,7 +3969,7 @@ mod tests {
         })
         .unwrap();
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -3993,7 +3993,7 @@ mod tests {
     fn non_interactive_context_can_auto_approve_without_prompt_or_grant() {
         let _guard = cwd_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         let context = context::VerifiedContext {
             project: "demo".to_string(),
@@ -4015,7 +4015,7 @@ mod tests {
         assert!(decision.approved);
         assert_eq!(decision.source, approvals::ApprovalSource::PolicyAuto);
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     fn access() -> AccessRequest {
@@ -4043,8 +4043,8 @@ mod tests {
     }
 
     fn setup_test_signing_unlock(home: &std::path::Path, project: &str) -> PathBuf {
-        std::env::set_var("ENVGATE_HOME", home);
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", home);
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = home.join(format!("{project}.env.vault"));
         unlock::create_run_unlock(
             project,
@@ -4057,8 +4057,8 @@ mod tests {
     }
 
     fn clear_test_signing_unlock() {
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     #[test]
@@ -4078,9 +4078,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(keep_project.path()).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::fs::write(keep_project.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
         std::fs::write(
             keep_project.path().join(".env"),
@@ -4201,9 +4201,9 @@ mod tests {
         );
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -4214,9 +4214,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::fs::write(project.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
         std::fs::write(
             project.path().join(".env"),
@@ -4245,9 +4245,9 @@ mod tests {
         doctor().unwrap();
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -4286,7 +4286,7 @@ mod tests {
         let retained = tempdir.path().join("retained.md");
         std::fs::write(
             &retained,
-            "Intro\n\n<!-- envgate-agent-instructions -->\nGenerated\n",
+            "Intro\n\n<!-- ward-agent-instructions -->\nGenerated\n",
         )
         .unwrap();
         assert!(remove_agent_instruction_section(&retained).unwrap());
@@ -4355,7 +4355,7 @@ mod tests {
         std::fs::write(&absolute_vault, "placeholder").unwrap();
         let bad_home = project.path().join("not-a-dir");
         std::fs::write(&bad_home, "file").unwrap();
-        std::env::set_var("ENVGATE_HOME", &bad_home);
+        std::env::set_var("WARD_HOME", &bad_home);
 
         let registry_error = setup(SetupOptions {
             yes: false,
@@ -4374,7 +4374,7 @@ mod tests {
         assert!(registry_error.contains("failed to create"));
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -4385,9 +4385,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
 
         let config =
             ProjectConfig::default_for_dir(project.path(), Some("old-demo".to_string())).unwrap();
@@ -4420,9 +4420,9 @@ mod tests {
         );
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -4433,9 +4433,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::fs::write(
             project.path().join(".env"),
             "DATABASE_URL=postgres://coverage\nPAYLOAD_SECRET=payload\n",
@@ -4491,12 +4491,12 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(missing_vault.contains("EnvGate locked marker"));
+        assert!(missing_vault.contains("Ward locked marker"));
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -4507,9 +4507,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::fs::write(project.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
         std::fs::write(
             project.path().join(".env"),
@@ -4535,9 +4535,9 @@ mod tests {
         assert!(project.path().join(".env.vault").exists());
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -4548,9 +4548,9 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         std::env::set_current_dir(project.path()).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::fs::write(project.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
         std::fs::write(
             project.path().join(".env"),
@@ -4732,9 +4732,9 @@ mod tests {
         .unwrap();
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -4743,9 +4743,9 @@ mod tests {
         let _guard = cwd_lock();
         let old_cwd = std::env::current_dir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
 
         let invalid_project = tempfile::tempdir().unwrap();
         std::env::set_current_dir(invalid_project.path()).unwrap();
@@ -4772,7 +4772,7 @@ mod tests {
         let config_blocked = tempfile::tempdir().unwrap();
         std::env::set_current_dir(config_blocked.path()).unwrap();
         std::fs::write(config_blocked.path().join(".env.vault"), "placeholder").unwrap();
-        std::fs::create_dir(config_blocked.path().join(".envgate.json")).unwrap();
+        std::fs::create_dir(config_blocked.path().join(".ward.json")).unwrap();
         let config_error = setup(SetupOptions {
             yes: true,
             project: Some("demo".to_string()),
@@ -4901,9 +4901,9 @@ mod tests {
         };
 
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
 
         assert!(invalid_source.contains("failed to parse"));
         assert!(config_error.contains("failed to write"));
@@ -4922,9 +4922,9 @@ mod tests {
         let old_cwd = std::env::current_dir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::env::set_current_dir(project.path()).unwrap();
         std::fs::write(
             project.path().join(".env"),
@@ -5092,7 +5092,7 @@ mod tests {
             Vec::new(),
         )
         .is_err());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "deny");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "deny");
         assert!(run(RunOptions {
             profile: None,
             project: None,
@@ -5105,7 +5105,7 @@ mod tests {
             no_prompt: false,
         })
         .is_err());
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         allow(
             Some("dev".to_string()),
             None,
@@ -5167,7 +5167,7 @@ mod tests {
             },
         })
         .unwrap();
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "once");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "once");
         run(RunOptions {
             profile: None,
             project: None,
@@ -5184,8 +5184,8 @@ mod tests {
             no_prompt: false,
         })
         .unwrap();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "once");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "once");
         let child_error = run(RunOptions {
             profile: None,
             project: None,
@@ -5202,7 +5202,7 @@ mod tests {
             child_error.downcast_ref::<ChildExit>().unwrap().exit_code(),
             7
         );
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         dispatch(Cli {
             command: Commands::Dev {
                 agent: Some("codex".to_string()),
@@ -5343,9 +5343,9 @@ mod tests {
 
         std::env::set_current_dir(old_cwd).unwrap();
         std::env::remove_var("EDITOR");
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -5355,10 +5355,10 @@ mod tests {
         let old_cwd = std::env::current_dir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "session");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "session");
         std::env::set_current_dir(project.path()).unwrap();
         std::fs::write(
             project.path().join(".env"),
@@ -5417,7 +5417,7 @@ mod tests {
             no_prompt: false,
         })
         .unwrap();
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "deny");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "deny");
         request(
             None,
             AgentContextOptions {
@@ -5432,7 +5432,7 @@ mod tests {
             false,
         )
         .unwrap();
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "session");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "session");
         let pending = pending_requests::create_pending_request(
             AccessRequest {
                 project: "demo".to_string(),
@@ -5567,13 +5567,13 @@ mod tests {
             vec!["DATABASE_URL".to_string()],
         )
         .is_err());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "wrong passphrase");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase");
         assert!(unlock_vault("1h").is_err());
         std::env::set_current_dir(old_cwd).unwrap();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -5616,12 +5616,12 @@ mod tests {
         let reused = decide_access(&access, &evaluation(ApprovalMode::Prompt, true), true).unwrap();
         assert_eq!(reused.source, approvals::ApprovalSource::Grant);
 
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "once");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "once");
         let prompted =
             decide_access(&access, &evaluation(ApprovalMode::Prompt, true), false).unwrap();
         assert_eq!(prompted.source, approvals::ApprovalSource::LocalTty);
 
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         clear_test_signing_unlock();
     }
 
@@ -5631,7 +5631,7 @@ mod tests {
         let _guard = cwd_lock();
         let tempdir = tempfile::tempdir().unwrap();
         let vault = setup_test_signing_unlock(tempdir.path(), "demo");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "once");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "once");
 
         let mut access = access();
         access.command = "sh -c printenv".to_string();
@@ -5671,7 +5671,7 @@ mod tests {
         assert_eq!(reused_once.source, approvals::ApprovalSource::Grant);
         assert_eq!(reused_once.grant_id, Some(once.id));
 
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         clear_test_signing_unlock();
     }
 
@@ -5733,11 +5733,11 @@ mod tests {
         let grants_dir = tempdir.path().join("sessions");
         std::fs::create_dir_all(&grants_dir).unwrap();
         std::fs::write(grants_dir.join("grants.jsonl"), "{bad-json}\n").unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
 
         assert!(decide_access(&access(), &evaluation(ApprovalMode::Prompt, true), true).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -5745,13 +5745,13 @@ mod tests {
     fn decide_access_continues_when_no_grant_matches() {
         let _guard = cwd_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
 
         let decision = decide_access(&access(), &evaluation(ApprovalMode::Auto, false), true)
             .expect("empty grant registry should not block auto approval");
 
         assert_eq!(decision.source, approvals::ApprovalSource::PolicyAuto);
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -5844,9 +5844,9 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let original = std::env::current_dir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
+        std::env::set_var("WARD_HOME", home.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "coverage passphrase");
         std::fs::write(
             tempdir.path().join(".env"),
             "DATABASE_URL=postgres://local\n",
@@ -5857,9 +5857,9 @@ mod tests {
         let result = init(Some("demo".to_string()), false, false);
 
         std::env::set_current_dir(original).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
         assert!(result.is_ok());
         assert!(tempdir.path().join(".env.example").exists());
         assert!(env_file::is_locked_env_file(&tempdir.path().join(".env")).unwrap());
@@ -5872,12 +5872,12 @@ mod tests {
         let original = std::env::current_dir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         std::env::set_current_dir(project.path()).unwrap();
 
         doctor().unwrap();
 
-        std::fs::write(project.path().join(".envgate.json"), "{").unwrap();
+        std::fs::write(project.path().join(".ward.json"), "{").unwrap();
         std::fs::write(
             project.path().join(".env"),
             "DATABASE_URL=postgres://local\n",
@@ -5939,7 +5939,7 @@ mod tests {
         doctor().unwrap();
 
         std::env::set_current_dir(original).unwrap();
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -6198,7 +6198,7 @@ mod tests {
                 .to_string();
             assert!(rendered.contains(subcommand));
             if subcommand == "run" {
-                assert!(rendered.contains("Put all EnvGate flags before --"));
+                assert!(rendered.contains("Put all Ward flags before --"));
             }
         }
     }
@@ -6208,7 +6208,7 @@ mod tests {
         let request_id = uuid::Uuid::nil().to_string();
         let command_sets = vec![
             vec![
-                "envgate",
+                "ward",
                 "setup",
                 "--yes",
                 "--project",
@@ -6222,10 +6222,10 @@ mod tests {
                 "--unlock-ttl",
                 "1h",
             ],
-            vec!["envgate", "init", "--project", "demo", "--force", "--bare"],
-            vec!["envgate", "import", ".env", "--vault", ".env.vault"],
+            vec!["ward", "init", "--project", "demo", "--force", "--bare"],
+            vec!["ward", "import", ".env", "--vault", ".env.vault"],
             vec![
-                "envgate",
+                "ward",
                 "register",
                 "demo",
                 "--path",
@@ -6233,11 +6233,11 @@ mod tests {
                 "--vault",
                 ".env.vault",
             ],
-            vec!["envgate", "use", "demo"],
-            vec!["envgate", "projects", "list"],
-            vec!["envgate", "projects", "show", "demo"],
+            vec!["ward", "use", "demo"],
+            vec!["ward", "projects", "list"],
+            vec!["ward", "projects", "show", "demo"],
             vec![
-                "envgate",
+                "ward",
                 "projects",
                 "register",
                 "demo",
@@ -6246,13 +6246,13 @@ mod tests {
                 "--vault",
                 ".env.vault",
             ],
-            vec!["envgate", "projects", "use", "demo"],
-            vec!["envgate", "projects", "remove", "demo"],
-            vec!["envgate", "env", "list", "--project", "demo"],
-            vec!["envgate", "env", "set", "--project", "demo", "KEY=value"],
-            vec!["envgate", "env", "unset", "--project", "demo", "KEY"],
+            vec!["ward", "projects", "use", "demo"],
+            vec!["ward", "projects", "remove", "demo"],
+            vec!["ward", "env", "list", "--project", "demo"],
+            vec!["ward", "env", "set", "--project", "demo", "KEY=value"],
+            vec!["ward", "env", "unset", "--project", "demo", "KEY"],
             vec![
-                "envgate",
+                "ward",
                 "env",
                 "unlock",
                 "--project",
@@ -6262,7 +6262,7 @@ mod tests {
                 "--force",
             ],
             vec![
-                "envgate",
+                "ward",
                 "env",
                 "lock",
                 "--project",
@@ -6271,7 +6271,7 @@ mod tests {
                 ".env",
             ],
             vec![
-                "envgate",
+                "ward",
                 "env",
                 "export",
                 "--project",
@@ -6281,7 +6281,7 @@ mod tests {
                 "--force",
             ],
             vec![
-                "envgate",
+                "ward",
                 "env",
                 "export",
                 "--project",
@@ -6289,7 +6289,7 @@ mod tests {
                 "--unsafe-stdout",
             ],
             vec![
-                "envgate",
+                "ward",
                 "request",
                 "--profile",
                 "dev",
@@ -6307,7 +6307,7 @@ mod tests {
                 "--no-prompt",
             ],
             vec![
-                "envgate",
+                "ward",
                 "allow",
                 "--profile",
                 "dev",
@@ -6322,11 +6322,11 @@ mod tests {
                 "--env",
                 "DATABASE_URL",
             ],
-            vec!["envgate", "grants", "list"],
-            vec!["envgate", "grants", "revoke", &request_id],
-            vec!["envgate", "grants", "prune"],
+            vec!["ward", "grants", "list"],
+            vec!["ward", "grants", "revoke", &request_id],
+            vec!["ward", "grants", "prune"],
             vec![
-                "envgate",
+                "ward",
                 "approve",
                 &request_id,
                 "--scope",
@@ -6334,9 +6334,9 @@ mod tests {
                 "--confirm-critical",
                 "--agent-mediated",
             ],
-            vec!["envgate", "deny", &request_id, "--agent-mediated"],
+            vec!["ward", "deny", &request_id, "--agent-mediated"],
             vec![
-                "envgate",
+                "ward",
                 "run",
                 "--profile",
                 "dev",
@@ -6357,7 +6357,7 @@ mod tests {
                 "dev",
             ],
             vec![
-                "envgate",
+                "ward",
                 "dev",
                 "--agent",
                 "codex",
@@ -6367,7 +6367,7 @@ mod tests {
                 "--no-prompt",
             ],
             vec![
-                "envgate",
+                "ward",
                 "migrate",
                 "--agent",
                 "codex",
@@ -6376,12 +6376,12 @@ mod tests {
                 "--json",
                 "--no-prompt",
             ],
-            vec!["envgate", "doctor"],
-            vec!["envgate", "logs", "requests"],
-            vec!["envgate", "logs", "view", "requests"],
-            vec!["envgate", "logs", "verify", "requests", "--full"],
+            vec!["ward", "doctor"],
+            vec!["ward", "logs", "requests"],
+            vec!["ward", "logs", "view", "requests"],
+            vec!["ward", "logs", "verify", "requests", "--full"],
             vec![
-                "envgate",
+                "ward",
                 "logs",
                 "export",
                 "requests",
@@ -6389,12 +6389,12 @@ mod tests {
                 "requests.jsonl",
                 "--force",
             ],
-            vec!["envgate", "logs", "unlock", "--ttl", "15m"],
-            vec!["envgate", "edit"],
-            vec!["envgate", "unlock", "--ttl", "1h"],
-            vec!["envgate", "lock"],
+            vec!["ward", "logs", "unlock", "--ttl", "15m"],
+            vec!["ward", "edit"],
+            vec!["ward", "unlock", "--ttl", "1h"],
+            vec!["ward", "lock"],
             vec![
-                "envgate",
+                "ward",
                 "teardown",
                 "--project",
                 "demo",

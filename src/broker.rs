@@ -123,11 +123,11 @@ struct BrokerSession {
 }
 
 pub fn run_dir() -> PathBuf {
-    logs::envgate_home().join("run")
+    logs::ward_home().join("run")
 }
 
 pub fn socket_path() -> PathBuf {
-    run_dir().join("envgate.sock")
+    run_dir().join("ward.sock")
 }
 
 pub fn pid_path() -> PathBuf {
@@ -156,7 +156,7 @@ pub fn ensure_running() -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to start EnvGate broker")?;
+        .context("failed to start Ward broker")?;
     wait_until_ready(StdDuration::from_secs(2))
 }
 
@@ -169,18 +169,18 @@ fn wait_until_ready(timeout: StdDuration) -> Result<()> {
         }
         thread::sleep(StdDuration::from_millis(25));
     }
-    anyhow::bail!("EnvGate broker did not become ready");
+    anyhow::bail!("Ward broker did not become ready");
 }
 
 #[cfg(not(test))]
 fn broker_process_supported(exe: &Path) -> bool {
     #[cfg(coverage)]
-    if std::env::var_os("ENVGATE_COVERAGE_ASSUME_BROKER_EXE").is_some() {
+    if std::env::var_os("WARD_COVERAGE_ASSUME_BROKER_EXE").is_some() {
         return true;
     }
     exe.file_stem()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "envgate")
+        .is_some_and(|name| name == "ward")
 }
 
 #[cfg(test)]
@@ -236,7 +236,7 @@ pub fn sign_receipt(
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
-        anyhow::bail!("EnvGate broker is unavailable from this executable");
+        anyhow::bail!("Ward broker is unavailable from this executable");
     }
     match send_simple(BrokerRequest::Sign {
         project: project.to_string(),
@@ -260,7 +260,7 @@ pub fn execute(
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
-        anyhow::bail!("EnvGate broker is unavailable from this executable");
+        anyhow::bail!("Ward broker is unavailable from this executable");
     }
     let mut stream = connect()?;
     let inherited_env = inherited_execution_env();
@@ -363,7 +363,7 @@ pub fn stop() -> Result<()> {
 pub fn serve() -> Result<()> {
     cleanup_stale_files()?;
     fs_util::ensure_private_dir(&run_dir())?;
-    let listener = UnixListener::bind(socket_path()).context("failed to bind EnvGate broker")?;
+    let listener = UnixListener::bind(socket_path()).context("failed to bind Ward broker")?;
     fs_util::write_private_file(&pid_path(), std::process::id().to_string().as_bytes())?;
     let state = Arc::new(Mutex::new(BrokerState::default()));
     for stream in listener.incoming() {
@@ -593,7 +593,7 @@ fn ping() -> Result<()> {
 }
 
 fn connect() -> Result<UnixStream> {
-    UnixStream::connect(socket_path()).context("failed to connect to EnvGate broker")
+    UnixStream::connect(socket_path()).context("failed to connect to Ward broker")
 }
 
 fn read_request(reader: &mut BufReader<UnixStream>) -> Result<BrokerRequest> {
@@ -649,7 +649,7 @@ fn read_pid() -> Result<u32> {
 #[doc(hidden)]
 pub fn coverage_exercise_broker_edges() -> Result<()> {
     let home = tempfile::tempdir()?;
-    std::env::set_var("ENVGATE_HOME", home.path());
+    std::env::set_var("WARD_HOME", home.path());
     cleanup_stale_files()?;
     assert!(execute(
         "demo",
@@ -689,7 +689,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
     let stop_result = with_fake_broker(responses, stop)?;
     assert!(stop_result.is_err());
 
-    std::env::set_var("ENVGATE_COVERAGE_ASSUME_BROKER_EXE", "1");
+    std::env::set_var("WARD_COVERAGE_ASSUME_BROKER_EXE", "1");
     let vault_path = home.path().join(".env.vault");
     let payload = ApprovalReceiptPayload {
         schema_version: 1,
@@ -802,8 +802,8 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
     let execute_result = with_fake_broker(responses, action)?;
     assert!(execute_result.is_err());
 
-    std::env::remove_var("ENVGATE_COVERAGE_ASSUME_BROKER_EXE");
-    std::env::remove_var("ENVGATE_HOME");
+    std::env::remove_var("WARD_COVERAGE_ASSUME_BROKER_EXE");
+    std::env::remove_var("WARD_HOME");
     Ok(())
 }
 
@@ -859,26 +859,26 @@ mod tests {
     }
 
     #[test]
-    fn broker_paths_live_under_envgate_run_dir() {
+    fn broker_paths_live_under_ward_run_dir() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
-        assert!(socket_path().ends_with("run/envgate.sock"));
+        std::env::set_var("WARD_HOME", home.path());
+        assert!(socket_path().ends_with("run/ward.sock"));
         assert!(pid_path().ends_with("run/broker.pid"));
         ensure_running().unwrap();
         assert!(!broker_process_supported(Path::new(
             "target/debug/cli-test"
         )));
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
     fn status_reports_not_running_without_socket() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let status = status().unwrap();
         assert!(!status.running);
         assert!(status.sessions.is_empty());
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -932,7 +932,7 @@ mod tests {
     #[test]
     fn broker_client_protocol_handles_ping_stop_unlock_sign_and_execute() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let passphrase = "coverage passphrase";
         let (_vault_dir, vault_path) = test_vault(passphrase);
         let state = Arc::new(Mutex::new(BrokerState::default()));
@@ -1155,13 +1155,13 @@ mod tests {
         let finished = read_response(&mut reader).unwrap();
         assert!(matches!(finished, BrokerResponse::Finished { .. }));
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
     fn broker_helpers_report_closed_and_invalid_messages() {
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let access = AccessRequest {
             project: "demo".to_string(),
             agent: Some("codex".to_string()),
@@ -1197,6 +1197,6 @@ mod tests {
         writeln!(client, "not json").unwrap();
         let mut reader = BufReader::new(server);
         assert!(read_request(&mut reader).is_err());
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 }

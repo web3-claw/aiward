@@ -226,7 +226,7 @@ pub(crate) fn selected_editor() -> String {
 }
 
 pub(crate) fn test_passphrase() -> Option<String> {
-    std::env::var("ENVGATE_UNSAFE_TEST_PASSPHRASE")
+    std::env::var("WARD_UNSAFE_TEST_PASSPHRASE")
         .ok()
         .filter(|value| !value.trim().is_empty())
 }
@@ -513,11 +513,11 @@ mod tests {
     fn test_passphrase_ignores_empty_values() {
         let _guard = env_lock();
 
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "");
         assert!(test_passphrase().is_none());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "secret");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "secret");
         assert_eq!(test_passphrase(), Some("secret".to_string()));
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -525,12 +525,12 @@ mod tests {
     fn passphrase_readers_use_test_passphrase_when_present() {
         let _guard = env_lock();
 
-        std::env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", "secret passphrase");
+        std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "secret passphrase");
 
         assert_eq!(read_new_passphrase().unwrap(), "secret passphrase");
         assert_eq!(read_existing_passphrase().unwrap(), "secret passphrase");
 
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     }
 
     #[test]
@@ -597,7 +597,7 @@ mod tests {
     #[serial_test::serial]
     fn coverage_prompt_password_stubs_are_available_without_env() {
         let _guard = env_lock();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+        std::env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
 
         assert_eq!(read_new_passphrase().unwrap(), "coverage passphrase");
         assert_eq!(read_existing_passphrase().unwrap(), "coverage passphrase");

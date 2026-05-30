@@ -88,7 +88,7 @@ impl Drop for SessionSigningKey {
 }
 
 pub fn keys_dir() -> PathBuf {
-    logs::envgate_home().join("keys")
+    logs::ward_home().join("keys")
 }
 
 pub fn project_key_path(project: &str) -> PathBuf {
@@ -358,7 +358,7 @@ mod tests {
     fn approval_key_generation_round_trips_and_rejects_wrong_passphrase() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         let key_file = ensure_project_key("demo", "1234").unwrap();
         assert_eq!(key_file.project, "demo");
@@ -368,7 +368,7 @@ mod tests {
             key_file.key_id
         );
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -376,14 +376,14 @@ mod tests {
     fn session_signing_ciphertext_round_trips_and_rejects_wrong_secret() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
         assert_eq!(session_key.signer_key_id, ciphertext.signer_key_id);
         assert!(decrypt_session_signing_key(&ciphertext, "wrong").is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
     fn canonical_receipt_is_deterministic_for_reordered_envs() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
         let now = Utc::now();
@@ -423,7 +423,7 @@ mod tests {
             canonical_payload_bytes(&second)
         );
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -431,7 +431,7 @@ mod tests {
     fn signature_verifies_and_fails_after_payload_change() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
         let payload = build_payload(
@@ -451,7 +451,7 @@ mod tests {
         receipt.payload.scope = ApprovalScope::Session;
         assert!(!verify_receipt_signature("demo", &receipt));
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -459,7 +459,7 @@ mod tests {
     fn signing_and_verification_reject_bad_metadata_and_key_files() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let ciphertext = session_signing_key_ciphertext("demo", "1234", "session").unwrap();
         let session_key = decrypt_session_signing_key(&ciphertext, "session").unwrap();
         let payload = build_payload(
@@ -516,7 +516,7 @@ mod tests {
         std::fs::write(project_key_path("demo"), contents).unwrap();
         assert!(read_project_key("demo").is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -524,7 +524,7 @@ mod tests {
     fn approval_key_storage_reports_parse_write_and_seed_errors() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         std::fs::create_dir_all(keys_dir()).unwrap();
         std::fs::write(project_key_path("bad-json"), "{bad-json").unwrap();
@@ -543,9 +543,9 @@ mod tests {
 
         let blocked_home = home.path().join("blocked-home");
         std::fs::write(&blocked_home, "not a directory").unwrap();
-        std::env::set_var("ENVGATE_HOME", blocked_home);
+        std::env::set_var("WARD_HOME", blocked_home);
         assert!(ensure_project_key("blocked", "1234").is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 }

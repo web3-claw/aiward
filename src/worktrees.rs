@@ -59,7 +59,7 @@ pub enum WorktreeDecision {
 }
 
 pub fn worktrees_path() -> PathBuf {
-    logs::envgate_home().join("worktrees.json")
+    logs::ward_home().join("worktrees.json")
 }
 
 pub fn load_state() -> Result<WorktreeState> {
@@ -73,7 +73,7 @@ pub fn load_state() -> Result<WorktreeState> {
 }
 
 pub fn save_state(state: &WorktreeState) -> Result<()> {
-    fs_util::ensure_private_dir(&logs::envgate_home())?;
+    fs_util::ensure_private_dir(&logs::ward_home())?;
     let contents = serde_json::to_string_pretty(state).expect("worktree state should serialize");
     fs_util::write_private_file(&worktrees_path(), format!("{contents}\n").as_bytes())
 }
@@ -280,7 +280,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let worktree = root.path().join("wt");
         std::fs::create_dir(&worktree).unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         let registered = registered(repo.path());
 
         allow_root("demo", root.path()).unwrap();
@@ -331,7 +331,7 @@ mod tests {
             WorktreeDecision::Denied { .. }
         ));
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -340,7 +340,7 @@ mod tests {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
         let base = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         let missing_root = base.path().join("missing-root");
         let missing_worktree = missing_root.join("agent-wt");
@@ -355,6 +355,6 @@ mod tests {
         ));
         assert!(remove_root("demo", &missing_root).unwrap());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 }

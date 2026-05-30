@@ -1,5 +1,5 @@
 use assert_cmd::Command;
-use envgate::{
+use ward::{
     approvals::ApprovalScope,
     cli::{dispatch, Cli, Commands, EnvCommand, LogsCommand, ProjectsCommand},
     config,
@@ -17,13 +17,13 @@ const TEST_PASSPHRASE: &str = "correct horse battery staple";
 
 struct TestProject {
     project_dir: tempfile::TempDir,
-    envgate_home: tempfile::TempDir,
+    ward_home: tempfile::TempDir,
 }
 
 impl TestProject {
     fn new() -> Self {
         let project_dir = tempfile::tempdir().unwrap();
-        let envgate_home = tempfile::tempdir().unwrap();
+        let ward_home = tempfile::tempdir().unwrap();
 
         std::fs::write(project_dir.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
         std::fs::write(
@@ -34,16 +34,16 @@ impl TestProject {
 
         Self {
             project_dir,
-            envgate_home,
+            ward_home,
         }
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::cargo_bin("envgate").unwrap();
+        let mut command = Command::cargo_bin("ward").unwrap();
         command
             .current_dir(self.project_dir.path())
-            .env("ENVGATE_HOME", self.envgate_home.path())
-            .env("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+            .env("WARD_HOME", self.ward_home.path())
+            .env("WARD_UNSAFE_TEST_KEYRING", "1");
         command
     }
 
@@ -54,7 +54,7 @@ impl TestProject {
             .success();
 
         self.command()
-            .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+            .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
             .args(["import", ".env"])
             .assert()
             .success();
@@ -70,7 +70,7 @@ impl TestProject {
 
         let custom_vault = self.project_dir.path().join("custom.vault");
         self.command()
-            .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+            .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
             .args(["import", ".env", "--vault", custom_vault.to_str().unwrap()])
             .assert()
             .success();
@@ -80,18 +80,18 @@ impl TestProject {
 
     fn setup_yes(&self) {
         self.command()
-            .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+            .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
             .args(["setup", "--yes", "--project", "demo"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("EnvGate setup complete."))
+            .stdout(predicate::str::contains("Ward setup complete."))
             .stdout(predicate::str::contains("Vault unlocked until"))
-            .stdout(predicate::str::contains("Next: envgate dev"));
+            .stdout(predicate::str::contains("Next: ward dev"));
     }
 
     fn unlock(&self) {
         self.command()
-            .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+            .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
             .args(["unlock", "--ttl", "1h"])
             .assert()
             .success();
@@ -185,7 +185,7 @@ impl TestProject {
 fn init_creates_project_config_and_env_example() {
     let tempdir = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
         .args(["init", "--project", "demo"])
@@ -193,7 +193,7 @@ fn init_creates_project_config_and_env_example() {
         .success()
         .stdout(predicate::str::contains("Created"));
 
-    assert!(tempdir.path().join(".envgate.json").exists());
+    assert!(tempdir.path().join(".ward.json").exists());
     assert!(tempdir.path().join(".env.example").exists());
 }
 
@@ -208,20 +208,20 @@ fn init_guided_setup_locks_env_and_creates_initial_unlock() {
     )
     .unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
-        .env("ENVGATE_HOME", home.path())
-        .env("ENVGATE_UNSAFE_TEST_KEYRING", "1")
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["init", "--project", "demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("EnvGate setup complete."))
+        .stdout(predicate::str::contains("Ward setup complete."))
         .stdout(predicate::str::contains("Vault unlocked until"));
 
     let env_contents = std::fs::read_to_string(tempdir.path().join(".env")).unwrap();
-    assert!(env_contents.contains("EnvGate managed locked .env"));
+    assert!(env_contents.contains("Ward managed locked .env"));
     assert!(!env_contents.contains("postgres://local"));
     assert!(home.path().join("sessions/unlocks.json").exists());
 }
@@ -235,7 +235,7 @@ fn init_bare_preserves_config_only_plaintext_warning() {
     )
     .unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
         .args(["init", "--bare", "--project", "demo"])
@@ -245,17 +245,17 @@ fn init_bare_preserves_config_only_plaintext_warning() {
 }
 
 #[test]
-fn logs_path_uses_default_home_when_envgate_home_is_not_set() {
+fn logs_path_uses_default_home_when_ward_home_is_not_set() {
     let tempdir = tempfile::tempdir().unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
-        .env_remove("ENVGATE_HOME")
+        .env_remove("WARD_HOME")
         .arg("logs")
         .assert()
         .success()
-        .stdout(predicate::str::contains(".envgate").and(predicate::str::contains("logs")));
+        .stdout(predicate::str::contains(".ward").and(predicate::str::contains("logs")));
 }
 
 #[test]
@@ -264,21 +264,21 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
 
     fixture.setup_yes();
 
-    assert!(fixture.project_dir.path().join(".envgate.json").exists());
+    assert!(fixture.project_dir.path().join(".ward.json").exists());
     assert!(fixture.project_dir.path().join(".env.vault").exists());
     let locked_env = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
-    assert!(locked_env.contains("EnvGate managed locked .env"));
+    assert!(locked_env.contains("Ward managed locked .env"));
     assert!(!locked_env.contains("postgres://secret"));
-    assert!(fixture.envgate_home.path().join("registry.json").exists());
+    assert!(fixture.ward_home.path().join("registry.json").exists());
     let unlocks: Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture.envgate_home.path().join("sessions/unlocks.json"))
+        &std::fs::read_to_string(fixture.ward_home.path().join("sessions/unlocks.json"))
             .unwrap(),
     )
     .unwrap();
     assert_eq!(unlocks["sessions"][0]["purpose"], "run");
 
     let config: Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture.project_dir.path().join(".envgate.json")).unwrap(),
+        &std::fs::read_to_string(fixture.project_dir.path().join(".ward.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(config["project"], "demo");
@@ -302,8 +302,8 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
     assert!(gitignore.contains("!.env.vault\n"));
 
     let agents = std::fs::read_to_string(fixture.project_dir.path().join("AGENTS.md")).unwrap();
-    assert!(agents.contains("envgate request --profile dev"));
-    assert!(agents.contains("envgate dev"));
+    assert!(agents.contains("ward request --profile dev"));
+    assert!(agents.contains("ward dev"));
     assert!(agents.contains("confirmationRequired"));
     assert!(agents.contains("--confirm-critical"));
     assert!(agents.contains("native structured choice UI"));
@@ -311,7 +311,7 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "view", "alerts"])
         .assert()
         .success()
@@ -319,35 +319,35 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes", "--project", "demo"])
         .assert()
         .success();
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock"])
         .assert()
         .success();
     let unlocked = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
     assert!(unlocked.contains("DATABASE_URL=postgres://secret"));
     assert!(unlocked.contains("PAYLOAD_SECRET=payload-secret"));
-    assert!(!unlocked.contains("ENVGATE_LOCKED=1"));
+    assert!(!unlocked.contains("WARD_LOCKED=1"));
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("already an EnvGate locked marker"));
+        .stderr(predicate::str::contains("already an Ward locked marker"));
 }
 
 #[test]
@@ -362,7 +362,7 @@ fn setup_profiles_only_include_vault_present_database_key() {
     fixture.setup_yes();
 
     let config: Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture.project_dir.path().join(".envgate.json")).unwrap(),
+        &std::fs::read_to_string(fixture.project_dir.path().join(".ward.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -567,7 +567,7 @@ fn logs_verify_clean_logs_exit_success_and_tampered_logs_fail() {
         .success()
         .stdout(predicate::str::contains("[ok]"));
 
-    let requests_log = fixture.envgate_home.path().join("logs/requests.jsonl");
+    let requests_log = fixture.ward_home.path().join("logs/requests.jsonl");
     std::fs::create_dir_all(requests_log.parent().unwrap()).unwrap();
     std::fs::write(&requests_log, "{bad-json}\n").unwrap();
 
@@ -588,7 +588,7 @@ fn setup_refuses_locked_env_when_vault_is_missing() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
         .args(["setup", "--yes", "--project", "demo"])
         .assert()
         .failure()
@@ -602,7 +602,7 @@ fn setup_refuses_locked_env_when_vault_is_missing() {
         .assert()
         .failure()
         .stderr(
-            predicate::str::contains("EnvGate locked marker")
+            predicate::str::contains("Ward locked marker")
                 .and(predicate::str::contains(".env.vault is missing")),
         );
 }
@@ -613,7 +613,7 @@ fn setup_supports_keep_plaintext_and_ignore_vault_modes() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "setup",
             "--yes",
@@ -734,13 +734,13 @@ fn setup_request_and_profile_error_edges_are_exercised_through_cli() {
         .failure()
         .stderr(predicate::str::contains("at least one --env"));
 
-    let blocked_home = fixture.project_dir.path().join("envgate-home-file");
+    let blocked_home = fixture.project_dir.path().join("ward-home-file");
     let blocked_vault = fixture.project_dir.path().join("blocked.env.vault");
     std::fs::write(&blocked_home, "").unwrap();
     std::fs::write(&blocked_vault, "placeholder").unwrap();
     let mut command = fixture.command();
     command
-        .env("ENVGATE_HOME", &blocked_home)
+        .env("WARD_HOME", &blocked_home)
         .args([
             "setup",
             "--yes",
@@ -869,11 +869,11 @@ fn local_pending_decisions_session_listing_and_once_grant_consumption_work_via_c
 }
 
 #[test]
-fn post_run_execution_log_failure_returns_envgate_error_after_child_success() {
+fn post_run_execution_log_failure_returns_ward_error_after_child_success() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
     fixture.unlock();
-    let script = "rm -f \"$ENVGATE_HOME/logs/executions.jsonl\"; mkdir \"$ENVGATE_HOME/logs/executions.jsonl\"";
+    let script = "rm -f \"$WARD_HOME/logs/executions.jsonl\"; mkdir \"$WARD_HOME/logs/executions.jsonl\"";
     let command_text = format!("sh -c {script}");
 
     fixture
@@ -906,7 +906,7 @@ fn doctor_reports_missing_config_plaintext_env_and_gitignore_gap() {
     )
     .unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
         .arg("doctor")
@@ -920,7 +920,7 @@ fn doctor_reports_missing_config_plaintext_env_and_gitignore_gap() {
 #[test]
 fn doctor_reports_likely_secret_variant_registry_failure_and_vault_exception() {
     let tempdir = tempfile::tempdir().unwrap();
-    let envgate_home = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
 
     std::fs::write(
         tempdir.path().join(".env.local"),
@@ -934,10 +934,10 @@ fn doctor_reports_likely_secret_variant_registry_failure_and_vault_exception() {
     )
     .unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
-        .env("ENVGATE_HOME", envgate_home.path())
+        .env("WARD_HOME", ward_home.path())
         .arg("doctor")
         .assert()
         .success()
@@ -950,13 +950,13 @@ fn doctor_reports_likely_secret_variant_registry_failure_and_vault_exception() {
 #[test]
 fn doctor_reports_alert_log_check_failures() {
     let tempdir = tempfile::tempdir().unwrap();
-    let envgate_home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(envgate_home.path().join("logs/alerts.jsonl")).unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ward_home.path().join("logs/alerts.jsonl")).unwrap();
 
-    Command::cargo_bin("envgate")
+    Command::cargo_bin("ward")
         .unwrap()
         .current_dir(tempdir.path())
-        .env("ENVGATE_HOME", envgate_home.path())
+        .env("WARD_HOME", ward_home.path())
         .arg("doctor")
         .assert()
         .success()
@@ -1021,31 +1021,31 @@ fn passive_flow_imports_registers_runs_reuses_grant_and_logs() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "session")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "session")
         .args(run_args)
         .assert()
         .success();
 
-    let grant_path = fixture.envgate_home.path().join("sessions/grants.jsonl");
+    let grant_path = fixture.ward_home.path().join("sessions/grants.jsonl");
     let grants = std::fs::read_to_string(&grant_path).unwrap();
     assert!(grants.contains("\"scope\":\"session\""));
     assert!(grants.contains("\"command\":\"sh -c true"));
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(run_args)
         .assert()
         .success();
 
     let executions =
-        std::fs::read_to_string(fixture.envgate_home.path().join("logs/executions.jsonl")).unwrap();
+        std::fs::read_to_string(fixture.ward_home.path().join("logs/executions.jsonl")).unwrap();
     assert!(!executions.contains("Run dev server"));
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "view", "executions"])
         .assert()
         .success()
@@ -1057,7 +1057,7 @@ fn passive_flow_imports_registers_runs_reuses_grant_and_logs() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] .env is EnvGate locked."))
+        .stdout(predicate::str::contains("[ok] .env is Ward locked."))
         .stdout(predicate::str::contains("[ok] Resolved project: demo"));
 }
 
@@ -1081,8 +1081,8 @@ fn critical_run_requires_once_confirmation_and_redacts_output() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "session")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "session")
         .args(run_args)
         .assert()
         .failure()
@@ -1090,15 +1090,15 @@ fn critical_run_requires_once_confirmation_and_redacts_output() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "once")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args(run_args)
         .assert()
         .success()
-        .stderr(predicate::str::contains("CRITICAL EnvGate warning"))
-        .stdout(predicate::str::contains("DATABASE_URL=[ENVGATE_REDACTED]"));
+        .stderr(predicate::str::contains("CRITICAL Ward warning"))
+        .stdout(predicate::str::contains("DATABASE_URL=[WARD_REDACTED]"));
 
-    let grant_path = fixture.envgate_home.path().join("sessions/grants.jsonl");
+    let grant_path = fixture.ward_home.path().join("sessions/grants.jsonl");
     if grant_path.exists() {
         let grants = std::fs::read_to_string(&grant_path).unwrap();
         assert!(!grants.contains("\"scope\":\"session\""));
@@ -1107,7 +1107,7 @@ fn critical_run_requires_once_confirmation_and_redacts_output() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "view", "alerts"])
         .assert()
         .success()
@@ -1219,11 +1219,11 @@ fn agent_mediated_request_approve_unlock_and_run_flow() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("DATABASE_URL=[ENVGATE_REDACTED]"));
+        .stdout(predicate::str::contains("DATABASE_URL=[WARD_REDACTED]"));
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "view", "approvals"])
         .assert()
         .success()
@@ -1279,7 +1279,7 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -1291,11 +1291,11 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
         .args(&context)
         .assert()
         .success()
-        .stdout(predicate::str::contains("DATABASE_URL=[ENVGATE_REDACTED]"));
+        .stdout(predicate::str::contains("DATABASE_URL=[WARD_REDACTED]"));
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "view", "executions"])
         .assert()
         .success()
@@ -1311,7 +1311,7 @@ fn no_prompt_run_returns_approval_then_unlock_then_executes_with_grant() {
     );
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["setup", "--yes", "--project", "demo", "--no-unlock"])
         .assert()
         .success();
@@ -1354,7 +1354,7 @@ fn no_prompt_run_returns_approval_then_unlock_then_executes_with_grant() {
         .args(&context)
         .assert()
         .success()
-        .stdout(predicate::str::contains("dev ok [ENVGATE_REDACTED]"));
+        .stdout(predicate::str::contains("dev ok [WARD_REDACTED]"));
 
     let output = fixture
         .command()
@@ -1428,7 +1428,7 @@ fn unreadable_unlock_material_returns_json_reason_and_doctor_warning() {
         .stdout(predicate::str::contains("without an active session"));
 
     std::fs::write(
-        fixture.envgate_home.path().join("sessions/unlocks.json"),
+        fixture.ward_home.path().join("sessions/unlocks.json"),
         "{bad-json}",
     )
     .unwrap();
@@ -1444,7 +1444,7 @@ fn unreadable_unlock_material_returns_json_reason_and_doctor_warning() {
 fn no_prompt_run_reports_vault_key_missing_instead_of_unlock_required() {
     let fixture = TestProject::new();
     fixture.setup_yes();
-    let config_path = fixture.project_dir.path().join(".envgate.json");
+    let config_path = fixture.project_dir.path().join(".ward.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config["profiles"]["dev"]["env"] =
@@ -1520,21 +1520,21 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
         &context.branch,
     ];
 
-    let mut request = Command::cargo_bin("envgate").unwrap();
+    let mut request = Command::cargo_bin("ward").unwrap();
     request
         .current_dir(worktree.path())
-        .env("ENVGATE_HOME", fixture.envgate_home.path())
-        .env("ENVGATE_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["request", "--profile", "dev", "--json", "--no-prompt"])
         .args(&context_args)
         .assert()
         .success()
         .stdout(predicate::str::contains("worktree_approval_required"));
 
-    let mut run = Command::cargo_bin("envgate").unwrap();
+    let mut run = Command::cargo_bin("ward").unwrap();
     run.current_dir(worktree.path())
-        .env("ENVGATE_HOME", fixture.envgate_home.path())
-        .env("ENVGATE_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["run", "--profile", "dev", "--json", "--no-prompt"])
         .args(&context_args)
         .assert()
@@ -1742,7 +1742,7 @@ fn approve_and_deny_json_report_pending_request_errors() {
     assert_eq!(response["reason"], "pending_request_not_found");
 
     let malformed = "11111111-1111-1111-1111-111111111111";
-    let request_dir = fixture.envgate_home.path().join("requests");
+    let request_dir = fixture.ward_home.path().join("requests");
     std::fs::create_dir_all(&request_dir).unwrap();
     std::fs::write(request_dir.join(format!("{malformed}.json")), "{bad-json}").unwrap();
 
@@ -1781,8 +1781,8 @@ fn run_rejects_misplaced_no_prompt_after_separator_as_json() {
         .clone();
     let response: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(response["status"], "invalid_invocation");
-    assert_eq!(response["reason"], "envgate_flags_after_separator");
-    assert_eq!(response["message"], "Move EnvGate flags before --.");
+    assert_eq!(response["reason"], "ward_flags_after_separator");
+    assert_eq!(response["message"], "Move Ward flags before --.");
 }
 
 #[test]
@@ -1790,19 +1790,19 @@ fn doctor_reports_active_unlock_with_local_log_key_storage() {
     let fixture = TestProject::new();
     fixture.setup_yes();
     let log_key_path = fixture
-        .envgate_home
+        .ward_home
         .path()
         .join("cache")
         .join("log-key.json");
     assert!(log_key_path.exists());
     assert!(!fixture
-        .envgate_home
+        .ward_home
         .path()
         .join("cache")
         .join("keystore.json")
         .exists());
     assert!(!fixture
-        .envgate_home
+        .ward_home
         .path()
         .join("cache")
         .join("test-keyring.json")
@@ -1836,13 +1836,13 @@ fn env_lock_preserves_existing_broker_session_only() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock"])
         .assert()
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
         .success()
@@ -1865,18 +1865,18 @@ fn env_lock_preserves_existing_broker_session_only() {
     fixture.command().arg("lock").assert().success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock"])
         .assert()
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "No active agent unlock session. Run envgate unlock --ttl 8h if agents need access.",
+            "No active agent unlock session. Run ward unlock --ttl 8h if agents need access.",
         ));
 }
 
@@ -1933,24 +1933,24 @@ fn managed_env_projects_logs_and_teardown_flow() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("DATABASE_URL"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "set", "OPENAI_API_KEY=sk test"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Set encrypted env OPENAI_API_KEY"));
     let locked = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
-    assert!(locked.contains("EnvGate managed locked .env"));
+    assert!(locked.contains("Ward managed locked .env"));
     assert!(!locked.contains("sk test"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unset", "OPENAI_API_KEY"])
         .assert()
         .success()
@@ -1959,7 +1959,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         ));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unset", "OPENAI_API_KEY"])
         .assert()
         .success()
@@ -1969,7 +1969,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "unlock"])
         .assert()
         .success()
@@ -1981,7 +1981,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
     );
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "lock"])
         .assert()
         .success()
@@ -1989,12 +1989,12 @@ fn managed_env_projects_logs_and_teardown_flow() {
     assert!(
         std::fs::read_to_string(fixture.project_dir.path().join(".env"))
             .unwrap()
-            .contains("EnvGate managed locked .env")
+            .contains("Ward managed locked .env")
     );
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "export", "--output", ".env.export"])
         .assert()
         .success();
@@ -2006,7 +2006,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
     let absolute_export = fixture.project_dir.path().join("absolute.env.export");
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "env",
             "export",
@@ -2020,7 +2020,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .contains("postgres://secret"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["env", "export", "--unsafe-stdout"])
         .assert()
         .success()
@@ -2034,20 +2034,20 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .stdout(predicate::str::contains("[ok] sessions"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "verify", "--full"])
         .assert()
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "export", "sessions", "--output", "sessions.log"])
         .assert()
         .success()
         .stderr(predicate::str::contains("deleted logs should be treated"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "export", "sessions", "--output", "sessions.log"])
         .assert()
         .failure()
@@ -2060,7 +2060,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -2090,7 +2090,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
         .stderr(predicate::str::contains("teardown requires --yes"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["teardown", "--yes", "--export", ".env"])
         .assert()
         .failure()
@@ -2099,11 +2099,11 @@ fn managed_env_projects_logs_and_teardown_flow() {
         ));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["teardown", "--yes"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed EnvGate project demo"))
+        .stdout(predicate::str::contains("Removed Ward project demo"))
         .stdout(predicate::str::contains(
             "Encrypted audit logs were preserved",
         ));
@@ -2113,7 +2113,7 @@ fn managed_env_projects_logs_and_teardown_flow() {
             .contains("postgres://secret")
     );
     assert!(!fixture.project_dir.path().join(".env").exists());
-    assert!(!fixture.project_dir.path().join(".envgate.json").exists());
+    assert!(!fixture.project_dir.path().join(".ward.json").exists());
     assert!(!fixture.project_dir.path().join(".env.vault").exists());
 }
 
@@ -2124,14 +2124,14 @@ fn teardown_restore_env_explicitly_restores_plaintext_dotenv() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["teardown", "--yes", "--restore-env"])
         .assert()
         .success();
 
     let restored = std::fs::read_to_string(fixture.project_dir.path().join(".env")).unwrap();
     assert!(restored.contains("postgres://secret"));
-    assert!(!fixture.project_dir.path().join(".envgate.json").exists());
+    assert!(!fixture.project_dir.path().join(".ward.json").exists());
     assert!(!fixture.project_dir.path().join(".env.vault").exists());
 }
 
@@ -2165,7 +2165,7 @@ fn allow_profile_dev_and_migrate_shortcuts_reuse_grants() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -2230,7 +2230,7 @@ fn doctor_reports_encrypted_anomaly_alert_counts_without_decrypting() {
     );
     fixture.setup_yes();
 
-    let config_path = fixture.project_dir.path().join(".envgate.json");
+    let config_path = fixture.project_dir.path().join(".ward.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config["anomalyDetection"]["maxRunsPerHourPerGrant"] = serde_json::json!(0);
@@ -2251,7 +2251,7 @@ fn doctor_reports_encrypted_anomaly_alert_counts_without_decrypting() {
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -2270,7 +2270,7 @@ fn doctor_reports_encrypted_anomaly_alert_counts_without_decrypting() {
         .stdout(predicate::str::contains("Encrypted alerts:"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "view", "alerts"])
         .assert()
         .success()
@@ -2285,7 +2285,7 @@ fn anomaly_logging_failure_warns_without_blocking_child_success() {
     );
     fixture.setup_yes();
 
-    let config_path = fixture.project_dir.path().join(".envgate.json");
+    let config_path = fixture.project_dir.path().join(".ward.json");
     let mut config: Value =
         serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
     config["anomalyDetection"]["maxRunsPerHourPerGrant"] = serde_json::json!(0);
@@ -2306,11 +2306,11 @@ fn anomaly_logging_failure_warns_without_blocking_child_success() {
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
-    std::fs::create_dir_all(fixture.envgate_home.path().join("logs/alerts.jsonl")).unwrap();
+    std::fs::create_dir_all(fixture.ward_home.path().join("logs/alerts.jsonl")).unwrap();
 
     fixture
         .command()
@@ -2360,7 +2360,7 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .assert()
         .failure()
         .stderr(predicate::str::contains(
-            "envgate allow supports session, branch, and always scopes",
+            "ward allow supports session, branch, and always scopes",
         ));
 
     fixture
@@ -2388,7 +2388,7 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -2435,7 +2435,7 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .stdout(predicate::str::contains("Always"));
 
     let grant_id =
-        std::fs::read_to_string(fixture.envgate_home.path().join("sessions/grants.jsonl"))
+        std::fs::read_to_string(fixture.ward_home.path().join("sessions/grants.jsonl"))
             .unwrap()
             .lines()
             .find_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -2488,7 +2488,7 @@ fn expired_unlock_is_not_used_even_when_grant_matches() {
         .success();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -2501,7 +2501,7 @@ fn expired_unlock_is_not_used_even_when_grant_matches() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
         .args([
             "run",
             "--action",
@@ -2534,7 +2534,7 @@ fn edit_reencrypts_vault_and_updated_secret_can_be_injected() {
     fixture
         .command()
         .env("EDITOR", &editor)
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .arg("edit")
         .assert()
         .success()
@@ -2542,8 +2542,8 @@ fn edit_reencrypts_vault_and_updated_secret_can_be_injected() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "once")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args([
             "run",
             "--agent",
@@ -2560,7 +2560,7 @@ fn edit_reencrypts_vault_and_updated_secret_can_be_injected() {
         .assert()
         .success()
         .stdout(predicate::str::contains(
-            "PAYLOAD_SECRET=[ENVGATE_REDACTED]",
+            "PAYLOAD_SECRET=[WARD_REDACTED]",
         ));
 }
 
@@ -2584,7 +2584,7 @@ fn request_use_logs_unlock_and_lock_cover_stateful_cli_commands() {
         .stdout(predicate::str::contains("requests.jsonl"));
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["logs", "unlock", "--ttl", "15m"])
         .assert()
         .success()
@@ -2595,11 +2595,11 @@ fn request_use_logs_unlock_and_lock_cover_stateful_cli_commands() {
         .args(["use", "demo"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Active EnvGate project: demo"));
+        .stdout(predicate::str::contains("Active Ward project: demo"));
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "always")
+        .env("WARD_UNSAFE_TEST_APPROVAL", "always")
         .args([
             "request",
             "--agent",
@@ -2619,7 +2619,7 @@ fn request_use_logs_unlock_and_lock_cover_stateful_cli_commands() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .arg("unlock")
         .assert()
         .success()
@@ -2642,7 +2642,7 @@ fn denied_run_does_not_execute_child_command() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "deny")
+        .env("WARD_UNSAFE_TEST_APPROVAL", "deny")
         .args([
             "run",
             "--agent",
@@ -2658,7 +2658,7 @@ fn denied_run_does_not_execute_child_command() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("EnvGate access denied"));
+        .stderr(predicate::str::contains("Ward access denied"));
 
     assert!(!marker.exists());
 }
@@ -2672,7 +2672,7 @@ fn denied_request_logs_denial_message() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "deny")
+        .env("WARD_UNSAFE_TEST_APPROVAL", "deny")
         .args([
             "request",
             "--agent",
@@ -2690,7 +2690,7 @@ fn denied_request_logs_denial_message() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "session")
+        .env("WARD_UNSAFE_TEST_APPROVAL", "session")
         .args([
             "request",
             "--agent",
@@ -2734,7 +2734,7 @@ fn denied_request_logs_denial_message() {
         .args(["approve", request_id, "--scope", "deny"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("use envgate deny"));
+        .stderr(predicate::str::contains("use ward deny"));
 
     fixture
         .command()
@@ -2748,14 +2748,14 @@ fn denied_request_logs_denial_message() {
 fn invalid_grant_file_prevents_run_before_prompting() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
-    let grants_dir = fixture.envgate_home.path().join("sessions");
+    let grants_dir = fixture.ward_home.path().join("sessions");
     std::fs::create_dir_all(&grants_dir).unwrap();
     std::fs::write(grants_dir.join("grants.jsonl"), "{bad-json}\n").unwrap();
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "once")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args([
             "run",
             "--agent",
@@ -2779,7 +2779,7 @@ fn policy_auto_and_deny_presets_are_applied_without_prompt_approval() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
     let context = fixture.context_args("codex", "main");
-    let config_path = fixture.project_dir.path().join(".envgate.json");
+    let config_path = fixture.project_dir.path().join(".ward.json");
 
     std::fs::write(
         &config_path,
@@ -2802,7 +2802,7 @@ fn policy_auto_and_deny_presets_are_applied_without_prompt_approval() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "run",
             "--agent",
@@ -2855,7 +2855,7 @@ fn policy_auto_and_deny_presets_are_applied_without_prompt_approval() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("EnvGate access denied"));
+        .stderr(predicate::str::contains("Ward access denied"));
 
     let output = fixture
         .command()
@@ -2886,8 +2886,8 @@ fn run_returns_child_failure_status() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "once")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args([
             "run",
             "--agent",
@@ -2912,8 +2912,8 @@ fn run_fails_when_approved_env_is_missing_from_vault() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "once")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args([
             "run",
             "--agent",
@@ -2945,10 +2945,10 @@ fn import_with_explicit_vault_and_doctor_parse_error_are_reported() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ok] .env is EnvGate locked."));
+        .stdout(predicate::str::contains("[ok] .env is Ward locked."));
 
     std::fs::write(
-        fixture.project_dir.path().join(".envgate.json"),
+        fixture.project_dir.path().join(".ward.json"),
         "{bad-json}",
     )
     .unwrap();
@@ -2972,7 +2972,7 @@ fn import_reports_missing_and_invalid_sources() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["import", "missing.env"])
         .assert()
         .failure()
@@ -2985,14 +2985,14 @@ fn import_reports_missing_and_invalid_sources() {
     .unwrap();
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["import", "invalid.env"])
         .assert()
         .failure();
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["import", ".env"])
         .assert()
         .success();
@@ -3001,7 +3001,7 @@ fn import_reports_missing_and_invalid_sources() {
         .args(["import", ".env"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("already an EnvGate locked marker"));
+        .stderr(predicate::str::contains("already an Ward locked marker"));
 }
 
 #[test]
@@ -3030,7 +3030,7 @@ fn unlock_failure_is_logged_and_wrong_project_use_fails() {
 
     fixture
         .command()
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase")
         .arg("unlock")
         .assert()
         .failure()
@@ -3078,13 +3078,13 @@ fn multi_worktree_style_registry_resolution_uses_git_remote() {
         .output()
         .unwrap();
 
-    let mut command = Command::cargo_bin("envgate").unwrap();
+    let mut command = Command::cargo_bin("ward").unwrap();
     command
         .current_dir(worktree.path())
-        .env("ENVGATE_HOME", fixture.envgate_home.path())
-        .env("ENVGATE_UNSAFE_TEST_KEYRING", "1")
-        .env("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
-        .env("ENVGATE_UNSAFE_TEST_APPROVAL", "once")
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
         .args([
             "run",
             "--agent",
@@ -3100,28 +3100,28 @@ fn multi_worktree_style_registry_resolution_uses_git_remote() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("[ENVGATE_REDACTED]"));
+        .stdout(predicate::str::contains("[WARD_REDACTED]"));
 }
 
 #[test]
 fn install_script_dry_run_reports_target_and_path_hint() {
     let bin_dir = tempfile::tempdir().unwrap();
     let output = StdCommand::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
-        .env("ENVGATE_INSTALL_DRY_RUN", "1")
-        .env("ENVGATE_INSTALL_BIN_DIR", bin_dir.path())
+        .env("WARD_INSTALL_DRY_RUN", "1")
+        .env("WARD_INSTALL_BIN_DIR", bin_dir.path())
         .env("PATH", "/usr/bin:/bin")
         .output()
         .unwrap();
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("Would install EnvGate"));
-    assert!(stdout.contains("Add EnvGate to PATH"));
+    assert!(stdout.contains("Would install Ward"));
+    assert!(stdout.contains("Add Ward to PATH"));
 
     let release_output = StdCommand::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
-        .env("ENVGATE_INSTALL_DRY_RUN", "1")
-        .env("ENVGATE_INSTALL_BIN_DIR", bin_dir.path())
-        .env("ENVGATE_GITHUB_REPO", "owner/envgate")
+        .env("WARD_INSTALL_DRY_RUN", "1")
+        .env("WARD_INSTALL_BIN_DIR", bin_dir.path())
+        .env("WARD_GITHUB_REPO", "owner/ward")
         .env(
             "PATH",
             format!("{}:/usr/bin:/bin", bin_dir.path().display()),
@@ -3130,15 +3130,15 @@ fn install_script_dry_run_reports_target_and_path_hint() {
         .unwrap();
     assert!(release_output.status.success());
     let release_stdout = String::from_utf8(release_output.stdout).unwrap();
-    assert!(release_stdout.contains("Would download EnvGate release"));
-    assert!(release_stdout.contains("envgate is on PATH."));
+    assert!(release_stdout.contains("Would download Ward release"));
+    assert!(release_stdout.contains("ward is on PATH."));
 }
 
 #[test]
 #[serial_test::serial]
 fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     assert_eq!(
-        format!("{}", envgate::cli::ChildExit::new(7)),
+        format!("{}", ward::cli::ChildExit::new(7)),
         "child process exited with 7"
     );
 
@@ -3147,9 +3147,9 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     env::set_current_dir(keep_project.path()).unwrap();
-    env::set_var("ENVGATE_HOME", home.path());
-    env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
-    env::set_var("ENVGATE_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE);
+    env::set_var("WARD_HOME", home.path());
+    env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
+    env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE);
     std::fs::write(keep_project.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
     std::fs::write(
         keep_project.path().join(".env"),
@@ -3420,7 +3420,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         },
     })
     .unwrap();
-    let request_id = std::fs::read_dir(envgate::pending_requests::requests_dir())
+    let request_id = std::fs::read_dir(ward::pending_requests::requests_dir())
         .unwrap()
         .next()
         .unwrap()
@@ -3524,9 +3524,9 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     .unwrap();
 
     env::set_current_dir(old_cwd).unwrap();
-    env::remove_var("ENVGATE_HOME");
-    env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
-    env::remove_var("ENVGATE_UNSAFE_TEST_PASSPHRASE");
+    env::remove_var("WARD_HOME");
+    env::remove_var("WARD_UNSAFE_TEST_KEYRING");
+    env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
 }
 
 struct ContextParts {

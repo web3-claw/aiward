@@ -10,8 +10,8 @@ cargo test -- --test-threads=1
 cargo llvm-cov clean --workspace
 cargo llvm-cov --no-report -- --test-threads=1
 
-coverage_binary="target/llvm-cov-target/debug/envgate"
-coverage_profile="target/llvm-cov-target/env-gate-manual-%p-%m.profraw"
+coverage_binary="target/llvm-cov-target/debug/ward"
+coverage_profile="target/llvm-cov-target/ward-manual-%p-%m.profraw"
 
 run_coverage_help() {
   LLVM_PROFILE_FILE="$coverage_profile" "$coverage_binary" "$@" --help >/dev/null

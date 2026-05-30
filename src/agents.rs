@@ -39,7 +39,7 @@ pub struct AgentProof {
 }
 
 pub fn agents_path() -> PathBuf {
-    logs::envgate_home().join("agents.json")
+    logs::ward_home().join("agents.json")
 }
 
 pub fn ensure_agent(project: &str, agent_name: &str) -> Result<AgentIdentity> {
@@ -126,7 +126,7 @@ pub fn load_agents() -> Result<AgentState> {
 }
 
 pub fn save_agents(state: &AgentState) -> Result<()> {
-    fs_util::ensure_private_dir(&logs::envgate_home())?;
+    fs_util::ensure_private_dir(&logs::ward_home())?;
     let contents = serde_json::to_string_pretty(state).expect("agent state should serialize");
     fs_util::write_private_file(&agents_path(), format!("{contents}\n").as_bytes())
 }
@@ -153,7 +153,7 @@ mod tests {
     fn agent_identity_signs_and_verifies_payloads() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         let first = ensure_agent("demo", "codex").unwrap();
         let second = ensure_agent("demo", "codex").unwrap();
@@ -169,7 +169,7 @@ mod tests {
         missing_agent.agent_name = "claude".to_string();
         assert!(!verify_proof("demo", &missing_agent).unwrap());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -177,11 +177,11 @@ mod tests {
     fn agent_state_reports_invalid_files() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
         std::fs::create_dir_all(home.path()).unwrap();
         std::fs::write(agents_path(), "{bad-json}").unwrap();
         assert!(load_agents().is_err());
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
     fn agent_signing_reports_invalid_key_lengths() {
         let _guard = env_lock();
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", home.path());
+        std::env::set_var("WARD_HOME", home.path());
 
         let proof = sign_payload("demo", "codex", "payload").unwrap();
         let mut state = load_agents().unwrap();
@@ -217,6 +217,6 @@ mod tests {
         save_agents(&state).unwrap();
         assert!(verify_proof("demo", &proof).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 }

@@ -51,7 +51,7 @@ pub struct ResolvedProject {
 }
 
 pub fn registry_path() -> PathBuf {
-    logs::envgate_home().join("registry.json")
+    logs::ward_home().join("registry.json")
 }
 
 pub fn load_registry() -> Result<Registry> {
@@ -69,7 +69,7 @@ pub fn save_registry(registry: &Registry) -> Result<()> {
     let path = registry_path();
 
     let contents = serde_json::to_string_pretty(registry).expect("registry should serialize");
-    fs_util::ensure_private_dir(&logs::envgate_home())?;
+    fs_util::ensure_private_dir(&logs::ward_home())?;
     fs_util::write_private_file(&path, format!("{contents}\n").as_bytes())
 }
 
@@ -189,7 +189,7 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
             .context(format!("active project {active} is not registered"));
     }
 
-    anyhow::bail!("could not resolve EnvGate project; run envgate init or envgate use <project>")
+    anyhow::bail!("could not resolve Ward project; run ward init or ward use <project>")
 }
 
 fn registered_project(registry: &Registry, project: &str) -> Option<ResolvedProject> {
@@ -215,7 +215,7 @@ mod tests {
     }
 
     fn set_home(path: &Path) {
-        std::env::set_var("ENVGATE_HOME", path);
+        std::env::set_var("WARD_HOME", path);
     }
 
     fn registered(path: &Path, vault: &Path) -> RegisteredProject {
@@ -245,7 +245,7 @@ mod tests {
         std::fs::write(registry_path(), "{bad-json}").unwrap();
         assert!(load_registry().is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -266,7 +266,7 @@ mod tests {
         set_home(blocked_home.path());
         assert!(save_registry(&Registry::default()).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -297,7 +297,7 @@ mod tests {
         )
         .is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -323,7 +323,7 @@ mod tests {
         assert!(set_active_project("missing").is_err());
         assert!(resolve_project(Some("missing"), project.path()).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -335,7 +335,7 @@ mod tests {
         set_home(home.path());
 
         std::fs::write(
-            project.path().join(".envgate.json"),
+            project.path().join(".ward.json"),
             r#"{"version":1,"project":"demo","vault":".env.vault","presets":[]}"#,
         )
         .unwrap();
@@ -353,7 +353,7 @@ mod tests {
         let registered = resolve_project(None, project.path()).unwrap();
         assert_eq!(registered.vault, project.path().join("registered.vault"));
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -427,7 +427,7 @@ mod tests {
             "active"
         );
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -451,7 +451,7 @@ mod tests {
 
         assert!(resolve_project(None, outside.path()).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]
@@ -466,6 +466,6 @@ mod tests {
 
         assert!(resolve_project(None, outside.path()).is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 }

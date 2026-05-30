@@ -10,12 +10,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{fs_util, vault};
 
-const LOCKED_MARKER: &str = "# EnvGate managed locked .env";
-const VAULT_HASH_PREFIX: &str = "# envgate-vault-sha256:";
+const LOCKED_MARKER: &str = "# Ward managed locked .env";
+const VAULT_HASH_PREFIX: &str = "# ward-vault-sha256:";
 const UNLOCKED_HEADER: &str = "\
-# EnvGate unlocked plaintext .env.
+# Ward unlocked plaintext .env.
 # This file contains secrets for manual local development.
-# Run `envgate env lock` when you are done to re-encrypt and restore the locked file.
+# Run `ward env lock` when you are done to re-encrypt and restore the locked file.
 
 ";
 
@@ -39,7 +39,7 @@ pub fn unlock_env_file(
 ) -> Result<()> {
     if env_path.exists() && !force && !is_locked_env_file(env_path)? {
         anyhow::bail!(
-            "{} already exists and is not an EnvGate locked file; pass --force to overwrite",
+            "{} already exists and is not an Ward locked file; pass --force to overwrite",
             env_path.display()
         );
     }
@@ -68,10 +68,10 @@ pub fn export_env_file(
 pub fn lock_plaintext_source(source: &Path, vault_path: &Path, passphrase: &str) -> Result<()> {
     let plaintext =
         fs::read_to_string(source).context(format!("failed to read {}", source.display()))?;
-    let plaintext = strip_envgate_unlocked_header(&plaintext);
+    let plaintext = strip_ward_unlocked_header(&plaintext);
     if is_locked_env_contents(&plaintext) {
         anyhow::bail!(
-            "{} is already an EnvGate locked marker; unlock it before editing or provide a plaintext dotenv file",
+            "{} is already an Ward locked marker; unlock it before editing or provide a plaintext dotenv file",
             source.display()
         );
     }
@@ -161,12 +161,12 @@ pub fn locked_contents(vault_path: &Path) -> Result<String> {
         "\
 {LOCKED_MARKER}
 # Secrets are encrypted in {vault}.
-# Use `envgate run ...` for AI-safe secret injection.
-# Use `envgate env unlock` to write plaintext `.env` for manual local development.
-# Use `envgate env lock` to re-encrypt manual edits and restore this locked file.
+# Use `ward run ...` for AI-safe secret injection.
+# Use `ward env unlock` to write plaintext `.env` for manual local development.
+# Use `ward env lock` to re-encrypt manual edits and restore this locked file.
 {VAULT_HASH_PREFIX} {hash}
-ENVGATE_LOCKED=1
-ENVGATE_VAULT={vault}
+WARD_LOCKED=1
+WARD_VAULT={vault}
 ",
         vault = display_path(vault_path),
     ))
@@ -213,7 +213,7 @@ fn write_updated_vault(vault_path: &Path, passphrase: &str, plaintext: &str) -> 
 fn ensure_not_locked_marker(plaintext: &str, vault_path: &Path) -> Result<()> {
     if is_locked_env_contents(plaintext) {
         anyhow::bail!(
-            "{} contains an EnvGate locked marker instead of plaintext secrets; restore or re-import a plaintext dotenv file",
+            "{} contains an Ward locked marker instead of plaintext secrets; restore or re-import a plaintext dotenv file",
             vault_path.display()
         );
     }
@@ -239,14 +239,14 @@ fn recorded_vault_hash(contents: &str) -> Option<String> {
     })
 }
 
-fn strip_envgate_unlocked_header(contents: &str) -> String {
+fn strip_ward_unlocked_header(contents: &str) -> String {
     contents
         .lines()
-        .filter(|line| !line.starts_with("# EnvGate unlocked plaintext .env."))
+        .filter(|line| !line.starts_with("# Ward unlocked plaintext .env."))
         .filter(|line| {
             !line.starts_with("# This file contains secrets for manual local development.")
         })
-        .filter(|line| !line.starts_with("# Run `envgate env lock`"))
+        .filter(|line| !line.starts_with("# Run `ward env lock`"))
         .collect::<Vec<_>>()
         .join("\n")
         + "\n"
@@ -295,7 +295,7 @@ mod tests {
 
         lock_env_file(&env_path, &vault_path).unwrap();
         let contents = std::fs::read_to_string(&env_path).unwrap();
-        assert!(contents.contains("ENVGATE_LOCKED=1"));
+        assert!(contents.contains("WARD_LOCKED=1"));
         assert!(!contents.contains("postgres://local"));
         assert_eq!(
             inspect_env_file(&env_path, &vault_path).unwrap(),
@@ -357,7 +357,7 @@ mod tests {
         unlock_env_file(&env_path, &vault_path, "passphrase", false).unwrap();
         let unlocked = std::fs::read_to_string(&env_path).unwrap();
         assert!(unlocked.contains("postgres://local"));
-        assert!(unlocked.contains("EnvGate unlocked plaintext"));
+        assert!(unlocked.contains("Ward unlocked plaintext"));
 
         lock_plaintext_source(&env_path, &vault_path, "passphrase").unwrap();
         assert!(is_locked_env_file(&env_path).unwrap());
@@ -413,7 +413,7 @@ mod tests {
         .is_err());
         assert!(list_env_names(&vault_path, "passphrase").is_err());
         assert!(set_env_value(&vault_path, "passphrase", "PAYLOAD_SECRET=secret").is_err());
-        assert!(unset_env_value(&vault_path, "passphrase", "ENVGATE_LOCKED").is_err());
+        assert!(unset_env_value(&vault_path, "passphrase", "WARD_LOCKED").is_err());
     }
 
     #[test]

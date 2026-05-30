@@ -66,7 +66,7 @@ pub enum GrantIntegrityStatus {
 }
 
 pub fn grants_path() -> PathBuf {
-    logs::envgate_home().join("sessions").join("grants.jsonl")
+    logs::ward_home().join("sessions").join("grants.jsonl")
 }
 
 pub fn find_matching_grant(access: &AccessRequest) -> Result<Option<ApprovalGrant>> {
@@ -277,7 +277,7 @@ pub fn load_grants_from_path(path: &Path) -> Result<Vec<ApprovalGrant>> {
 }
 
 pub fn append_grant_to_path(path: &Path, grant: &ApprovalGrant) -> Result<()> {
-    ensure_envgate_home_for(path)?;
+    ensure_ward_home_for(path)?;
     let mut file = fs_util::open_private_append(path)?;
     let line = serde_json::to_string(grant).expect("approval grants should serialize");
     writeln!(file, "{line}").context(format!("failed to write {}", path.display()))
@@ -336,7 +336,7 @@ pub fn prune_expired_grants_at_path(path: &Path, now: DateTime<Utc>) -> Result<u
 }
 
 fn write_grants_to_path(path: &Path, grants: &[ApprovalGrant]) -> Result<()> {
-    ensure_envgate_home_for(path)?;
+    ensure_ward_home_for(path)?;
     fs_util::ensure_private_parent_dir(path)?;
     let mut file = fs::File::create(path).context(format!("failed to write {}", path.display()))?;
     fs_util::set_private_file_permissions(path)?;
@@ -347,8 +347,8 @@ fn write_grants_to_path(path: &Path, grants: &[ApprovalGrant]) -> Result<()> {
     Ok(())
 }
 
-fn ensure_envgate_home_for(path: &Path) -> Result<()> {
-    let home = logs::envgate_home();
+fn ensure_ward_home_for(path: &Path) -> Result<()> {
+    let home = logs::ward_home();
     if path.starts_with(&home) {
         fs_util::ensure_private_dir(&home)?;
     }
@@ -603,7 +603,7 @@ fn sign_grant(
         let signing_key = match unlock::active_run_signing_key(&access.project, vault)? {
             unlock::RunSigningLookup::Available(signing_key) => signing_key,
             unlock::RunSigningLookup::Missing => anyhow::bail!(
-            "signing_key_unavailable: run envgate unlock --ttl 8h before creating approval grants"
+            "signing_key_unavailable: run ward unlock --ttl 8h before creating approval grants"
         ),
             unlock::RunSigningLookup::MaterialUnavailable { reason } => {
                 anyhow::bail!("{reason}")
@@ -693,16 +693,16 @@ mod tests {
 
     fn setup_signing_home() -> (tempfile::TempDir, PathBuf) {
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
         unlock::create_run_unlock("ambienta", &vault, "1234", Duration::hours(1)).unwrap();
         (tempdir, vault)
     }
 
     fn clear_signing_home() {
-        std::env::remove_var("ENVGATE_HOME");
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_KEYRING");
+        std::env::remove_var("WARD_HOME");
+        std::env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     }
 
     fn grant(scope: ApprovalScope, now: DateTime<Utc>, vault: &Path) -> ApprovalGrant {
@@ -919,8 +919,8 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let sessions_path = tempdir.path().join("sessions");
         std::fs::write(&sessions_path, "").unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
-        std::env::set_var("ENVGATE_UNSAFE_TEST_KEYRING", "1");
+        std::env::set_var("WARD_HOME", tempdir.path());
+        std::env::set_var("WARD_UNSAFE_TEST_KEYRING", "1");
         let vault = tempdir.path().join(".env.vault");
         assert!(unlock::create_run_unlock("ambienta", &vault, "1234", Duration::hours(1)).is_err());
 
@@ -1173,7 +1173,7 @@ mod tests {
     fn persist_manual_grant_reports_unavailable_signing_material() {
         let _guard = env_lock();
         let (_home, vault) = setup_signing_home();
-        let key_store_path = crate::logs::envgate_home()
+        let key_store_path = crate::logs::ward_home()
             .join("cache")
             .join("keystore.json");
         std::fs::remove_file(key_store_path).unwrap();
@@ -1339,7 +1339,7 @@ mod tests {
     fn global_grant_helpers_report_invalid_grant_file() {
         let _guard = env_lock();
         let tempdir = tempfile::tempdir().unwrap();
-        std::env::set_var("ENVGATE_HOME", tempdir.path());
+        std::env::set_var("WARD_HOME", tempdir.path());
         let grants_dir = tempdir.path().join("sessions");
         std::fs::create_dir_all(&grants_dir).unwrap();
         std::fs::write(grants_dir.join("grants.jsonl"), "{bad-json}\n").unwrap();
@@ -1349,7 +1349,7 @@ mod tests {
         assert!(find_matching_non_always_grant(&access()).is_err());
         assert!(revoke_session_grants().is_err());
 
-        std::env::remove_var("ENVGATE_HOME");
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]

@@ -1,13 +1,13 @@
-# EnvGate Implementation Map
+# Ward Implementation Map
 
 ## Product boundary
 
-EnvGate protects against accidental local secret exposure in AI-assisted coding
+Ward protects against accidental local secret exposure in AI-assisted coding
 workflows. It is not a malware sandbox, kernel isolation layer, enterprise vault,
 or complete exfiltration prevention system.
 
-The MVP succeeds when plaintext `.env` files are replaced by EnvGate locked
-marker files, commands that need secrets run through `envgate run`, and every
+The MVP succeeds when plaintext `.env` files are replaced by Ward locked
+marker files, commands that need secrets run through `ward run`, and every
 secret-bearing execution has an approval and audit trail. This is the passive
 version: no shell hooks, no daemon, and no terminal-wide command scanning.
 
@@ -16,10 +16,10 @@ version: no shell hooks, no daemon, and no terminal-wide command scanning.
 ```txt
 src/
   cli/          CLI parsing and command dispatch
-  config/       Project-local .envgate.json
+  config/       Project-local .ward.json
   env_file/     Locked .env, manual unlock/export, and encrypted env edits
   vault/        .env.vault encryption and decryption
-  registry/     ~/.envgate project registry and active project selection
+  registry/     ~/.ward project registry and active project selection
   policy/       Preset matching and scoped env decisions
   approvals/    Interactive and agent-mediated approval decisions
   approval_receipts/ Signed approval receipt keys, payloads, signing, and verification
@@ -45,13 +45,13 @@ src/
 | Config | `ProjectConfig::default_for_dir` | Build initial project config. |
 | Config | `default_profiles` | Generate exact-env `dev` and `migrate` profiles from known vault keys. |
 | Config | `ensure_gitignore` | Keep plaintext env files ignored and optionally allow committed vaults. |
-| Config | `write_project_config` | Persist `.envgate.json`. |
+| Config | `write_project_config` | Persist `.ward.json`. |
 | Vault | `encrypt_env` | Encrypt dotenv plaintext using Argon2id and AES-256-GCM. |
 | Vault | `decrypt_env` | Decrypt `.env.vault` into in-memory dotenv text. |
 | Vault | `import_env_file` | Read `.env`, encrypt it, and write `.env.vault`. |
 | Env file | `lock_env_file` | Replace plaintext `.env` with a safe locked marker. |
 | Env file | `unlock_env_file` | Write plaintext `.env` for explicit manual local development. |
-| Registry | `register_project` | Add a canonical project and vault path to `~/.envgate/registry.json`. |
+| Registry | `register_project` | Add a canonical project and vault path to `~/.ward/registry.json`. |
 | Registry | `resolve_project` | Resolve project by explicit name, local config, active project, or path ancestry. |
 | Policy | `evaluate_request` | Match profiles/presets and decide whether approval is required. |
 | Approvals | `prompt_for_approval` | Ask allow-once/session/branch/deny in the terminal. |
@@ -68,7 +68,7 @@ src/
 | Detection | `preflight_findings` | Flag suspicious requested env/command/action combinations, including critical secret-exfiltration patterns. |
 | Anomaly | `detect_grant_anomalies` | Emit warning-only grant frequency, outside-hours, and branch-spread alerts. |
 | Runner | `run_command` | Decrypt approved env vars, inject them, stream redacted output, and log execution. |
-| Logs | `append_event` | Append encrypted hash-chained audit events under `~/.envgate/logs`. |
+| Logs | `append_event` | Append encrypted hash-chained audit events under `~/.ward/logs`. |
 | Git | `collect_git_context` | Collect safe git metadata for audit logs. |
 
 ## User flows
@@ -76,8 +76,8 @@ src/
 ### 1. Small onboarding setup
 
 ```txt
-User runs envgate init
-  -> create .envgate.json
+User runs ward init
+  -> create .ward.json
   -> generate dev and migrate profiles with vault-present exact env names
   -> import .env into .env.vault when present
   -> verify decrypt
@@ -88,12 +88,12 @@ User runs envgate init
   -> create approval key material and initial run unlock session unless --no-unlock is used
 ```
 
-`envgate setup --yes` runs the same recommended flow for scripts.
+`ward setup --yes` runs the same recommended flow for scripts.
 
 ### 2. Import existing .env
 
 ```txt
-User runs envgate import .env
+User runs ward import .env
   -> prompt for vault PIN/passphrase
   -> parse dotenv file
   -> encrypt full env content into .env.vault
@@ -104,19 +104,19 @@ User runs envgate import .env
 ### 3. Signed approval grant
 
 ```txt
-User runs envgate unlock --ttl 8h
+User runs ward unlock --ttl 8h
   -> decrypt vault to validate PIN/passphrase
   -> start or refresh the on-demand local broker
   -> load active project unlock capability into broker memory
   -> keep approval signing capability in broker memory
   -> write non-sensitive unlock metadata only
 
-User approves request or runs envgate allow
+User approves request or runs ward allow
   -> build canonical approval receipt payload
   -> ask broker to sign payload
   -> persist grant plus receipt hash, signer key id, algorithm, and signature
 
-Future envgate run
+Future ward run
   -> load candidate grant
   -> verify payload hash, public key signature, expiry, command hash, env subset, scope, branch, and agent
   -> ignore unsigned or modified grants
@@ -125,13 +125,13 @@ Future envgate run
 ### 3b. Brokered no-prompt agent execution
 
 ```txt
-Agent runs envgate run --json --no-prompt with full context
+Agent runs ward run --json --no-prompt with full context
   -> require agent, worktree, branch, git remote, commit, action, and command/profile/env data
   -> verify the claimed context with local Git and canonical paths
   -> verify or create an agent identity record
   -> evaluate worktree trust
   -> reuse only signed grants matching the verified context and agent identity
-  -> contact the broker over ~/.envgate/run/envgate.sock
+  -> contact the broker over ~/.ward/run/ward.sock
   -> broker decrypts only approved env vars in memory
   -> broker spawns the child command and streams redacted output
   -> execution logs include claimed and verified context plus broker session data
@@ -143,11 +143,11 @@ mismatched context returns structured JSON and the command does not execute.
 ### 2b. Manual self-use
 
 ```txt
-User runs envgate env unlock
+User runs ward env unlock
   -> prompt for vault PIN/passphrase
   -> decrypt .env.vault
   -> write plaintext .env with warning header and private permissions
-User runs envgate env lock
+User runs ward env lock
   -> parse current .env
   -> re-encrypt .env.vault
   -> restore locked .env marker
@@ -156,16 +156,16 @@ User runs envgate env lock
 ### 3. Register project for worktrees
 
 ```txt
-User runs envgate register ambienta
-  -> read .envgate.json
+User runs ward register ambienta
+  -> read .ward.json
   -> collect git remote and repo root
-  -> write ~/.envgate/registry.json
+  -> write ~/.ward/registry.json
 ```
 
 ### 4. Run a command with scoped env
 
 ```txt
-Agent/user runs envgate run --env DATABASE_URL -- pnpm dev
+Agent/user runs ward run --env DATABASE_URL -- pnpm dev
   -> resolve project
   -> collect git context
   -> evaluate preset/policy
@@ -183,14 +183,14 @@ Agent/user runs envgate run --env DATABASE_URL -- pnpm dev
   -> write warning-only anomaly alerts if grant behavior crosses thresholds
 ```
 
-When `--json --no-prompt` is used, EnvGate never opens an interactive prompt.
+When `--json --no-prompt` is used, Ward never opens an interactive prompt.
 It either executes with an existing grant and active unlock, returns an
 approval-required JSON payload, or returns an unlock-required JSON payload.
 
 ### 5. Request approval without execution
 
 ```txt
-Agent runs envgate request ...
+Agent runs ward request ...
   -> resolve project
   -> evaluate policy and detections
   -> reuse matching grant or prompt for approval
@@ -201,19 +201,19 @@ Agent runs envgate request ...
 Profile-backed requests use the same flow, but the agent only names a profile:
 
 ```txt
-Agent runs envgate request --profile dev --json --no-prompt
-  -> expand command/env/action from .envgate.json
+Agent runs ward request --profile dev --json --no-prompt
+  -> expand command/env/action from .ward.json
   -> create pending request without exposing vault contents
 ```
 
 ### 5b. Agent-mediated approval
 
 ```txt
-Agent runs envgate request --json --no-prompt ...
-  -> create pending request id under ~/.envgate/requests
+Agent runs ward request --json --no-prompt ...
+  -> create pending request id under ~/.ward/requests
   -> return JSON for the agent UI, including findings and critical confirmation text
 User approves in agent UI
-Agent records envgate approve <request-id> --scope session --agent-mediated --json
+Agent records ward approve <request-id> --scope session --agent-mediated --json
   -> create scoped grant without exposing vault keys
 ```
 
@@ -223,15 +223,15 @@ Critical requests restrict the approval surface:
 Agent sees confirmationRequired=true
   -> show warning title/body to the user
   -> deny by default unless the user explicitly permits the exact command
-Agent records envgate approve <request-id> --scope once --confirm-critical --agent-mediated --json
+Agent records ward approve <request-id> --scope once --confirm-critical --agent-mediated --json
   -> create a one-use approval only
 ```
 
 ### 6. Diagnose project safety
 
 ```txt
-User runs envgate doctor
-  -> check .envgate.json
+User runs ward doctor
+  -> check .ward.json
   -> check .env.vault
   -> check plaintext .env
   -> check .env.* variants except .env.example
@@ -244,15 +244,15 @@ User runs envgate doctor
 ### 7. Teardown
 
 ```txt
-User runs envgate teardown --yes
+User runs ward teardown --yes
   -> export plaintext dotenv from the vault to .env.export by default
-  -> remove project-local EnvGate config and vault files
+  -> remove project-local Ward config and vault files
   -> unregister the project
   -> remove project-scoped grants, pending requests, and unlock sessions
   -> preserve encrypted audit logs
 ```
 
-`envgate teardown --yes --restore-env` is the explicit opt-in for restoring
+`ward teardown --yes --restore-env` is the explicit opt-in for restoring
 plaintext `.env`.
 
 ## Next implementation priorities

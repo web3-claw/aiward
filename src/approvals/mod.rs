@@ -117,7 +117,7 @@ fn select_approval_scope(choices: Vec<ApprovalScope>) -> Result<ApprovalScope> {
 }
 
 pub(crate) fn test_approval_scope() -> Result<Option<ApprovalScope>> {
-    let Ok(value) = std::env::var("ENVGATE_UNSAFE_TEST_APPROVAL") else {
+    let Ok(value) = std::env::var("WARD_UNSAFE_TEST_APPROVAL") else {
         return Ok(None);
     };
     let scope = match value.trim().to_ascii_lowercase().as_str() {
@@ -126,7 +126,7 @@ pub(crate) fn test_approval_scope() -> Result<Option<ApprovalScope>> {
         "branch" => ApprovalScope::Branch,
         "always" => ApprovalScope::Always,
         "deny" => ApprovalScope::Deny,
-        other => anyhow::bail!("invalid ENVGATE_UNSAFE_TEST_APPROVAL value: {other}"),
+        other => anyhow::bail!("invalid WARD_UNSAFE_TEST_APPROVAL value: {other}"),
     };
     Ok(Some(scope))
 }
@@ -166,7 +166,7 @@ pub fn auto_approval(evaluation: &PolicyEvaluation) -> ApprovalDecision {
 }
 
 fn print_request_summary(request: &AccessRequest, evaluation: &PolicyEvaluation) {
-    eprintln!("EnvGate access request");
+    eprintln!("Ward access request");
     eprintln!("Project: {}", request.project);
     if let Some(agent) = &request.agent {
         eprintln!("Agent: {agent}");
@@ -197,14 +197,14 @@ fn print_request_summary(request: &AccessRequest, evaluation: &PolicyEvaluation)
 
 fn print_critical_warning() {
     eprintln!();
-    eprintln!("CRITICAL EnvGate warning");
+    eprintln!("CRITICAL Ward warning");
     eprintln!("This command matched known secret-exfiltration patterns.");
     eprintln!("Deny unless you explicitly expect this exact command to inspect secrets.");
 }
 
 fn print_action_warning() {
     eprintln!();
-    eprintln!("EnvGate action warning");
+    eprintln!("Ward action warning");
     eprintln!("The declared action contains suspicious or coercive text.");
     eprintln!("Review the exact command and requested env vars before approving.");
 }
@@ -341,13 +341,13 @@ mod tests {
             ("always", ApprovalScope::Always),
             ("deny", ApprovalScope::Deny),
         ] {
-            std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", value);
+            std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", value);
             assert_eq!(test_approval_scope().unwrap(), Some(expected));
         }
 
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "bad");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "bad");
         assert!(test_approval_scope().is_err());
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         assert_eq!(test_approval_scope().unwrap(), None);
     }
 
@@ -375,11 +375,11 @@ mod tests {
     #[serial_test::serial]
     fn prompt_for_approval_uses_test_scope() {
         let _guard = env_lock();
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "deny");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "deny");
 
         let decision = prompt_for_approval(&access(), &evaluation()).unwrap();
 
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         assert!(!decision.approved);
         assert_eq!(decision.scope, ApprovalScope::Deny);
     }
@@ -390,13 +390,13 @@ mod tests {
         let _guard = env_lock();
         let mut evaluation = evaluation();
         evaluation.findings = vec![Finding::critical("critical.test", "critical")];
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "session");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "session");
 
         assert!(prompt_for_approval(&access(), &evaluation).is_err());
 
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "once");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "once");
         let decision = prompt_for_approval(&access(), &evaluation).unwrap();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         assert_eq!(decision.scope, ApprovalScope::Once);
         assert!(decision.approved);
         assert!(validate_scope_for_critical(ApprovalScope::Always, true).is_err());
@@ -412,13 +412,13 @@ mod tests {
             "action.approval_coercion",
             "coercive action",
         )];
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "always");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "always");
 
         assert!(prompt_for_approval(&access(), &evaluation).is_err());
 
-        std::env::set_var("ENVGATE_UNSAFE_TEST_APPROVAL", "session");
+        std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "session");
         let decision = prompt_for_approval(&access(), &evaluation).unwrap();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         assert_eq!(decision.scope, ApprovalScope::Session);
     }
 
@@ -438,7 +438,7 @@ mod tests {
     #[serial_test::serial]
     fn prompt_for_approval_uses_coverage_terminal_stub_without_test_scope() {
         let _guard = env_lock();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
 
         let decision = prompt_for_approval(&access(), &evaluation()).unwrap();
 
@@ -451,7 +451,7 @@ mod tests {
     #[serial_test::serial]
     fn critical_prompt_uses_coverage_terminal_stub_without_test_scope() {
         let _guard = env_lock();
-        std::env::remove_var("ENVGATE_UNSAFE_TEST_APPROVAL");
+        std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         let mut evaluation = evaluation();
         evaluation.findings = vec![Finding::critical("critical.test", "critical")];
 
