@@ -1,0 +1,9 @@
+target/
+.env
+.env.*
+!.env.example
+.envgate-local/
+.envgate-test/
+.envgate-install/
+*.log
+.DS_Store
