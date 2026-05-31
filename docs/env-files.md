@@ -67,11 +67,16 @@ The setup flow:
 After setup, the intended checked-in files are:
 
 ```txt
-.ward.json
-.env.vault
 .env.example
 AGENTS.md or CLAUDE.md
 ```
+
+`.ward.json` is gitignored automatically because it contains the vault nonce —
+leaking the nonce weakens the derived filename. The vault itself has a derived
+filename (not `.env.vault`) and is also gitignored.
+
+If you were previously committing `.env.vault`, run `ward rotate` after upgrading
+to 0.4+ to get a derived filename, and remove the old file from git history.
 
 The generated profiles in `.ward.json` store exact env names:
 
@@ -116,6 +121,19 @@ ward env lock
 
 Do not commit plaintext `.env` files. `.env.example` should list required names
 without real secret values.
+
+## Session Encryption
+
+Starting with v0.4, the vault on disk is session-encrypted while an unlock
+session is active. When you run `ward unlock`, the broker:
+
+1. Decrypts the vault with your passphrase.
+2. Re-encrypts it with a random ephemeral key held only in broker memory.
+3. Writes the session-encrypted vault back to disk.
+
+Your passphrase-encrypted vault does not exist on disk while the session is
+active. When `ward lock` runs, the broker restores the vault to passphrase
+encryption before stopping.
 
 ## How Commands Get Secrets
 

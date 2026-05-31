@@ -39,7 +39,14 @@ cd your-project
 ward setup
 ```
 
-Ward will walk you through encrypting your `.env`, creating a project profile, and wiring up your shell. Your plaintext `.env` is replaced with a locked marker file — secrets live in `.env.vault` from this point on.
+Ward will walk you through:
+- Encrypting your `.env`
+- Choosing where to store secrets (OS keychain or encrypted vault file)
+- Creating a vault passphrase
+- Creating a recovery PIN and recovery key
+- Wiring up your shell
+
+Your plaintext `.env` is replaced with a locked marker file — secrets live in the encrypted vault from this point on.
 
 ---
 
@@ -146,7 +153,7 @@ ward logs verify            # verify log integrity
 ward doctor
 ```
 
-Checks your setup: vault, broker, gitignore, grants, and log integrity. Run this if something feels off.
+Checks your setup: vault, broker, gitignore, grants, recovery key, and log integrity. Run this if something feels off.
 
 ---
 
@@ -172,13 +179,32 @@ Ward detects and blocks suspicious agent behavior before it reaches the approval
 
 ## Security model
 
-Ward protects secrets when commands run through it. It does not prevent a user or process from reading `.env.vault` directly, accessing the keychain, or bypassing ward entirely. The security boundary is explicit opt-in, not OS-level isolation.
+Ward is designed for a specific threat: AI agents accessing secrets through commands — accidentally, through prompt injection, or by requesting broader scope than a task needs.
 
-What ward guarantees:
-- Secrets are never written to disk in plaintext during normal operation
-- Every secret injection is logged with the requesting identity and scope
-- Approval grants are signed — editing them invalidates them
-- Audit logs are hash-chained — tampering is detectable
+Within that boundary, ward gives you hard guarantees:
+
+- **Vault filename is derived, not fixed.** The vault has no predictable name on disk — it changes on each rotation and is only derivable with your passphrase.
+- **Session encryption.** While an unlock session is active, the vault on disk is re-encrypted with a random ephemeral key held only in broker memory. Your passphrase-encrypted form does not exist on disk during an active session.
+- **Recovery key with PIN.** A PIN-protected recovery key is stored locally. If a session is interrupted, ward can restore access without your vault passphrase. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct PIN.
+- **Secrets are never written to disk in plaintext** during normal operation.
+- **Every secret injection is logged** with the requesting identity and scope.
+- **Approval grants are signed** — editing them invalidates them.
+- **Audit logs are hash-chained** — tampering is detectable.
+
+Ward operates at the workflow layer, not the OS level. The protection is effective as long as secret-bearing commands run through ward — agents cannot access secrets outside their approved scope, and every injection is logged and attributable.
+
+---
+
+## Vault rotation and recovery
+
+```bash
+ward rotate                         # rotate vault to a new derived filename
+ward recovery create                # create a PIN-protected recovery key
+ward recovery export                # save a backup to a safe location
+ward recovery import /path/to/file  # restore a recovery key from backup
+```
+
+Ward doctor will warn you if the recovery key is missing or if no backup has been exported.
 
 ---
 

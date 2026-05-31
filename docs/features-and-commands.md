@@ -21,7 +21,7 @@ ward dev
 ward migrate
 ```
 
-Commands that bypass Ward are outside the MVP boundary:
+Commands that bypass Ward are outside its protection boundary:
 
 ```bash
 cat .env
@@ -50,23 +50,13 @@ cargo install aiward
 
 This installs the binary to `~/.cargo/bin/ward`.
 
-To build and install from source:
-
-```bash
-./install.sh
-```
-
-This builds the Rust release binary and installs it to `~/.local/bin/ward`.
-If `~/.local/bin` is not on `PATH`, the installer prints a short PATH fix.
-
 Ward uses local project files and global user state. It has no backend.
 
 Project-local files:
 
 ```txt
 .env
-.env.vault
-.ward.json
+.ward.json          (vault nonce, profiles, storage mode — gitignored automatically)
 .env.example
 AGENTS.md or CLAUDE.md
 ```
@@ -81,6 +71,7 @@ Global user state:
 |-- requests/
 |-- keys/
 |-- run/
+|-- recovery/       (recovery key + decoy files)
 |-- worktrees.json
 |-- agents.json
 `-- cache/
@@ -95,20 +86,88 @@ state files: 0600
 
 ## Core Features
 
-### Encrypted Env Vault
+### Encrypted Env Vault — Dynamic Filename
 
-Ward stores canonical secrets in `.env.vault`.
+Ward stores canonical secrets in an encrypted vault file. Starting with v0.4, the
+vault has no fixed name. Its filename is derived from your passphrase, project name,
+and a random nonce stored in `.ward.json`. The filename:
+
+- Looks like random data to anyone who doesn't know your passphrase
+- Changes on every `ward rotate`
+- Is only reproducible if you know the passphrase
 
 The vault is encrypted with:
 
 ```txt
-Argon2id key derivation
+Argon2id key derivation (m=65536, t=3, p=1)
 AES-256-GCM encryption
 ```
 
-The PIN/passphrase is required to decrypt, edit, export, or lock/unlock env
-files. A 4-character PIN is accepted as the minimum convenience mode for local
-use; use a longer passphrase if `.env.vault` may leave the machine.
+The PIN/passphrase is required to decrypt, edit, export, or lock/unlock env files.
+A 4-character minimum PIN is accepted for convenience; use a longer passphrase for
+higher-value projects.
+
+### Session Encryption
+
+When you run `ward unlock`, the broker does two things:
+
+1. Decrypts the vault with your passphrase to verify it.
+2. Immediately re-encrypts the vault with a random ephemeral key held only in broker memory.
+
+While your unlock session is active, the on-disk vault is encrypted with that
+ephemeral key — your passphrase-encrypted form does not exist on disk. When you
+run `ward lock`, the broker decrypts with the session key and re-encrypts with your
+passphrase before shutting down.
+
+If the broker crashes mid-session, use `ward recovery restore` or `ward unlock`
+to trigger the recovery flow.
+
+### Storage Mode
+
+During setup, you choose where secrets are stored:
+
+```txt
+vault-file  — encrypted vault file (works everywhere, including CI and Docker)
+keychain    — OS keychain protected by Touch ID / system login
+```
+
+The choice is stored in `.ward.json` as `storageMode`. Keychain mode uses the
+platform native secret store; vault-file mode uses the Argon2id+AES-GCM vault.
+
+### Recovery System
+
+Ward creates a PIN-protected recovery key during setup. If a session is interrupted
+and the broker cannot restore the vault automatically, the recovery key can decrypt
+it using only your PIN.
+
+The recovery directory at `~/.ward/recovery/` contains the real key alongside
+a number of decoy files. All files in the directory are the same size and
+indistinguishable without the correct PIN. The real recovery file is identified
+by a filename derived from your passphrase — ward finds it automatically.
+
+Recovery commands:
+
+```bash
+ward recovery create                # create recovery key (prompts for passphrase + PIN)
+ward recovery export --output ~/Desktop  # save backup to Desktop
+ward recovery import /path/to/file  # restore from external backup
+```
+
+`ward doctor` warns if the recovery key is missing or no backup has been exported.
+
+### Vault Rotation
+
+`ward rotate` generates a new random nonce, re-encrypts the vault, writes it
+to the new derived filename, and removes the old file. This is automatic and
+transparent to agents — the new filename is derived from the same passphrase
+plus the new nonce.
+
+```bash
+ward rotate
+```
+
+`.ward.json` is updated with the new nonce and is gitignored automatically on
+setup so the nonce never leaks into git history.
 
 ### Managed Locked `.env`
 
@@ -164,11 +223,7 @@ without seeing vault contents.
 New `.ward.json` files do not include presets by default. Presets are still
 supported for legacy/custom configs, but they are lower-level policy rules for
 raw command matching and approval behavior. Use profiles for normal user and
-agent workflows. Use presets only when you need policy matching for commands
-that do not have a profile.
-Profile env lists are treated as the expected scope for profile-backed
-requests; env vars listed in a matched profile do not produce
-`env.scope_deviation`.
+agent workflows.
 
 ### Approval Grants
 
@@ -196,34 +251,25 @@ deny     logged as denial, not persisted as an allow grant
 
 ### On-Demand Broker and Unlock Sessions
 
-Guided `ward init` and `ward setup` create the first short-lived run
-unlock session by default. `ward unlock --ttl 8h` refreshes it later after
-expiry or after `ward lock`. Unlock sessions let Ward decrypt internally
-for approved `ward run` commands without repeatedly prompting for the vault
-PIN/passphrase.
-
-`ward unlock` starts or refreshes an on-demand local broker. The broker keeps
-active vault decrypt capability and session signing capability in memory and
-listens on a private Unix socket:
+`ward unlock` starts an on-demand local broker. The broker keeps active vault
+decrypt capability and session signing capability in memory and listens on a
+private Unix socket:
 
 ```txt
 ~/.ward/run/ward.sock
 ```
 
 The broker is not installed as a daemon. It starts only when Ward is
-contacted, it does not hook the shell, and it does not monitor the filesystem or
-terminal input. `~/.ward/sessions/unlocks.json` is non-sensitive session
-metadata; active decrypt material lives in broker memory.
+contacted, does not hook the shell, and does not monitor the filesystem or
+terminal input.
+
+While the broker is running:
+- The vault on disk is session-encrypted (ephemeral key, not your passphrase)
+- The original passphrase-encrypted vault is restored when `ward lock` is run
+- The ephemeral key exists only in broker memory
 
 Unlock material is never printed, accepted as a CLI argument, written to project
 files, or exposed to agents.
-
-Approval grants and unlock sessions are separate:
-
-```txt
-grant           says "this command may use these env names"
-unlock session  lets Ward decrypt internally for the approved command
-```
 
 ### Agent Non-Interactive Flow
 
@@ -242,7 +288,6 @@ ward run --profile dev \
 
 In no-prompt mode, Ward never opens a TTY prompt.
 For repositories with no `origin` remote, pass `--git-remote ""` explicitly.
-Omitting `--git-remote` is still treated as missing context.
 
 No-prompt agent calls must always include complete context:
 
@@ -256,58 +301,10 @@ No-prompt agent calls must always include complete context:
 --profile
 ```
 
-For non-profile commands, replace `--profile` with exact `--command` and exact
-`--env` names. Ward verifies the claimed worktree, branch, remote, commit,
-and canonical path locally before creating approvals, reusing grants, signing
-receipts, or executing.
-
-If approval is missing, Ward returns JSON with:
-
-```txt
-approvalRequired
-requestId
-approvalOptions
-approveCommands
-denyCommand
-findings
-critical confirmation fields when needed
-```
-
-Agents should show approval choices with native structured UI when available,
-not loose prose. If the response includes `action.*` findings, surface them
-before asking for approval; suspicious action text removes `always` from the
-available approval scopes.
-
-If approval exists but run unlock is missing, Ward returns JSON with:
-
-```txt
-unlockRequired: true
-unlockCommand: "ward unlock --ttl 8h"
-```
-
-If context is missing or mismatched, Ward returns structured JSON such as
-`context_required`, `context_mismatch`, or `worktree_approval_required` and does
-not execute. Agent-facing mismatch JSON redacts Ward's verified value and
-returns `actualPresent` plus `actualHash` instead.
-
 ### Worktree Orchestration
 
-Ward orchestrates worktree access only when an Ward command is contacted.
+Ward orchestrates worktree access only when a Ward command is contacted.
 It does not scan directories in the background.
-
-Registered projects can define trusted worktree roots. A contacted worktree is
-auto-bound only when:
-
-```txt
-the path is under an allowed root
-Git remote/branch/commit verification matches the registered project
-the command/request supplies full agent context
-```
-
-Weak matches create a pending worktree request for human approval. Unknown or
-mismatched folders are denied. Automatic env delivery means scoped process
-injection by `ward run`; Ward does not write plaintext `.env` into agent
-worktrees.
 
 ### Critical Exploit Confirmation
 
@@ -315,89 +312,36 @@ Ward has deterministic preflight detection for common secret-exfiltration
 patterns, including:
 
 ```txt
-printenv
-bare env
-set
-export -p
+printenv / bare env / set / export -p
 /proc/self/environ
-process.env
-os.environ
-$_ENV
+process.env / os.environ / $_ENV
 direct echo of requested env names
 base64, xxd, hexdump, od, openssl enc
 pbcopy, curl, wget, nc, telnet when paired with env inspection
 ```
 
 Critical requests:
-
-```txt
-cannot receive session, branch, or always grants
-can only be denied or approved once
-require --confirm-critical on approval
-force fresh approval even if a durable grant exists
-```
+- Cannot receive session, branch, or always grants
+- Can only be denied or approved once
+- Require `--confirm-critical` on approval
 
 ### Scoped Env Injection
 
 `ward run` decrypts the vault internally and injects only approved env names
-into the child process.
-
-Example:
-
-```bash
-ward run --agent codex --action "Run migration" --env DATABASE_URL -- pnpm payload migrate
-```
-
-Only `DATABASE_URL` is injected if approved.
+into the child process. No other env vars are visible to the child.
 
 ### Output Redaction and Alerts
 
-Ward redacts exact injected secret values from child stdout/stderr. It also
-logs alerts for output that looks like:
-
-```txt
-env dumps
-secret-shaped KEY=value output
-known high-risk key names
-```
-
-The current MVP does not interrupt the child process for output alerts. It
-redacts and logs.
+Ward redacts exact injected secret values from child stdout/stderr and logs
+alerts for output that looks like env dumps, secret-shaped KEY=value output,
+or known high-risk key names.
 
 ### Encrypted Tamper-Evident Logs
 
-Logs are encrypted JSONL envelopes under:
-
-```txt
-~/.ward/logs/
-```
-
-Log kinds:
-
-```txt
-requests
-approvals
-executions
-alerts
-sessions
-```
-
-Each log entry includes cleartext verification metadata:
-
-```txt
-version
-kind
-sequence
-timestamp
-previous hash
-nonce
-ciphertext
-entry hash
-```
+Log kinds: `requests`, `approvals`, `executions`, `alerts`, `sessions`.
 
 Payloads are AES-256-GCM encrypted. Hash chains make modification or reordering
-detectable. Same-user deletion is not physically prevented; deleted logs should
-be treated as a high-severity signal.
+detectable.
 
 ### Doctor Checks
 
@@ -405,52 +349,34 @@ be treated as a high-severity signal.
 
 ```txt
 .ward.json exists and parses
-.env.vault exists
+vault file exists (at derived path)
 project resolves through registry
 plaintext .env warnings
 locked/stale/missing .env state
-.env.* likely-secret warnings, excluding .env.example and .env.vault
-.gitignore contains .env and .env.*
+.env.* likely-secret warnings
+.gitignore contains .env, .env.*, and .ward.json
 registered vault path exists
+recovery key exists
+recovery backup exported
 encrypted alert count
 ```
 
-### Teardown
-
-`ward teardown` exports plaintext env, verifies it, removes project-local
-Ward files, unregisters the project, and removes project-scoped local state.
-Encrypted audit logs are preserved by default.
+---
 
 ## First-Time Setup
-
-Recommended onboarding:
 
 ```bash
 cargo install aiward
 ward init --project my-project
-ward allow --profile dev --scope always --agent codex
-ward dev --agent codex
+ward recovery create
+ward recovery export
+ward doctor
 ```
 
-`ward init` is the human-friendly entry point. If `.env` or `.env.vault`
-exists, it performs the boring setup steps:
+`ward init` creates the initial run unlock session by default. The initial
+session-encrypted vault is ready immediately after setup.
 
-```txt
-creates or updates .ward.json
-imports .env into .env.vault when .env exists
-verifies vault decrypt
-replaces .env with locked marker by default
-creates or updates .env.example
-creates or updates AGENTS.md or CLAUDE.md
-updates .gitignore
-registers the project globally
-generates dev and migrate profiles from vault-present env names
-creates the initial run unlock session unless --no-unlock is used
-logs setup event
-```
-
-Use `ward setup --yes --project my-project` for scriptable onboarding with
-the same recommended defaults.
+---
 
 ## Command Reference
 
@@ -469,26 +395,61 @@ Options:
 --project <name>      project name
 --source <path>       source dotenv file, default .env
 --vault <path>        vault path, default .env.vault
---commit-vault        keep .env.vault commit-friendly through .gitignore
---ignore-vault        add/keep .env.vault ignored
+--commit-vault        keep vault commit-friendly through .gitignore
+--ignore-vault        add/keep vault ignored
 --keep-plaintext      unsafe escape hatch; leave plaintext source unchanged
 --remove-plaintext    deprecated; remove source after import
 --unlock-ttl <ttl>    initial run unlock TTL, default 8h
 --no-unlock           skip initial run unlock creation
 ```
 
-Default behavior is to encrypt `.env`, verify the vault, then replace `.env`
-with the locked marker and create an initial run unlock session.
-Generated profiles include only env names verified in `.env.vault`. If a later
-manual config edit requests an env var that is absent from the vault,
-no-prompt runs return `vault_key_missing`, not `unlock_required`.
+### `ward rotate`
+
+Rotate the vault to a new derived filename. Generates a new random nonce,
+re-encrypts the vault at the new path, and removes the old file.
+
+```bash
+ward rotate
+```
+
+`.ward.json` is updated with the new nonce. Run after any suspected filename
+exposure.
+
+### `ward recovery create`
+
+Create a PIN-protected recovery key for this project. Generates the real key
+and a set of decoy files in `~/.ward/recovery/`.
+
+```bash
+ward recovery create
+```
+
+Prompts for the vault passphrase and a new PIN (min 4 characters, any characters).
+
+### `ward recovery export`
+
+Export the real recovery key to a safe external location.
+
+```bash
+ward recovery export
+ward recovery export --output /Volumes/USB
+```
+
+Defaults to the Desktop if `--output` is omitted. Store the exported file
+somewhere separate from your machine (USB drive, secure cloud backup).
+
+### `ward recovery import`
+
+Restore a recovery key backup into `~/.ward/recovery/`.
+
+```bash
+ward recovery import /path/to/backup.key
+```
 
 ### `ward init`
 
-Run guided human onboarding by default. If `.env` or `.env.vault` exists,
-`init` delegates to the recommended setup flow: config, vault import or
-validation, locked `.env`, registry, profiles, `.gitignore`, agent docs, and an
-initial run unlock session.
+Guided human onboarding. If `.env` or `.env.vault` exists, delegates to
+the full setup flow.
 
 ```bash
 ward init
@@ -497,540 +458,32 @@ ward init --bare
 ward init --force
 ```
 
-Use `--bare` for the old config-only behavior, which creates or updates:
-
-```txt
-.ward.json
-.env.example
-AGENTS.md or CLAUDE.md
-```
-
 ### `ward import`
 
-Encrypt an existing dotenv file into a vault and lock the source env file.
+Encrypt an existing dotenv file into a vault.
 
 ```bash
 ward import .env
 ward import .env --vault .env.vault
 ```
 
-Responsibilities:
-
-```txt
-prompt for PIN/passphrase
-validate dotenv syntax
-encrypt into .env.vault
-verify decrypt
-replace source .env with locked marker
-log vault import
-```
-
-### `ward register`
-
-Compatibility alias for project registration.
-
-```bash
-ward register my-project
-ward register my-project --path /path/to/project
-ward register my-project --vault /path/to/project/.env.vault
-```
-
-Prefer `ward projects register` for new docs and workflows.
-
-### `ward use`
-
-Compatibility alias for selecting the active global project.
-
-```bash
-ward use my-project
-```
-
-Prefer `ward projects use`.
-
-## Global Project Commands
-
-### `ward projects list`
-
-List registered projects.
-
-```bash
-ward projects list
-```
-
-Shows project name, path, vault path, and active marker.
-
-### `ward projects show`
-
-Show a registered project or the project resolved from the current directory.
-
-```bash
-ward projects show
-ward projects show my-project
-```
-
-### `ward projects register`
-
-Register a project globally.
-
-```bash
-ward projects register my-project
-ward projects register my-project --path /path/to/project
-ward projects register my-project --vault /path/to/project/.env.vault
-```
-
-### `ward projects use`
-
-Set the active global project.
-
-```bash
-ward projects use my-project
-```
-
-The active project is used when Ward cannot resolve a project from local
-config, path ancestry, or git remote.
-
-### `ward projects remove`
-
-Remove a project from the global registry.
-
-```bash
-ward projects remove my-project
-```
-
-This removes the registry entry only. It does not delete project files or logs.
-
-## Broker Commands
-
-### `ward broker status`
-
-Show whether the on-demand broker is reachable, its socket path, pid when
-available, and active project sessions.
-
-```bash
-ward broker status
-```
-
-### `ward broker socket-path`
-
-Print the private Unix socket path.
-
-```bash
-ward broker socket-path
-```
-
-### `ward broker stop`
-
-Ask the broker to stop.
-
-```bash
-ward broker stop
-```
-
-`ward lock` also clears broker unlock state and stops the idle broker.
-
-## Worktree Commands
-
-### `ward worktrees list`
-
-List trusted roots, known worktrees, and pending worktree requests for a project.
-
-```bash
-ward worktrees list --project my-project
-```
-
-### `ward worktrees allow-root`
-
-Allow automatic binding for verified worktrees under a root path.
-
-```bash
-ward worktrees allow-root --project my-project /Users/me/worktrees
-```
-
-### `ward worktrees remove-root`
-
-Remove a trusted root.
-
-```bash
-ward worktrees remove-root --project my-project /Users/me/worktrees
-```
-
-### `ward worktrees approve`
-
-Approve a pending weak worktree match.
-
-```bash
-ward worktrees approve <request-id>
-```
-
-### `ward worktrees deny`
-
-Deny a pending weak worktree match.
-
-```bash
-ward worktrees deny <request-id>
-```
-
-## Env Vault Commands
-
-### `ward env list`
-
-List env names stored in the encrypted vault.
-
-```bash
-ward env list
-ward env list --project my-project
-```
-
-Prompts for the vault PIN/passphrase. Values are not printed.
-
-### `ward env set`
-
-Set or update one encrypted env value.
-
-```bash
-ward env set DATABASE_URL=postgres://local
-ward env set --project my-project STRIPE_SECRET_KEY=sk_test_xxx
-```
-
-Responsibilities:
-
-```txt
-prompt for PIN/passphrase
-decrypt vault in memory
-set KEY=value
-validate dotenv syntax
-re-encrypt vault
-refresh locked .env marker
-write encrypted audit event
-```
-
-### `ward env unset`
-
-Remove one encrypted env value.
-
-```bash
-ward env unset DATABASE_URL
-ward env unset --project my-project STRIPE_SECRET_KEY
-```
-
-The command logs whether the key existed.
-
-### `ward env unlock`
-
-Write plaintext dotenv contents for manual human local development.
-
-```bash
-ward env unlock
-ward env unlock --project my-project
-ward env unlock --output .env.local
-ward env unlock --force
-```
-
-This prompts for the vault PIN/passphrase and writes plaintext with a warning
-header. The output file is written with restrictive permissions where supported.
-
-Use this only when a human intentionally wants to run local tools outside
-Ward.
-
-### `ward env lock`
-
-Re-encrypt a plaintext dotenv file and restore the locked marker.
-
-```bash
-ward env lock
-ward env lock --source .env.local
-ward env lock --project my-project
-```
-
-Responsibilities:
-
-```txt
-prompt for PIN/passphrase
-parse plaintext dotenv
-re-encrypt .env.vault
-verify decrypt
-rewrite source .env back to locked marker
-log encrypted audit event
-```
-
-### `ward env export`
-
-Export plaintext dotenv contents to a separate file.
-
-```bash
-ward env export --output .env.export
-ward env export --project my-project --output /tmp/my-project.env
-ward env export --output .env.export --force
-```
-
-Stdout export is intentionally explicit because it can leak secrets:
-
-```bash
-ward env export --unsafe-stdout
-```
-
-## Request and Approval Commands
-
-### `ward request`
-
-Request secret access without running a command.
-
-Interactive example:
-
-```bash
-ward request \
-  --agent codex \
-  --branch feature/example \
-  --action "Run migration" \
-  --command "pnpm payload migrate" \
-  --env DATABASE_URL \
-  --env PAYLOAD_SECRET
-```
-
-Agent-facing no-prompt example:
-
-```bash
-ward request --profile dev \
-  --agent codex \
-  --worktree /repo \
-  --git-remote https://example.test/repo.git \
-  --commit <sha> \
-  --branch feature/example \
-  --json \
-  --no-prompt
-```
-
-No-prompt mode creates a pending request and prints JSON containing approval
-commands for the human or agent UI to surface.
-
-### `ward approve`
-
-Approve a pending request.
-
-```bash
-ward approve <request-id> --scope once
-ward approve <request-id> --scope session --agent-mediated --json
-ward approve <request-id> --scope branch --agent-mediated --json
-ward approve <request-id> --scope always --agent-mediated --json
-```
-
-Critical requests require once-only explicit confirmation:
-
-```bash
-ward approve <request-id> --scope once --confirm-critical --agent-mediated --json
-```
-
-Critical requests cannot be approved as `session`, `branch`, or `always`.
-
-### `ward deny`
-
-Deny a pending request.
-
-```bash
-ward deny <request-id>
-ward deny <request-id> --agent-mediated --json
-```
-
-Denials are logged but never persisted as allow grants.
-
-### `ward allow`
-
-Create a durable approval grant directly for known safe commands.
-
-```bash
-ward allow --profile dev --scope always --agent codex
-ward allow --profile migrate --scope branch --agent codex --branch feature/db
-ward allow --scope always --agent codex --command "pnpm dev" --env DATABASE_URL
-```
-
-For profiles, the default scope is used when `--scope` is omitted:
-
-```txt
-dev      always
-migrate  branch
-```
-
-For non-profile `--command` usage, `--scope` is required.
-
-`ward allow` refuses critical commands because it only creates durable
-grants.
-
-## Grant Commands
-
-Reusable approval grants are signed. Ward creates a per-project Ed25519
-approval key, stores the public metadata under `~/.ward/keys/`, and keeps the
-private key encrypted with the project PIN/passphrase. During `ward unlock`,
-signing capability is loaded into broker memory. `ward approve` and `ward
-allow` ask the broker to create
-a receipt for the exact approved project, agent, branch, command hash, env
-names, scope, expiry, request id, and critical-confirmation state.
-
-An active broker unlock session is therefore required before creating reusable
-approval grants:
-
-```bash
-ward unlock --ttl 8h
-ward approve <request-id> --scope session --agent-mediated --json
-ward allow --profile dev --scope always --agent codex
-```
-
-Unsigned legacy grants and edited grants are ignored during reuse. `doctor`
-reports invalid or unsigned grants, and `grants list` shows each grant's signed
-status and receipt hash.
-
-### `ward grants list`
-
-List stored approval grants, including signature status.
-
-```bash
-ward grants list
-```
-
-### `ward grants revoke`
-
-Revoke one grant.
-
-```bash
-ward grants revoke <grant-id>
-```
-
-### `ward grants prune`
-
-Remove expired grants.
-
-```bash
-ward grants prune
-```
-
-## Run Commands
-
-### `ward run`
-
-Run a command with scoped secret injection.
-
-Manual command example:
-
-```bash
-ward run \
-  --agent codex \
-  --action "Run dev server" \
-  --env DATABASE_URL \
-  -- pnpm dev
-```
-
-All Ward flags must appear before `--`. Everything after `--` is passed to
-the child command:
-
-```bash
-# Correct
-ward run --agent codex --action "Run dev" --env DATABASE_URL --json --no-prompt -- pnpm dev
-
-# Wrong: --json and --no-prompt are pnpm arguments here
-ward run --agent codex --action "Run dev" --env DATABASE_URL -- pnpm dev --json --no-prompt
-```
-
-Profile example:
-
-```bash
-ward run --profile dev --agent codex
-```
-
-Agent-safe no-prompt example:
-
-```bash
-ward run --profile dev \
-  --agent codex \
-  --worktree /repo \
-  --git-remote https://example.test/repo.git \
-  --commit <sha> \
-  --branch feature/example \
-  --json \
-  --no-prompt
-```
-
-Behavior:
-
-```txt
-resolve project
-expand profile if provided
-evaluate policy and critical findings
-check approval grants
-in no-prompt mode, return JSON if approval or unlock is missing
-write execution.started encrypted log before spawning
-decrypt vault internally
-inject only approved env names
-redact stdout/stderr
-write execution.finished and alert logs
-return child exit code behavior through Ward
-```
-
-### `ward dev`
-
-Shortcut for:
-
-```bash
-ward run --profile dev
-```
-
-Examples:
-
-```bash
-ward dev --agent codex
-ward dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/example --json --no-prompt
-```
-
-### `ward migrate`
-
-Shortcut for:
-
-```bash
-ward run --profile migrate
-```
-
-Examples:
-
-```bash
-ward migrate --agent codex --branch feature/db
-ward migrate --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/db --json --no-prompt
-```
-
-## Vault Session Commands
-
 ### `ward unlock`
 
-Create a short-lived run unlock session.
+Create a short-lived run unlock session. Triggers session encryption of the vault.
 
 ```bash
 ward unlock
 ward unlock --ttl 8h
-ward unlock --ttl 30m
-ward unlock --ttl 1d
+ward unlock --ttl 30m --mode dev
 ```
-
-Supported TTL suffixes:
-
-```txt
-m minutes
-h hours
-d days
-```
-
-This validates the vault PIN/passphrase, loads unlock capability into broker
-memory, and lets approved `ward run` commands decrypt internally until the
-TTL expires.
-
-`ward unlock` is for command execution only. It does not unlock logs view or
-edit.
 
 ### `ward lock`
 
-Clear run unlock sessions and revoke session-scoped grants.
+Restore the vault to passphrase encryption and clear run unlock sessions.
 
 ```bash
 ward lock
 ```
-
-It does not remove branch or always grants.
 
 ### `ward edit`
 
@@ -1040,217 +493,107 @@ Safely edit the encrypted vault.
 ward edit
 ```
 
-Flow:
-
-```txt
-prompt for vault PIN/passphrase
-decrypt to temporary file with restrictive permissions
-open $EDITOR, VISUAL, or nano
-validate dotenv syntax after editor exits
-re-encrypt .env.vault
-remove temporary file
-log edit event
-```
-
-## Logs Commands
-
-### `ward logs`
-
-Print encrypted log directory or encrypted log paths.
-
-```bash
-ward logs
-ward logs requests
-ward logs approvals
-ward logs executions
-ward logs alerts
-ward logs sessions
-```
-
-This does not decrypt logs.
-
-### `ward logs view`
-
-Decrypt and print one log kind.
-
-```bash
-ward logs view executions
-ward logs view alerts
-```
-
-Always prompts for the vault PIN/passphrase before decrypting. Ward prints a
-warning that logs are read-only for review, edits are tamper-evident, and
-deleted logs are serious.
-
-Encrypted audit log payloads use a random local log key stored at
-`~/.ward/cache/log-key.json` with private file permissions. Ward does not
-use the OS Keychain for this log key in the normal path.
-
-### `ward logs export`
-
-Decrypt one log kind and write it to a file.
-
-```bash
-ward logs export executions --output executions.jsonl
-ward logs export alerts --output alerts.jsonl --force
-```
-
-Always prompts for the vault PIN/passphrase.
-
-### `ward logs verify`
-
-Verify encrypted log metadata and hash chains without decrypting payloads.
-
-```bash
-ward logs verify
-ward logs verify executions
-```
-
-Use this to detect malformed, modified, or reordered log entries.
-
-### `ward logs verify --full`
-
-Verify hash chains and decryptability.
-
-```bash
-ward logs verify --full
-ward logs verify executions --full
-```
-
-This requires the vault PIN/passphrase.
-
-### `ward logs unlock`
-
-Deprecated compatibility command.
-
-```bash
-ward logs unlock --ttl 15m
-```
-
-It validates the PIN/passphrase but does not enable future log viewing.
-`logs view` and `logs export` still prompt every time.
-
-## Maintenance Commands
-
 ### `ward doctor`
 
-Inspect current project health.
+Inspect current project health including vault, recovery, gitignore, broker,
+grants, and logs.
 
 ```bash
 ward doctor
 ```
 
-Use this after setup, after moving worktrees, or after manual file changes.
+### `ward rotate`
+
+Rotate vault to a new derived filename with a fresh nonce.
+
+```bash
+ward rotate
+```
+
+### `ward env list / set / unset / unlock / lock / export`
+
+```bash
+ward env list
+ward env set DATABASE_URL=postgres://local
+ward env unset DATABASE_URL
+ward env unlock --output .env
+ward env lock --source .env
+ward env export --output .env.export
+```
+
+### `ward run / dev / migrate`
+
+Run a command with scoped secret injection.
+
+```bash
+ward run --profile dev --agent codex --json --no-prompt
+ward dev --agent codex
+ward migrate --agent codex --branch feature/db
+```
+
+### `ward request / approve / deny / allow`
+
+```bash
+ward request --profile dev --agent codex --json --no-prompt
+ward approve <id> --scope always --agent-mediated --json
+ward deny <id> --agent-mediated --json
+ward allow --profile dev --scope always --agent codex
+```
+
+### `ward grants list / revoke / prune`
+
+```bash
+ward grants list
+ward grants revoke <grant-id>
+ward grants prune
+```
+
+### `ward logs view / verify / export`
+
+```bash
+ward logs view executions
+ward logs verify
+ward logs verify --full
+ward logs export executions --output executions.jsonl
+```
+
+### `ward broker status / stop / socket-path`
+
+```bash
+ward broker status
+ward broker stop
+ward broker socket-path
+```
+
+### `ward projects list / show / register / use / remove`
+
+```bash
+ward projects list
+ward projects show my-project
+ward projects register my-project
+ward projects use my-project
+ward projects remove my-project
+```
+
+### `ward worktrees list / allow-root / remove-root / approve / deny`
+
+```bash
+ward worktrees list --project my-project
+ward worktrees allow-root --project my-project /Users/me/worktrees
+ward worktrees approve <id>
+ward worktrees deny <id>
+```
 
 ### `ward teardown`
 
-Export plaintext env, remove Ward project-local files, and unregister the
-project.
+Export plaintext env, remove Ward project-local files, and unregister.
 
 ```bash
 ward teardown --yes
-ward teardown --project my-project --yes
 ward teardown --yes --restore-env
 ```
 
-Teardown:
-
-```txt
-exports plaintext dotenv
-verifies exported dotenv syntax
-removes .ward.json
-removes .env.vault
-removes locked .env marker when replaced by exported plaintext
-removes Ward generated sections from AGENTS.md and CLAUDE.md
-unregisters project
-removes project-scoped grants
-removes project-scoped pending requests
-clears project unlock sessions
-preserves encrypted audit logs
-```
-
-`--yes` is required. By default teardown exports plaintext to `.env.export`.
-Use `--restore-env` to explicitly restore plaintext `.env`. Passing
-`--export .env` without `--restore-env` fails.
-
-## Recommended Daily Flows
-
-### Human Setup
-
-```bash
-cargo install aiward
-ward init --project my-project
-ward doctor
-```
-
-Guided init creates the initial run unlock session by default. Run
-`ward unlock --ttl 8h` later only when that session expires, after
-`ward lock`, or when setup was run with `--no-unlock`.
-
-### AI-Assisted Dev Server
-
-```bash
-ward unlock --ttl 8h
-ward allow --profile dev --scope always --agent codex
-ward dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/example --json --no-prompt
-```
-
-### Agent Request First
-
-```bash
-ward request --profile dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/example --json --no-prompt
-ward approve <request-id> --scope always --agent-mediated --json
-ward run --profile dev --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/example --json --no-prompt
-```
-
-### Critical Request
-
-```bash
-ward request \
-  --agent codex \
-  --worktree /repo \
-  --git-remote https://example.test/repo.git \
-  --commit <sha> \
-  --branch feature/debug \
-  --command "sh -c printenv" \
-  --env DATABASE_URL \
-  --json \
-  --no-prompt
-
-ward approve <request-id> --scope once --confirm-critical --agent-mediated --json
-ward run --agent codex --worktree /repo --git-remote https://example.test/repo.git --commit <sha> --branch feature/debug --env DATABASE_URL --json --no-prompt -- sh -c printenv
-```
-
-Only use this when the human explicitly expects the command to inspect secrets.
-
-### Manual Local Development
-
-```bash
-ward env unlock
-pnpm dev
-ward env lock
-```
-
-During the unlocked period, `.env` contains plaintext secrets. Lock it again
-before returning to AI-assisted work.
-
-### Review Logs
-
-```bash
-ward logs verify
-ward logs view executions
-ward logs view alerts
-```
-
-### Remove Ward From One Project
-
-```bash
-ward teardown --yes
-```
-
-Encrypted global audit logs remain available for review. The plaintext export is
-written to `.env.export`; use `--restore-env` only when you intentionally want
-to recreate plaintext `.env`.
+---
 
 ## What Agents Should Do
 

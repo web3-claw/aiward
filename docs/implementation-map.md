@@ -16,9 +16,10 @@ version: no shell hooks, no daemon, and no terminal-wide command scanning.
 ```txt
 src/
   cli/          CLI parsing and command dispatch
-  config/       Project-local .ward.json
+  config/       Project-local .ward.json (vault nonce, storage mode, profiles)
   env_file/     Locked .env, manual unlock/export, and encrypted env edits
-  vault/        .env.vault encryption and decryption
+  vault/        Vault encryption, dynamic filename derivation, session key generation
+  recovery/     PIN-protected recovery key creation, decoy generation, and restore
   registry/     ~/.ward project registry and active project selection
   policy/       Preset matching and scoped env decisions
   approvals/    Interactive and agent-mediated approval decisions
@@ -28,12 +29,12 @@ src/
   context/      Strict no-prompt agent worktree/branch/remote/commit verification
   agents/       Per-project agent identity records and request proof checks
   worktrees/    Trusted roots, known worktrees, and pending worktree approvals
-  broker/       On-demand Unix-socket broker with in-memory unlock capability
+  broker/       On-demand Unix-socket broker with in-memory session key + unlock capability
   unlock/       Short-lived run/log unlock sessions
   runner/       Scoped env injection, child process execution, output redaction
   detection/    Preflight suspicious-pattern checks
   anomaly/      Passive grant-use anomaly alerts
-  logs/         Encrypted hash-chained audit logging
+  logs/         Encrypted hash-chained audit logging, recovery_dir path
   git_context/  Safe git identity and repository metadata
 ```
 
@@ -47,8 +48,15 @@ src/
 | Config | `ensure_gitignore` | Keep plaintext env files ignored and optionally allow committed vaults. |
 | Config | `write_project_config` | Persist `.ward.json`. |
 | Vault | `encrypt_env` | Encrypt dotenv plaintext using Argon2id and AES-256-GCM. |
-| Vault | `decrypt_env` | Decrypt `.env.vault` into in-memory dotenv text. |
-| Vault | `import_env_file` | Read `.env`, encrypt it, and write `.env.vault`. |
+| Vault | `decrypt_env` | Decrypt vault into in-memory dotenv text. |
+| Vault | `import_env_file` | Read `.env`, encrypt it, and write to derived vault path. |
+| Vault | `derive_vault_filename` | SHA256(passphrase + project + nonce) → hidden dot-prefixed filename. |
+| Vault | `generate_vault_nonce` | Generate 16-byte random hex nonce for vault filename rotation. |
+| Vault | `encrypt_env_with_params` | Encrypt with custom Argon2 params (used for recovery blobs). |
+| Config | `resolve_vault_path_dynamic` | Derive vault path from passphrase + nonce; falls back to static path for legacy configs. |
+| Recovery | `create_recovery_files` | Create PIN-encrypted recovery blob plus decoy files in `~/.ward/recovery/`. |
+| Recovery | `restore_from_recovery` | Decrypt recovery file with PIN to retrieve vault passphrase. |
+| Recovery | `export_recovery_file` | Copy real recovery file to external backup location. |
 | Env file | `lock_env_file` | Replace plaintext `.env` with a safe locked marker. |
 | Env file | `unlock_env_file` | Write plaintext `.env` for explicit manual local development. |
 | Registry | `register_project` | Add a canonical project and vault path to `~/.ward/registry.json`. |
@@ -77,15 +85,25 @@ src/
 
 ```txt
 User runs ward init
-  -> create .ward.json
+  -> create .ward.json with random vault_nonce and storage_mode
   -> generate dev and migrate profiles with vault-present exact env names
-  -> import .env into .env.vault when present
+  -> derive vault filename from passphrase + project + nonce
+  -> import .env into derived vault path when present
   -> verify decrypt
   -> replace plaintext .env with locked marker by default
   -> register project
-  -> update .gitignore
+  -> update .gitignore (includes .env, .env.*, .ward.json)
   -> create .env.example and agent instructions
   -> create approval key material and initial run unlock session unless --no-unlock is used
+  -> session encryption: vault re-encrypted with ephemeral key, passphrase form gone from disk
+
+User runs ward recovery create
+  -> prompt for vault passphrase + recovery PIN
+  -> create PIN-encrypted recovery blob at derived filename in ~/.ward/recovery/
+  -> create 39-59 size-identical decoy .key files in same directory
+
+User runs ward recovery export
+  -> copy real recovery file to Desktop or specified path
 ```
 
 `ward setup --yes` runs the same recommended flow for scripts.
@@ -107,8 +125,11 @@ User runs ward import .env
 User runs ward unlock --ttl 8h
   -> decrypt vault to validate PIN/passphrase
   -> start or refresh the on-demand local broker
+  -> generate random 32-byte ephemeral session key
+  -> re-encrypt vault with session key; write to disk
+  -> passphrase-encrypted vault no longer exists on disk
   -> load active project unlock capability into broker memory
-  -> keep approval signing capability in broker memory
+  -> keep approval signing capability and session key in broker memory
   -> write non-sensitive unlock metadata only
 
 User approves request or runs ward allow
@@ -232,11 +253,13 @@ Agent records ward approve <request-id> --scope once --confirm-critical --agent-
 ```txt
 User runs ward doctor
   -> check .ward.json
-  -> check .env.vault
+  -> check vault at derived path
   -> check plaintext .env
   -> check .env.* variants except .env.example
-  -> check .gitignore coverage
+  -> check .gitignore coverage (.env, .env.*, .ward.json)
   -> check project registry resolution
+  -> check recovery file exists at ~/.ward/recovery/
+  -> check backup_exported flag in .ward.json
   -> report encrypted alert count without decrypting alerts
   -> report actionable warnings
 ```
@@ -257,6 +280,7 @@ plaintext `.env`.
 
 ## Next implementation priorities
 
-1. Refine setup prompts beyond `--yes` for interactive users.
-2. Add richer profile templates for common frameworks.
-3. Keep the passive boundary explicit in generated agent instructions.
+1. Integrate recovery creation into the `ward setup` wizard flow.
+2. Cloud backup for recovery key (optional, cloud infra layer).
+3. Add richer profile templates for common frameworks.
+4. Team vault support with individual logs and org policy (commercial layer).
