@@ -185,7 +185,7 @@ Within that boundary, ward gives you hard guarantees:
 
 - **Vault filename is derived, not fixed.** The vault has no predictable name on disk — it changes on each rotation and is only derivable with your passphrase.
 - **Session encryption.** While an unlock session is active, the vault on disk is re-encrypted with a random ephemeral key held only in broker memory. Your passphrase-encrypted form does not exist on disk during an active session.
-- **Recovery key with PIN.** A PIN-protected recovery key is stored locally. If a session is interrupted, ward can restore access without your vault passphrase. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct PIN.
+- **Recovery key with PIN.** A PIN-protected recovery key is stored locally. It contains your vault passphrase, encrypted with your PIN. If a session is interrupted and the broker can't restore the vault automatically, entering your PIN decrypts the recovery key and ward uses the recovered passphrase to restore access. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct PIN.
 - **Secrets are never written to disk in plaintext** during normal operation.
 - **Every secret injection is logged** with the requesting identity and scope.
 - **Approval grants are signed** — editing them invalidates them.
