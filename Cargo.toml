@@ -46,6 +46,8 @@ sha2 = "0.10"
 tempfile = "3.10"
 uuid = { version = "1.8", features = ["serde", "v4"] }
 zeroize = "1.8"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

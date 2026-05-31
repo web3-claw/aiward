@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod dashboard;
 pub mod anomaly;
 pub mod approval_receipts;
 pub mod approvals;

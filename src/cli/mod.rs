@@ -327,6 +327,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
+    /// Open the interactive logs dashboard.
+    Dashboard,
     #[command(hide = true, name = "__human-guardian")]
     HumanGuardian {
         #[arg(long)]
@@ -726,6 +728,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::ShellInit { shell } => shell_init(shell.as_deref()),
         Commands::Rotate { project } => rotate_vault(project.as_deref()),
         Commands::Recovery { command } => recovery_command(command),
+        Commands::Dashboard => crate::dashboard::run_dashboard(),
         Commands::Human { ttl } => crate::human::activate_human_mode(&ttl),
         Commands::HumanGuardian {
             shell_pid,
