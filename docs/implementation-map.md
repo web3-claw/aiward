@@ -36,7 +36,7 @@ src/
   detection/    Preflight suspicious-pattern checks
   anomaly/      Passive grant-use anomaly alerts
   dashboard/    Terminal log dashboard
-  webui/        Standalone browser dashboard lifecycle, APIs, and UI
+  webui/        Standalone browser dashboard lifecycle, APIs, profile policy, setup UI
   logs/         Encrypted hash-chained audit logging, recovery_dir path
   git_context/  Safe git identity and repository metadata
 ```

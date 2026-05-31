@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
-    fs_util, logs, modes,
+    config, env_file, fs_util, logs, modes, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     vault,
 };
@@ -45,6 +45,16 @@ pub struct BrokerSessionStatus {
     pub expires_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerProjectSetupStatus {
+    pub project: String,
+    pub path: PathBuf,
+    pub vault: PathBuf,
+    pub created: bool,
+    pub registered: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,6 +99,12 @@ enum BrokerRequest {
         project: String,
         vault: PathBuf,
     },
+    SetupProject {
+        source_project: String,
+        source_vault: PathBuf,
+        target_path: PathBuf,
+        project: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +116,7 @@ enum BrokerResponse {
     Output { stream: String, line: String },
     Finished { outcome: RunCommandOutcome },
     Keys { names: Vec<String> },
+    ProjectSetup { status: BrokerProjectSetupStatus },
     Error { reason: String, message: String },
 }
 
@@ -423,6 +440,24 @@ pub fn stop() -> Result<()> {
         }
         Ok(BrokerResponse::Error { message, .. }) => anyhow::bail!("{message}"),
         Ok(other) => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn setup_project_with_active_passphrase(
+    source_project: &str,
+    source_vault: &Path,
+    target_path: &Path,
+    project: Option<String>,
+) -> Result<BrokerProjectSetupStatus> {
+    match send_simple(BrokerRequest::SetupProject {
+        source_project: source_project.to_string(),
+        source_vault: source_vault.to_path_buf(),
+        target_path: target_path.to_path_buf(),
+        project,
+    })? {
+        BrokerResponse::ProjectSetup { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
     }
 }
 
@@ -916,6 +951,61 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 }
             }
         }
+        BrokerRequest::SetupProject {
+            source_project,
+            source_vault,
+            target_path,
+            project,
+        } => {
+            let (passphrase, expires_at) = {
+                let state = state.lock().expect("broker state poisoned");
+                match active_session(&state, &source_project, &source_vault) {
+                    Ok(session) => (session.passphrase.clone(), session.expires_at),
+                    Err(error) => {
+                        let response = broker_error("unlock_required", error.to_string());
+                        write_response(&mut stream, &response)?;
+                        return Ok(false);
+                    }
+                }
+            };
+
+            match setup_project_with_passphrase(&target_path, project.as_deref(), &passphrase) {
+                Ok(status) => {
+                    let new_session_key =
+                        match vault::decrypt_vault_file(&status.vault, &passphrase).and_then(
+                            |plaintext| {
+                                let ephemeral_key = generate_session_key();
+                                let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
+                                vault::write_vault(&status.vault, &envelope)?;
+                                Ok(ephemeral_key)
+                            },
+                        ) {
+                            Ok(ephemeral_key) => Some(ephemeral_key),
+                            Err(_) => None,
+                        };
+                    state
+                        .lock()
+                        .expect("broker state poisoned")
+                        .sessions
+                        .insert(
+                            session_key(&status.project, &status.vault),
+                            BrokerSession {
+                                project: status.project.clone(),
+                                vault: status.vault.clone(),
+                                passphrase,
+                                session_key: new_session_key,
+                                expires_at,
+                                active_mode: None,
+                            },
+                        );
+                    write_response(&mut stream, &BrokerResponse::ProjectSetup { status })?;
+                }
+                Err(error) => {
+                    let response = broker_error("project_setup_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
     }
     Ok(false)
 }
@@ -931,6 +1021,100 @@ fn sign_with_session(
     let signing_key = approval_receipts::decrypt_session_signing_key(&ciphertext, passphrase)?;
     payload.signer_key_id = signing_key.signer_key_id.clone();
     approval_receipts::sign_payload(payload, &signing_key)
+}
+
+fn setup_project_with_passphrase(
+    target_path: &Path,
+    project: Option<&str>,
+    passphrase: &str,
+) -> Result<BrokerProjectSetupStatus> {
+    let target_path = target_path
+        .canonicalize()
+        .unwrap_or_else(|_| target_path.to_path_buf());
+    if !target_path.is_dir() {
+        anyhow::bail!(
+            "selected path is not a directory: {}",
+            target_path.display()
+        );
+    }
+
+    if let Ok(config) = config::read_project_config(&target_path) {
+        let project_name = project.unwrap_or(&config.project).to_string();
+        let vault_path =
+            config::resolve_vault_path_with_passphrase(&target_path, &config, passphrase);
+        registry::update_project_vault(&project_name, target_path.clone(), vault_path.clone())?;
+        return Ok(BrokerProjectSetupStatus {
+            project: project_name,
+            path: target_path,
+            vault: vault_path,
+            created: false,
+            registered: true,
+        });
+    }
+
+    let source = target_path.join(".env");
+    if !source.exists() {
+        anyhow::bail!(
+            "selected folder has no .env file; add a dotenv file or run ward setup in that project"
+        );
+    }
+    if env_file::is_locked_env_file(&source)? {
+        anyhow::bail!(
+            "{} is already a Ward locked marker but no .ward.json exists",
+            source.display()
+        );
+    }
+
+    let project_name = project
+        .map(str::to_string)
+        .or_else(|| {
+            target_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .context("could not infer project name from selected folder")?;
+    let env_keys = config::env_keys_from_dotenv_file(&source)?;
+    let mut project_config =
+        config::ProjectConfig::default_for_dir(&target_path, Some(project_name.clone()))?;
+    project_config.vault = PathBuf::from(config::DEFAULT_VAULT_FILE);
+    project_config.profiles = config::default_profiles(&env_keys, &target_path);
+
+    config::write_project_config(&target_path, &project_config, true)?;
+    config::ensure_env_example(&target_path)?;
+    config::ensure_agent_instructions(&target_path, &project_config.project)?;
+    config::ensure_gitignore(&target_path, true)?;
+
+    let vault_path = target_path.join(config::DEFAULT_VAULT_FILE);
+    vault::import_env_file(&source, &vault_path, passphrase)?;
+    let plaintext = vault::decrypt_vault_file(&vault_path, passphrase)?;
+    env_file::lock_env_file(&source, &vault_path)?;
+    approval_receipts::ensure_project_key(&project_config.project, passphrase)?;
+
+    if recovery::create_recovery_files_with_material(
+        &project_config.project,
+        passphrase,
+        passphrase,
+        Some(&plaintext),
+    )
+    .is_ok()
+    {
+        project_config.recovery_created = true;
+        let _ = config::write_project_config(&target_path, &project_config, true);
+    }
+
+    registry::update_project_vault(
+        &project_config.project,
+        target_path.clone(),
+        vault_path.clone(),
+    )?;
+    Ok(BrokerProjectSetupStatus {
+        project: project_config.project,
+        path: target_path,
+        vault: vault_path,
+        created: true,
+        registered: true,
+    })
 }
 
 fn active_session<'a>(
@@ -1485,6 +1669,140 @@ mod tests {
         let envelope = vault::encrypt_env("DATABASE_URL=postgres://broker\n", passphrase).unwrap();
         vault::write_vault(&vault_path, &envelope).unwrap();
         (dir, vault_path)
+    }
+
+    #[test]
+    fn setup_project_with_passphrase_creates_project_without_exposing_secret_values() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join(".env"),
+            "DATABASE_URL=postgres://dashboard\nPAYLOAD_SECRET=payload\n",
+        )
+        .unwrap();
+
+        let status =
+            setup_project_with_passphrase(project.path(), Some("dashboard-demo"), "1234").unwrap();
+
+        assert_eq!(status.project, "dashboard-demo");
+        assert!(project.path().join(".ward.json").exists());
+        assert!(status.vault.exists());
+        let cfg = config::read_project_config(project.path()).unwrap();
+        assert!(cfg.recovery_created);
+        assert!(cfg.profiles["dev"]
+            .env
+            .contains(&"PAYLOAD_SECRET".to_string()));
+        let locked = std::fs::read_to_string(project.path().join(".env")).unwrap();
+        assert!(locked.contains("Ward managed locked .env"));
+        assert!(!locked.contains("postgres://dashboard"));
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    fn setup_project_request_requires_active_source_session() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let state = Arc::new(Mutex::new(BrokerState::default()));
+        let (_, response) = broker_pair(
+            BrokerRequest::SetupProject {
+                source_project: "demo".to_string(),
+                source_vault: home.path().join(".env.vault"),
+                target_path: home.path().join("target"),
+                project: None,
+            },
+            state,
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "unlock_required"
+        ));
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    fn setup_project_with_existing_config_registers_without_overwriting() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg =
+            config::ProjectConfig::default_for_dir(project.path(), Some("existing".to_string()))
+                .unwrap();
+        cfg.profiles.get_mut("dev").unwrap().command = "custom dev".to_string();
+        config::write_project_config(project.path(), &cfg, true).unwrap();
+
+        let status = setup_project_with_passphrase(project.path(), None, "1234").unwrap();
+        let after = config::read_project_config(project.path()).unwrap();
+
+        assert_eq!(status.project, "existing");
+        assert_eq!(after.profiles["dev"].command, "custom dev");
+        assert!(registry::load_registry()
+            .unwrap()
+            .projects
+            .contains_key("existing"));
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    fn setup_project_with_missing_env_is_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let project = tempfile::tempdir().unwrap();
+        let error = setup_project_with_passphrase(project.path(), Some("missing"), "1234")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no .env"));
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    fn setup_project_request_reuses_active_session_passphrase() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let source_vault = home.path().join("source.env.vault");
+        let envelope = vault::encrypt_env("DATABASE_URL=postgres://source\n", "1234").unwrap();
+        vault::write_vault(&source_vault, &envelope).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::fs::write(
+            target.path().join(".env"),
+            "DATABASE_URL=postgres://target\nPAYLOAD_SECRET=payload\n",
+        )
+        .unwrap();
+        let mut state = BrokerState::default();
+        state.sessions.insert(
+            session_key("demo", &source_vault),
+            BrokerSession {
+                project: "demo".to_string(),
+                vault: source_vault.clone(),
+                passphrase: "1234".to_string(),
+                session_key: None,
+                expires_at: Utc::now() + Duration::hours(1),
+                active_mode: None,
+            },
+        );
+        let state = Arc::new(Mutex::new(state));
+        let (_, response) = broker_pair(
+            BrokerRequest::SetupProject {
+                source_project: "demo".to_string(),
+                source_vault,
+                target_path: target.path().to_path_buf(),
+                project: Some("target-demo".to_string()),
+            },
+            Arc::clone(&state),
+        );
+        let BrokerResponse::ProjectSetup { status } = response else {
+            panic!("unexpected setup response");
+        };
+        assert_eq!(status.project, "target-demo");
+        assert!(state
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key(&session_key("target-demo", &status.vault)));
+        std::env::remove_var("WARD_HOME");
     }
 
     #[test]

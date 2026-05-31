@@ -124,6 +124,36 @@ struct UpdateProfileEnvRequest {
     env: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfilePolicyRequest {
+    name: Option<String>,
+    command: Option<String>,
+    action: Option<String>,
+    default_scope: Option<crate::approvals::ApprovalScope>,
+    #[serde(default)]
+    env: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PickFolderRequest {
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PickFolderResponse {
+    path: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectSetupRequest {
+    path: PathBuf,
+    project: Option<String>,
+}
+
 pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
     cleanup_stale_instances()?;
     let requested_port = options.port;
@@ -310,17 +340,51 @@ fn handle(mut req: tiny_http::Request, token: &str) {
         return;
     }
 
+    if method == Method::Get && is_dashboard_page_route(&path) {
+        serve_html(req);
+        return;
+    }
+
     match (method, path.as_str()) {
-        (Method::Get, "/") => serve_html(req),
         (Method::Get, "/api/projects") => respond_json_result(req, dashboard_projects()),
         (Method::Get, "/api/events") => {
             let project = query_param(&query, "project");
             respond_json_result(req, Ok(load_all_events(project.as_deref())))
         }
         (Method::Get, "/api/dashboard/status") => respond_json_result(req, dashboard_status()),
-        (Method::Patch, _) | (Method::Post, _) => {
-            if let Some((project, profile)) = profile_env_route(&path) {
+        (Method::Post, "/api/projects/pick-folder") => {
+            let result = pick_project_folder(&mut req);
+            respond_json_result(req, result);
+        }
+        (Method::Post, "/api/projects/setup") => {
+            let result = setup_project_from_dashboard(&mut req);
+            respond_project_setup_result(req, result);
+        }
+        (Method::Post, _) => {
+            if let Some(project) = profiles_collection_route(&path) {
+                let result = create_profile_policy(&project, &mut req);
+                respond_json_result(req, result);
+            } else if let Some((project, profile)) = profile_env_route(&path) {
                 let result = update_profile_env(&project, &profile, &mut req);
+                respond_json_result(req, result);
+            } else {
+                respond_not_found(req);
+            }
+        }
+        (Method::Patch, _) => {
+            if let Some((project, profile)) = profile_policy_route(&path) {
+                let result = update_profile_policy(&project, &profile, &mut req);
+                respond_json_result(req, result);
+            } else if let Some((project, profile)) = profile_env_route(&path) {
+                let result = update_profile_env(&project, &profile, &mut req);
+                respond_json_result(req, result);
+            } else {
+                respond_not_found(req);
+            }
+        }
+        (Method::Delete, _) => {
+            if let Some((project, profile)) = profile_policy_route(&path) {
+                let result = delete_profile_policy(&project, &profile);
                 respond_json_result(req, result);
             } else {
                 respond_not_found(req);
@@ -353,6 +417,37 @@ fn respond_json_result<T: Serialize>(req: tiny_http::Request, result: Result<T>)
             StatusCode(500),
             &json!({ "error": "dashboard_error", "message": error.to_string() }),
         ),
+    }
+}
+
+fn respond_project_setup_result(
+    req: tiny_http::Request,
+    result: Result<broker::BrokerProjectSetupStatus>,
+) {
+    match result {
+        Ok(value) => respond_json(req, StatusCode(200), &value),
+        Err(error) => {
+            if let Some(broker_error) = error.downcast_ref::<broker::BrokerError>() {
+                if broker_error.reason() == "unlock_required" {
+                    respond_json(
+                        req,
+                        StatusCode(423),
+                        &json!({
+                            "status": "unlock_required",
+                            "unlockRequired": true,
+                            "message": broker_error.message(),
+                            "fixCommand": "ward unlock --ttl 8h"
+                        }),
+                    );
+                    return;
+                }
+            }
+            respond_json(
+                req,
+                StatusCode(500),
+                &json!({ "error": "project_setup_failed", "message": error.to_string() }),
+            );
+        }
     }
 }
 
@@ -427,14 +522,74 @@ fn query_param(query: &str, name: &str) -> Option<String> {
     })
 }
 
+fn is_dashboard_page_route(path: &str) -> bool {
+    path == "/" || path == "/logs" || project_logs_route(path).is_some()
+}
+
+fn project_logs_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["projects", project, "logs"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn profiles_collection_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "projects", project, "profiles"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn profile_policy_route(path: &str) -> Option<(String, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "projects", project, "profiles", profile] => {
+            Some((url_decode(project), url_decode(profile)))
+        }
+        _ => None,
+    }
+}
+
 fn profile_env_route(path: &str) -> Option<(String, String)> {
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match parts.as_slice() {
         ["api", "projects", project, "profiles", profile, "env"] => {
-            Some((project.to_string(), profile.to_string()))
+            Some((url_decode(project), url_decode(profile)))
         }
         _ => None,
     }
+}
+
+fn url_decode(value: &str) -> String {
+    let mut out = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                    if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                        out.push(byte);
+                        index += 3;
+                        continue;
+                    }
+                }
+                out.push(bytes[index]);
+                index += 1;
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn update_profile_env(
@@ -476,6 +631,237 @@ fn update_profile_env_for_project(
         registry.active_project.as_deref(),
         broker::status().ok().as_ref(),
     )
+}
+
+fn create_profile_policy(project: &str, req: &mut tiny_http::Request) -> Result<ProjectView> {
+    let requested: ProfilePolicyRequest = read_json_body(req)?;
+    create_profile_policy_for_project(project, requested)
+}
+
+fn create_profile_policy_for_project(
+    project: &str,
+    requested: ProfilePolicyRequest,
+) -> Result<ProjectView> {
+    let name = requested
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .context("profile name is required")?
+        .to_string();
+    validate_profile_name(&name)?;
+    let profile = profile_from_request(None, requested)?;
+
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    let mut cfg = config::read_project_config(&registered.path)?;
+    if cfg.profiles.contains_key(&name) {
+        anyhow::bail!("profile {name} already exists in project {project}");
+    }
+    cfg.profiles.insert(name, profile);
+    config::write_project_config(&registered.path, &cfg, true)?;
+    project_view(
+        project,
+        registered,
+        registry.active_project.as_deref(),
+        broker::status().ok().as_ref(),
+    )
+}
+
+fn update_profile_policy(
+    project: &str,
+    profile: &str,
+    req: &mut tiny_http::Request,
+) -> Result<ProjectView> {
+    let requested: ProfilePolicyRequest = read_json_body(req)?;
+    update_profile_policy_for_project(project, profile, requested)
+}
+
+fn update_profile_policy_for_project(
+    project: &str,
+    profile: &str,
+    requested: ProfilePolicyRequest,
+) -> Result<ProjectView> {
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    let mut cfg = config::read_project_config(&registered.path)?;
+    let existing = cfg
+        .profiles
+        .remove(profile)
+        .with_context(|| format!("profile {profile} not found in project {project}"))?;
+    let new_name = requested
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(profile)
+        .to_string();
+    validate_profile_name(&new_name)?;
+    if new_name != profile && cfg.profiles.contains_key(&new_name) {
+        anyhow::bail!("profile {new_name} already exists in project {project}");
+    }
+    let profile_config = profile_from_request(Some(existing), requested)?;
+    cfg.profiles.insert(new_name, profile_config);
+    config::write_project_config(&registered.path, &cfg, true)?;
+    project_view(
+        project,
+        registered,
+        registry.active_project.as_deref(),
+        broker::status().ok().as_ref(),
+    )
+}
+
+fn delete_profile_policy(project: &str, profile: &str) -> Result<ProjectView> {
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    let mut cfg = config::read_project_config(&registered.path)?;
+    if cfg.profiles.remove(profile).is_none() {
+        anyhow::bail!("profile {profile} not found in project {project}");
+    }
+    config::write_project_config(&registered.path, &cfg, true)?;
+    project_view(
+        project,
+        registered,
+        registry.active_project.as_deref(),
+        broker::status().ok().as_ref(),
+    )
+}
+
+fn profile_from_request(
+    existing: Option<ProfileConfig>,
+    requested: ProfilePolicyRequest,
+) -> Result<ProfileConfig> {
+    let command = string_field(
+        "command",
+        requested.command,
+        existing.as_ref().map(|p| &p.command),
+    )?;
+    let action = string_field(
+        "action",
+        requested.action,
+        existing.as_ref().map(|p| &p.action),
+    )?;
+    let default_scope = requested
+        .default_scope
+        .or_else(|| existing.as_ref().map(|p| p.default_scope))
+        .unwrap_or(crate::approvals::ApprovalScope::Session);
+    let env = match requested.env {
+        Some(env) => normalize_env_names(env)?,
+        None => existing.map(|profile| profile.env).unwrap_or_default(),
+    };
+    Ok(ProfileConfig {
+        command,
+        env,
+        default_scope,
+        action,
+    })
+}
+
+fn string_field(
+    name: &str,
+    requested: Option<String>,
+    existing: Option<&String>,
+) -> Result<String> {
+    let value = requested
+        .as_deref()
+        .or(existing.map(String::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .with_context(|| format!("{name} is required"))?;
+    Ok(value.to_string())
+}
+
+fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+    {
+        anyhow::bail!("invalid profile name: {name}");
+    }
+    Ok(())
+}
+
+fn pick_project_folder(req: &mut tiny_http::Request) -> Result<PickFolderResponse> {
+    let body = read_optional_body(req)?;
+    if !body.trim().is_empty() {
+        let requested: PickFolderRequest =
+            serde_json::from_str(&body).context("failed to parse folder picker request")?;
+        if requested.path.is_some() {
+            return pick_folder_from_request(requested);
+        }
+    }
+    pick_folder_with_native_dialog()
+}
+
+fn pick_folder_from_request(requested: PickFolderRequest) -> Result<PickFolderResponse> {
+    requested
+        .path
+        .map(|path| PickFolderResponse { path })
+        .context("path is required")
+}
+
+fn pick_folder_with_native_dialog() -> Result<PickFolderResponse> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                r#"POSIX path of (choose folder with prompt "Select a project folder for Ward")"#,
+            ])
+            .output()
+            .context("failed to open Finder folder picker")?;
+        if !output.status.success() {
+            anyhow::bail!("folder selection was cancelled");
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            anyhow::bail!("folder selection returned no path");
+        }
+        Ok(PickFolderResponse {
+            path: PathBuf::from(path),
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!("native folder picker is only available on macOS")
+    }
+}
+
+fn setup_project_from_dashboard(
+    req: &mut tiny_http::Request,
+) -> Result<broker::BrokerProjectSetupStatus> {
+    let requested: ProjectSetupRequest = read_json_body(req)?;
+    let cwd = std::env::current_dir()?;
+    let current = registry::resolve_project(None, &cwd)?;
+    broker::setup_project_with_active_passphrase(
+        &current.name,
+        &current.vault,
+        &requested.path,
+        requested.project,
+    )
+}
+
+fn read_json_body<T: for<'de> Deserialize<'de>>(req: &mut tiny_http::Request) -> Result<T> {
+    let body = read_optional_body(req)?;
+    serde_json::from_str(&body).context("failed to parse JSON request")
+}
+
+fn read_optional_body(req: &mut tiny_http::Request) -> Result<String> {
+    let mut body = String::new();
+    std::io::Read::read_to_string(req.as_reader(), &mut body)
+        .context("failed to read request body")?;
+    Ok(body)
 }
 
 fn normalize_env_names(names: Vec<String>) -> Result<Vec<String>> {
@@ -604,7 +990,7 @@ fn load_all_events(project_filter: Option<&str>) -> Vec<Value> {
                 if let Some(obj) = event.as_object_mut() {
                     obj.insert(
                         "_kind".to_string(),
-                        Value::String(kind.as_str().to_string()),
+                        Value::String(event_kind_str(kind).to_string()),
                     );
                     if let Some(project) = project {
                         obj.insert("_project".to_string(), Value::String(project));
@@ -620,6 +1006,16 @@ fn load_all_events(project_filter: Option<&str>) -> Vec<Value> {
         tb.cmp(ta)
     });
     all
+}
+
+fn event_kind_str(kind: LogKind) -> &'static str {
+    match kind {
+        LogKind::Executions => "execution",
+        LogKind::Requests => "request",
+        LogKind::Approvals => "approval",
+        LogKind::Alerts => "alert",
+        LogKind::Sessions => "session",
+    }
 }
 
 fn infer_event_project(
@@ -940,7 +1336,10 @@ fn command_line(pid: u32) -> Option<String> {
     }
 }
 
-const DASHBOARD_HTML: &str = r##"<!doctype html>
+const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
+
+#[allow(dead_code)]
+const LEGACY_OVERVIEW_HTML: &str = r##"<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -1380,6 +1779,17 @@ mod tests {
             profile_env_route("/api/projects/demo/profiles/dev/env"),
             Some(("demo".to_string(), "dev".to_string()))
         );
+        assert_eq!(
+            profile_policy_route("/api/projects/demo/profiles/dev"),
+            Some(("demo".to_string(), "dev".to_string()))
+        );
+        assert_eq!(
+            profiles_collection_route("/api/projects/demo/profiles"),
+            Some("demo".to_string())
+        );
+        assert!(is_dashboard_page_route("/"));
+        assert!(is_dashboard_page_route("/logs"));
+        assert!(is_dashboard_page_route("/projects/demo/logs"));
         assert!(profile_env_route("/api/projects/demo").is_none());
     }
 
@@ -1389,6 +1799,14 @@ mod tests {
             dashboard_url(7777, "abc"),
             "http://127.0.0.1:7777/?token=abc"
         );
+    }
+
+    #[test]
+    fn dashboard_html_restores_old_logs_shell() {
+        assert!(DASHBOARD_HTML.contains("table-pane"));
+        assert!(DASHBOARD_HTML.contains("detail-pane"));
+        assert!(DASHBOARD_HTML.contains("data-kind=\"execution\""));
+        assert!(DASHBOARD_HTML.contains("profile policies"));
     }
 
     #[test]
@@ -1433,6 +1851,96 @@ mod tests {
         let serialized = serde_json::to_string(&updated).unwrap();
         assert!(serialized.contains("PAYLOAD_SECRET"));
         assert!(!serialized.contains("payload-secret-value"));
+    }
+
+    #[test]
+    #[serial]
+    fn profile_policy_crud_updates_project_config() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg =
+            config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
+                .unwrap();
+        cfg.profiles.clear();
+        config::write_project_config(project.path(), &cfg, true).unwrap();
+        registry::register_project(
+            "demo".to_string(),
+            project.path().to_path_buf(),
+            project.path().join(".env.vault"),
+        )
+        .unwrap();
+
+        let created = create_profile_policy_for_project(
+            "demo",
+            ProfilePolicyRequest {
+                name: Some("preview".to_string()),
+                command: Some("pnpm preview".to_string()),
+                action: Some("Run preview".to_string()),
+                default_scope: Some(crate::approvals::ApprovalScope::Session),
+                env: Some(vec!["PAYLOAD_SECRET".to_string()]),
+            },
+        )
+        .unwrap();
+        assert!(created
+            .profiles
+            .iter()
+            .any(|profile| profile.name == "preview"));
+
+        let updated = update_profile_policy_for_project(
+            "demo",
+            "preview",
+            ProfilePolicyRequest {
+                name: Some("prod".to_string()),
+                command: Some("pnpm start".to_string()),
+                action: Some("Run production".to_string()),
+                default_scope: Some(crate::approvals::ApprovalScope::Branch),
+                env: Some(vec![
+                    "DATABASE_URL".to_string(),
+                    "PAYLOAD_SECRET".to_string(),
+                ]),
+            },
+        )
+        .unwrap();
+        let prod = updated
+            .profiles
+            .iter()
+            .find(|profile| profile.name == "prod")
+            .unwrap();
+        assert_eq!(prod.command, "pnpm start");
+        assert_eq!(prod.env, vec!["DATABASE_URL", "PAYLOAD_SECRET"]);
+
+        let deleted = delete_profile_policy("demo", "prod").unwrap();
+        assert!(deleted.profiles.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn logs_api_filters_by_project_and_uses_old_kind_labels() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        logs::append_event(
+            LogKind::Requests,
+            json!({ "project": "demo", "requestedEnv": ["PAYLOAD_SECRET"] }),
+        )
+        .unwrap();
+        logs::append_event(LogKind::Requests, json!({ "project": "other" })).unwrap();
+
+        let events = load_all_events(Some("demo"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["_kind"], "request");
+        assert_eq!(events[0]["payload"]["project"], "demo");
+        assert_eq!(events[0]["payload"]["requestedEnv"][0], "PAYLOAD_SECRET");
+    }
+
+    #[test]
+    fn folder_picker_accepts_manual_fallback_path() {
+        let response = pick_folder_from_request(PickFolderRequest {
+            path: Some(PathBuf::from("/tmp/demo")),
+        })
+        .unwrap();
+        assert_eq!(response.path, PathBuf::from("/tmp/demo"));
+        assert!(pick_folder_from_request(PickFolderRequest { path: None }).is_err());
     }
 
     #[test]

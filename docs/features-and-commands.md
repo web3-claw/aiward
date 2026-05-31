@@ -526,8 +526,13 @@ ward dashboard tui
 
 The browser dashboard is a standalone localhost service. It shows registered
 projects, profile env-name policy, runtime status, and encrypted logs grouped
-by project. It never displays or edits secret values. Profile edits only change
-which env names a profile is allowed to request.
+by project. The overview page manages project/profile policy, while `/logs`
+and `/projects/<project>/logs` use the detailed logs layout.
+
+The dashboard never displays or edits secret values. Profile edits manage
+profile name, command, action, default scope, and env names only. Adding a
+project from the dashboard requires an active unlock/human session; Ward reuses
+that broker-held passphrase for setup without sending it to the browser.
 
 ### `ward rotate`
 
