@@ -6,6 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use dirs;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -16,7 +17,7 @@ use crate::{
     logs::{self as audit_logs, LogKind},
     modes, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
-    registry,
+    recovery, registry,
     runner::{self, RunCommandRequest},
     unlock, vault, worktrees,
 };
@@ -316,6 +317,16 @@ pub enum Commands {
         #[arg(long, default_value = "8h")]
         ttl: String,
     },
+    /// Rotate the vault to a new derived filename (generates a new nonce).
+    Rotate {
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Manage recovery keys for this project.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
     #[command(hide = true, name = "__human-guardian")]
     HumanGuardian {
         #[arg(long)]
@@ -493,6 +504,22 @@ pub enum ModesCommand {
     },
     /// Show the active session mode (if any).
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecoveryCommand {
+    /// Export the recovery file to a safe location (e.g. Desktop or USB).
+    Export {
+        /// Destination path or directory. Defaults to ~/Desktop.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Import a recovery file backup into ~/.ward/recovery/.
+    Import {
+        path: PathBuf,
+    },
+    /// Create a new recovery file (requires vault passphrase and a PIN).
+    Create,
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
@@ -697,6 +724,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Coverage => coverage_exercise_cli_edges(),
         Commands::BrokerServe => broker::serve(),
         Commands::ShellInit { shell } => shell_init(shell.as_deref()),
+        Commands::Rotate { project } => rotate_vault(project.as_deref()),
+        Commands::Recovery { command } => recovery_command(command),
         Commands::Human { ttl } => crate::human::activate_human_mode(&ttl),
         Commands::HumanGuardian {
             shell_pid,
@@ -1197,6 +1226,7 @@ fn setup(options: SetupOptions) -> Result<()> {
     if options.yes {
         println!("Used setup defaults.");
     }
+    println!("Recovery: run `ward recovery create` to create a recovery key (recommended).");
     if let Some(rc) = ensure_shell_integration() {
         println!();
         println!("Shell integration added to {}.", rc.display());
@@ -2475,6 +2505,40 @@ fn doctor() -> Result<()> {
         Err(error) => println!("! Alert log check failed: {error}"),
     }
 
+    // Recovery and security checks
+    if let Ok(project_config) = config::read_project_config(&cwd) {
+        let gitignore_path = cwd.join(".gitignore");
+        if gitignore_path.exists() {
+            match fs::read_to_string(&gitignore_path) {
+                Ok(contents) if contents.contains(config::WARD_JSON_GITIGNORE_ENTRY) => {
+                    println!("[ok] .ward.json is in .gitignore.");
+                }
+                Ok(_) => {
+                    println!(
+                        "! .ward.json is not in .gitignore — vault nonce may leak into git history. Add `.ward.json` to .gitignore."
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+
+        // Check recovery file
+        let passphrase_available = vault::test_passphrase().is_some();
+        if passphrase_available {
+            let passphrase = vault::test_passphrase().unwrap();
+            if recovery::recovery_file_exists(&project_config.project, &passphrase) {
+                println!("[ok] Recovery file exists.");
+                if !project_config.backup_exported {
+                    println!("! No recovery backup exported — run: ward recovery export");
+                } else {
+                    println!("[ok] Recovery backup has been exported.");
+                }
+            } else {
+                println!("! Recovery file missing — run: ward recovery create");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -2644,6 +2708,86 @@ fn lock() -> Result<()> {
     println!("Cleared {cleared_unlocks} unlock session(s).");
     if crate::human::is_human_terminal() {
         crate::human::display::print_padlock_closing();
+    }
+    Ok(())
+}
+
+fn rotate_vault(project_override: Option<&str>) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let mut config = config::read_project_config(&cwd)?;
+    let project_name = project_override.unwrap_or(&config.project).to_string();
+    config.project = project_name.clone();
+
+    let passphrase = vault::read_existing_passphrase()?;
+
+    // Find current vault — may be dynamic or static
+    let old_vault = config::resolve_vault_path_dynamic(&cwd, &config, &passphrase);
+    anyhow::ensure!(
+        old_vault.exists(),
+        "vault not found at {}; unlock before rotating",
+        old_vault.display()
+    );
+
+    let plaintext = vault::decrypt_vault_file(&old_vault, &passphrase)?;
+    config.vault_nonce = vault::generate_vault_nonce();
+    let new_vault = config::resolve_vault_path_dynamic(&cwd, &config, &passphrase);
+
+    let envelope = vault::encrypt_env(&plaintext, &passphrase)?;
+    vault::write_vault(&new_vault, &envelope)?;
+    fs::remove_file(&old_vault)
+        .context(format!("failed to remove old vault {}", old_vault.display()))?;
+
+    config::write_project_config(&cwd, &config, true)?;
+    println!("[ok] Vault rotated to {}", new_vault.display());
+    println!("[ok] .ward.json updated with new nonce.");
+    Ok(())
+}
+
+fn recovery_command(command: RecoveryCommand) -> Result<()> {
+    match command {
+        RecoveryCommand::Export { output } => {
+            let cwd = env::current_dir()?;
+            let config = config::read_project_config(&cwd)?;
+            let passphrase = vault::read_existing_passphrase()?;
+
+            let dest = output.unwrap_or_else(|| {
+                dirs::desktop_dir()
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+
+            let out_path =
+                recovery::export_recovery_file(&config.project, &passphrase, &dest)?;
+            println!("[ok] Recovery file exported to {}", out_path.display());
+            println!("  Store this file somewhere safe (USB drive, secure cloud backup).");
+            println!("  You will need it and your PIN to restore access if the broker crashes.");
+        }
+        RecoveryCommand::Import { path } => {
+            let dest = recovery::import_recovery_file(&path)?;
+            println!("[ok] Recovery file imported to {}", dest.display());
+        }
+        RecoveryCommand::Create => {
+            let cwd = env::current_dir()?;
+            let config = config::read_project_config(&cwd)?;
+            let passphrase = vault::read_existing_passphrase()?;
+
+            #[cfg(not(coverage))]
+            let pin = {
+                let first =
+                    rpassword::prompt_password("Create a recovery PIN (min 4 characters): ")?;
+                let second = rpassword::prompt_password("Confirm recovery PIN: ")?;
+                vault::validate_new_passphrase(&first, &second)?;
+                first
+            };
+            #[cfg(coverage)]
+            let pin = "test-pin".to_string();
+
+            let real_path =
+                recovery::create_recovery_files(&config.project, &passphrase, &pin)?;
+            println!("[ok] Recovery file created at {}", real_path.display());
+            println!("[ok] Decoy files generated to prevent fingerprinting.");
+            println!("  Run `ward recovery export` to save a backup to a safe location.");
+        }
     }
     Ok(())
 }
@@ -6419,6 +6563,9 @@ mod tests {
                 max_runs_per_hour_per_grant: 20,
                 max_branches_per_grant: 3,
             },
+            storage_mode: config::StorageMode::default(),
+            vault_nonce: String::new(),
+            backup_exported: false,
         };
         let mut access = access();
         access.action = Some("Run lint".to_string());

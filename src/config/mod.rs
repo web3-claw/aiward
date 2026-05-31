@@ -7,15 +7,24 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{approvals::ApprovalScope, policy::ApprovalMode};
+use crate::{approvals::ApprovalScope, policy::ApprovalMode, vault};
 
 pub const PROJECT_CONFIG_FILE: &str = ".ward.json";
+pub const WARD_JSON_GITIGNORE_ENTRY: &str = ".ward.json";
 pub const DEFAULT_VAULT_FILE: &str = ".env.vault";
 pub const AGENT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 pub const CLAUDE_INSTRUCTIONS_FILE: &str = "CLAUDE.md";
 
 const ENV_EXAMPLE_HEADER: &str = "# Ward managed environment.\n# Plaintext .env files should not be committed or shared with AI agents.\n# Agents should request scoped access with ward request, then run approved commands with ward run.\n\n";
 const AGENT_INSTRUCTIONS_MARKER: &str = "<!-- ward-agent-instructions -->";
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StorageMode {
+    #[default]
+    VaultFile,
+    Keychain,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -29,6 +38,14 @@ pub struct ProjectConfig {
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default = "default_anomaly_detection")]
     pub anomaly_detection: AnomalyDetectionConfig,
+    #[serde(default)]
+    pub storage_mode: StorageMode,
+    /// Random hex nonce used to derive the vault filename. Regenerated on each rotation.
+    #[serde(default)]
+    pub vault_nonce: String,
+    /// Whether the user has exported a recovery backup.
+    #[serde(default)]
+    pub backup_exported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +97,9 @@ impl ProjectConfig {
             presets: Vec::new(),
             profiles,
             anomaly_detection: default_anomaly_detection(),
+            storage_mode: StorageMode::VaultFile,
+            vault_nonce: vault::generate_vault_nonce(),
+            backup_exported: false,
         })
     }
 }
@@ -92,7 +112,13 @@ pub fn read_project_config(cwd: &Path) -> Result<ProjectConfig> {
     let path = config_path(cwd);
     let contents =
         fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))
+    let mut config: ProjectConfig =
+        serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))?;
+    // Backward compat: populate nonce for legacy configs that have none.
+    if config.vault_nonce.is_empty() {
+        config.vault_nonce = vault::generate_vault_nonce();
+    }
+    Ok(config)
 }
 
 pub fn write_project_config(cwd: &Path, config: &ProjectConfig, force: bool) -> Result<PathBuf> {
@@ -208,6 +234,7 @@ pub fn ensure_gitignore(cwd: &Path, commit_vault: bool) -> Result<PathBuf> {
 
     append_gitignore_line(&mut lines, ".env");
     append_gitignore_line(&mut lines, ".env.*");
+    append_gitignore_line(&mut lines, WARD_JSON_GITIGNORE_ENTRY);
     if commit_vault {
         append_gitignore_line(&mut lines, &format!("!{DEFAULT_VAULT_FILE}"));
     }
@@ -411,6 +438,16 @@ pub fn resolve_vault_path(cwd: &Path, config: &ProjectConfig) -> PathBuf {
     } else {
         cwd.join(&config.vault)
     }
+}
+
+/// Derives the vault path from passphrase + project + nonce when dynamic naming is active.
+/// Falls back to the static path for keychain mode or legacy configs.
+pub fn resolve_vault_path_dynamic(cwd: &Path, config: &ProjectConfig, passphrase: &str) -> PathBuf {
+    if config.storage_mode == StorageMode::Keychain || config.vault_nonce.is_empty() {
+        return resolve_vault_path(cwd, config);
+    }
+    let filename = vault::derive_vault_filename(passphrase, &config.project, &config.vault_nonce);
+    cwd.join(filename)
 }
 
 fn default_anomaly_detection() -> AnomalyDetectionConfig {

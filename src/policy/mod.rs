@@ -181,6 +181,9 @@ mod tests {
                 max_runs_per_hour_per_grant: 20,
                 max_branches_per_grant: 3,
             },
+            storage_mode: crate::config::StorageMode::default(),
+            vault_nonce: String::new(),
+            backup_exported: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),
@@ -223,6 +226,9 @@ mod tests {
                 max_runs_per_hour_per_grant: 20,
                 max_branches_per_grant: 3,
             },
+            storage_mode: crate::config::StorageMode::default(),
+            vault_nonce: String::new(),
+            backup_exported: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),
@@ -260,6 +266,9 @@ mod tests {
                 max_runs_per_hour_per_grant: 20,
                 max_branches_per_grant: 3,
             },
+            storage_mode: crate::config::StorageMode::default(),
+            vault_nonce: String::new(),
+            backup_exported: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),
@@ -300,6 +309,9 @@ mod tests {
                 max_runs_per_hour_per_grant: 20,
                 max_branches_per_grant: 3,
             },
+            storage_mode: crate::config::StorageMode::default(),
+            vault_nonce: String::new(),
+            backup_exported: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),

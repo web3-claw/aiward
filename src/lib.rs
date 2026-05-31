@@ -17,6 +17,7 @@ pub mod logs;
 pub mod modes;
 pub mod pending_requests;
 pub mod policy;
+pub mod recovery;
 pub mod registry;
 pub mod runner;
 pub mod unlock;

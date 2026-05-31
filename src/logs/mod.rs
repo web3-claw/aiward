@@ -83,6 +83,10 @@ pub fn logs_dir() -> PathBuf {
     ward_home().join("logs")
 }
 
+pub fn recovery_dir() -> PathBuf {
+    ward_home().join("recovery")
+}
+
 pub fn project_modes_dir(project: &str) -> PathBuf {
     ward_home().join("projects").join(slugify(project))
 }

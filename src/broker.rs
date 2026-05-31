@@ -139,6 +139,9 @@ struct BrokerSession {
     project: String,
     vault: PathBuf,
     passphrase: String,
+    /// Ephemeral key used to re-encrypt the vault on disk while the session is active.
+    /// If Some, the vault file is encrypted with this key (not passphrase) until lock.
+    session_key: Option<String>,
     expires_at: DateTime<Utc>,
     active_mode: Option<modes::ActiveMode>,
 }
@@ -470,6 +473,15 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             write_response(&mut stream, &BrokerResponse::Status { status })?;
         }
         BrokerRequest::Stop => {
+            // Restore all session-encrypted vaults before shutting down
+            {
+                let state = state.lock().expect("broker state poisoned");
+                for session in state.sessions.values() {
+                    if let Some(ref ek) = session.session_key {
+                        restore_vault_from_session(&session.vault, ek, &session.passphrase);
+                    }
+                }
+            }
             write_response(&mut stream, &BrokerResponse::Ok)?;
             return Ok(true);
         }
@@ -480,11 +492,22 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             ttl_seconds,
             mode,
         } => {
-            match vault::decrypt_vault_file(&vault, &passphrase).and_then(|_| {
-                approval_receipts::ensure_project_key(&project, &passphrase).map(|_| ())
+            match vault::decrypt_vault_file(&vault, &passphrase).and_then(|plaintext| {
+                approval_receipts::ensure_project_key(&project, &passphrase).map(|_| plaintext)
             }) {
-                Ok(()) => {
+                Ok(plaintext) => {
                     let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+
+                    // Re-encrypt vault with ephemeral key so passphrase-encrypted
+                    // form does not exist on disk while the session is active.
+                    let ephemeral_key = generate_session_key();
+                    let ephemeral_key = match vault::encrypt_env(&plaintext, &ephemeral_key) {
+                        Ok(envelope) => match vault::write_vault(&vault, &envelope) {
+                            Ok(()) => Some(ephemeral_key),
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    };
 
                     // Load active mode config from broker vault if requested
                     let active_mode = if let Some(mode_name) = &mode {
@@ -496,6 +519,9 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                                         expires_at,
                                     }),
                                     None => {
+                                        if let Some(ref ek) = ephemeral_key {
+                                            restore_vault_from_session(&vault, ek, &passphrase);
+                                        }
                                         let response = broker_error(
                                             "mode_not_found",
                                             format!("mode '{mode_name}' not found — run `ward modes push` first"),
@@ -506,6 +532,9 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                                 }
                             }
                             Err(error) => {
+                                if let Some(ref ek) = ephemeral_key {
+                                    restore_vault_from_session(&vault, ek, &passphrase);
+                                }
                                 let response = broker_error(
                                     "modes_vault_unavailable",
                                     format!("could not load modes vault: {error} — run `ward modes push` first"),
@@ -528,6 +557,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                                 project,
                                 vault,
                                 passphrase,
+                                session_key: ephemeral_key,
                                 expires_at,
                                 active_mode,
                             },
@@ -609,7 +639,10 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             }
             let passphrase = {
                 let state = state.lock().expect("broker state poisoned");
-                active_session(&state, &project, &vault).map(|session| session.passphrase.clone())
+                active_session(&state, &project, &vault).map(|session| {
+                    // Use ephemeral session key if vault is currently session-encrypted
+                    session.session_key.clone().unwrap_or_else(|| session.passphrase.clone())
+                })
             };
             let (passphrase, active_mode) = match passphrase {
                 Ok(passphrase) => {
@@ -757,6 +790,22 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
 
 fn session_key(project: &str, vault: &Path) -> String {
     format!("{}|{}", project, vault.display())
+}
+
+fn generate_session_key() -> String {
+    use rand::RngCore;
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    hex::encode(key)
+}
+
+/// Decrypts the session-encrypted vault and re-writes it with the original passphrase.
+/// Best-effort — silently ignores errors so lock/stop never fails due to restoration.
+fn restore_vault_from_session(vault: &Path, session_key: &str, passphrase: &str) {
+    let Ok(plaintext) = vault::decrypt_vault_file(vault, session_key) else { return };
+    if let Ok(envelope) = vault::encrypt_env(&plaintext, passphrase) {
+        let _ = vault::write_vault(vault, &envelope);
+    }
 }
 
 fn send_simple(request: BrokerRequest) -> Result<BrokerResponse> {
@@ -1210,6 +1259,7 @@ mod tests {
                 project: "expired".to_string(),
                 vault: vault_path.clone(),
                 passphrase: passphrase.to_string(),
+                session_key: None,
                 expires_at: Utc::now() - Duration::seconds(1),
                 active_mode: None,
             },
