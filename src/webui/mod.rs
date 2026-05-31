@@ -1807,6 +1807,8 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("detail-pane"));
         assert!(DASHBOARD_HTML.contains("data-kind=\"execution\""));
         assert!(DASHBOARD_HTML.contains("profile policies"));
+        assert!(DASHBOARD_HTML.contains("dropdown-button"));
+        assert!(!DASHBOARD_HTML.contains("<select"));
     }
 
     #[test]

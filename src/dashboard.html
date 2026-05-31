@@ -71,7 +71,7 @@
     font-size: 11px;
   }
 
-  button, input, select, textarea {
+  button, input, textarea {
     font-family: var(--font);
     font-size: 11px;
   }
@@ -126,20 +126,7 @@
 
   .separator { width: 1px; height: 16px; background: var(--border); margin: 0 4px; }
 
-  .agent-select-wrap {
-    position: relative;
-    display: inline-flex;
-    align-items: center;
-  }
-  .agent-select-wrap::after {
-    content: 'v';
-    position: absolute;
-    right: 8px;
-    color: var(--muted);
-    font-size: 9px;
-    pointer-events: none;
-  }
-  select, input, textarea {
+  input, textarea {
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
@@ -147,14 +134,70 @@
     padding: 5px 7px;
     outline: none;
   }
-  select {
-    appearance: none;
-    -webkit-appearance: none;
-    padding-right: 24px;
+  textarea { min-height: 54px; resize: vertical; width: 100%; }
+  input:focus, textarea:focus { border-color: var(--accent); }
+
+  .dropdown {
+    position: relative;
+    min-width: 130px;
+  }
+  .form-grid .dropdown { min-width: 0; width: 100%; }
+  .dropdown-button {
+    position: relative;
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: var(--radius);
+    padding: 5px 24px 5px 7px;
+    text-align: left;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .dropdown-button:hover,
+  .dropdown.open .dropdown-button { border-color: var(--accent); }
+  .dropdown-button::after {
+    content: 'v';
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--muted);
+    font-size: 9px;
+    pointer-events: none;
+  }
+  .dropdown-menu {
+    position: absolute;
+    z-index: 30;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    display: none;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 4px;
+    background: #18181c;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+  }
+  .dropdown.open .dropdown-menu { display: block; }
+  .dropdown-option {
+    width: 100%;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    border-radius: 4px;
+    padding: 5px 7px;
+    text-align: left;
     cursor: pointer;
   }
-  textarea { min-height: 54px; resize: vertical; width: 100%; }
-  input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+  .dropdown-option:hover,
+  .dropdown-option.active {
+    color: var(--text);
+    background: #252531;
+  }
 
   .body {
     display: flex;
@@ -362,6 +405,7 @@ let status = null;
 let events = [];
 let selectedProject = null;
 let selectedRow = null;
+let selectedEventKey = null;
 let kindFilter = 'all';
 let sevFilter = 'all';
 let agentFilter = '';
@@ -515,12 +559,11 @@ function renderProfileCards(project) {
 function profileEditor(project, profile) {
   const prefix = profile ? `edit-${profile.name}` : 'create';
   const env = new Set(profile ? profile.env : []);
+  const defaultScope = profile ? profile.defaultScope : 'session';
   return `
     <div class="form-grid" data-profile-editor="${esc(prefix)}">
       <input data-field="name" placeholder="name" value="${esc(profile ? profile.name : '')}">
-      <select data-field="defaultScope">
-        ${['once','session','branch','always'].map(scope => `<option value="${scope}" ${profile && profile.defaultScope === scope ? 'selected' : ''}>${scope}</option>`).join('')}
-      </select>
+      ${dropdownMarkup('defaultScope', defaultScope, ['once','session','branch','always'])}
       <input class="full" data-field="command" placeholder="command" value="${esc(profile ? profile.command : '')}">
       <input class="full" data-field="action" placeholder="action" value="${esc(profile ? profile.action : '')}">
       <div class="full check-grid">
@@ -535,6 +578,7 @@ function profileEditor(project, profile) {
 }
 
 function bindProfileEditors(project) {
+  bindDropdowns(document.getElementById('detail-pane'));
   document.querySelectorAll('[data-add-env]').forEach(btn => {
     btn.addEventListener('click', event => {
       const editor = event.target.closest('[data-profile-editor]');
@@ -577,7 +621,7 @@ function profilePayload(editor) {
     name: editor.querySelector('[data-field="name"]').value.trim(),
     command: editor.querySelector('[data-field="command"]').value.trim(),
     action: editor.querySelector('[data-field="action"]').value.trim(),
-    defaultScope: editor.querySelector('[data-field="defaultScope"]').value,
+    defaultScope: editor.querySelector('[data-field="defaultScope"]').dataset.value,
     env: [...editor.querySelectorAll('[data-env]:checked')].map(input => input.dataset.env)
   };
 }
@@ -589,7 +633,12 @@ function renderLogs() {
   document.getElementById('logs-link').href = link('/logs');
   renderLogFilters();
   renderLogTable();
-  document.getElementById('detail-pane').innerHTML = '<div class="detail-empty">select an event</div>';
+  const selectedEvent = selectedLogEvent();
+  if (selectedEvent) {
+    renderEventDetail(selectedEvent);
+  } else {
+    document.getElementById('detail-pane').innerHTML = '<div class="detail-empty">select an event</div>';
+  }
 }
 
 function renderLogFilters() {
@@ -599,7 +648,7 @@ function renderLogFilters() {
     ${['all','execution','request','approval','alert','session'].map(kind => `<button class="chip ${kindFilter === kind ? 'active' : ''}" data-kind="${kind}">${kind === 'execution' ? 'exec' : kind}</button>`).join('')}
     <div class="separator"></div>
     <span class="filter-label">agent</span>
-    <div class="agent-select-wrap"><select id="agent-filter"><option value="">all agents</option></select></div>
+    <div id="agent-filter"></div>
     <div class="separator"></div>
     <span class="filter-label">severity</span>
     ${['all','warn','crit'].map(sev => `<button class="chip ${sevFilter === sev ? 'active' : ''}" data-sev="${sev}">${sev === 'crit' ? 'critical' : sev}</button>`).join('')}
@@ -627,6 +676,8 @@ function renderLogTable() {
     <th class="td-time">time</th><th class="td-kind">kind</th><th class="td-sev">sev</th><th class="td-agent">agent</th><th class="td-cmd">command / action</th>
   </tr></thead><tbody></tbody>`;
   const rows = filteredEvents();
+  selectedRow = selectedEventKey ? rows.findIndex(event => eventKey(event) === selectedEventKey) : null;
+  if (selectedRow === -1) selectedRow = null;
   const tbody = table.querySelector('tbody');
   rows.forEach((event, index) => {
     const payload = event.payload || event;
@@ -634,18 +685,37 @@ function renderLogTable() {
     const cmd = payload.requestedCommand || (payload.access && payload.access.command) || payload.declaredAction || (payload.access && payload.access.action) || payload.eventType || '-';
     const sev = severity(event);
     const tr = document.createElement('tr');
-    if (selectedRow === index) tr.classList.add('selected');
+    if (selectedEventKey && eventKey(event) === selectedEventKey) tr.classList.add('selected');
     tr.innerHTML = `
       <td class="td-time">${esc((event.timestamp || '').slice(11, 19))}</td>
       <td class="td-kind"><span class="badge badge-${event._kind}">${event._kind}</span></td>
       <td class="td-sev"><span class="sev-${sev}">${sev}</span></td>
       <td class="td-agent">${esc(agent)}</td>
       <td class="td-cmd">${esc(shorten(cmd, 70))}</td>`;
-    tr.addEventListener('click', () => { selectedRow = index; renderLogTable(); renderEventDetail(event); });
+    tr.addEventListener('click', () => {
+      selectedRow = index;
+      selectedEventKey = eventKey(event);
+      renderLogTable();
+      renderEventDetail(event);
+    });
     tbody.appendChild(tr);
   });
   document.getElementById('item-count').textContent = `${events.length} events`;
   document.getElementById('filter-count').textContent = rows.length < events.length ? `${rows.length} shown` : '';
+}
+
+function selectedLogEvent() {
+  if (!selectedEventKey) return null;
+  return filteredEvents().find(event => eventKey(event) === selectedEventKey) || null;
+}
+
+function eventKey(event) {
+  return [
+    event._project || '',
+    event._kind || '',
+    event.timestamp || '',
+    JSON.stringify(event.payload || event)
+  ].join('|');
 }
 
 function updateAgentSelect() {
@@ -653,10 +723,72 @@ function updateAgentSelect() {
     const payload = event.payload || event;
     return payload.agent || (payload.access && payload.access.agent) || '';
   }).filter(Boolean))].sort();
-  const select = document.getElementById('agent-filter');
-  if (!select) return;
-  select.innerHTML = '<option value="">all agents</option>' + agents.map(agent => `<option value="${esc(agent)}" ${agentFilter === agent ? 'selected' : ''}>${esc(agent)}</option>`).join('');
-  select.addEventListener('change', event => { agentFilter = event.target.value; renderLogs(); });
+  if (agentFilter && !agents.includes(agentFilter)) agentFilter = '';
+  const host = document.getElementById('agent-filter');
+  if (!host) return;
+  const options = [{ value: '', label: 'all agents' }].concat(agents.map(agent => ({ value: agent, label: agent })));
+  host.innerHTML = dropdownMarkup('agentFilter', agentFilter, options);
+  bindDropdowns(host);
+  const dropdown = host.querySelector('[data-field="agentFilter"]');
+  dropdown.addEventListener('ward:dropdown-change', event => {
+    agentFilter = event.detail.value;
+    renderLogs();
+  });
+}
+
+function dropdownMarkup(field, value, options) {
+  const normalized = options.map(option => {
+    if (typeof option === 'string') return { value: option, label: option };
+    return { value: option.value, label: option.label };
+  });
+  const current = normalized.find(option => String(option.value) === String(value)) || normalized[0] || { value: '', label: '' };
+  return `
+    <div class="dropdown" data-dropdown data-field="${esc(field)}" data-value="${esc(current.value)}">
+      <button type="button" class="dropdown-button" data-dropdown-toggle aria-haspopup="listbox">${esc(current.label)}</button>
+      <div class="dropdown-menu" role="listbox">
+        ${normalized.map(option => {
+          const active = String(option.value) === String(current.value);
+          return `<button type="button" class="dropdown-option ${active ? 'active' : ''}" data-dropdown-option data-dropdown-value="${esc(option.value)}" role="option" aria-selected="${active ? 'true' : 'false'}">${esc(option.label)}</button>`;
+        }).join('')}
+      </div>
+    </div>`;
+}
+
+function bindDropdowns(root = document) {
+  root.querySelectorAll('[data-dropdown]').forEach(dropdown => {
+    if (dropdown.dataset.dropdownBound === 'true') return;
+    dropdown.dataset.dropdownBound = 'true';
+    const toggle = dropdown.querySelector('[data-dropdown-toggle]');
+    toggle.addEventListener('click', event => {
+      event.stopPropagation();
+      const wasOpen = dropdown.classList.contains('open');
+      closeDropdowns(dropdown);
+      dropdown.classList.toggle('open', !wasOpen);
+    });
+    dropdown.querySelectorAll('[data-dropdown-option]').forEach(option => {
+      option.addEventListener('click', event => {
+        event.stopPropagation();
+        dropdown.dataset.value = option.dataset.dropdownValue;
+        toggle.textContent = option.textContent;
+        dropdown.querySelectorAll('[data-dropdown-option]').forEach(item => {
+          const active = item === option;
+          item.classList.toggle('active', active);
+          item.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        dropdown.classList.remove('open');
+        dropdown.dispatchEvent(new CustomEvent('ward:dropdown-change', {
+          bubbles: true,
+          detail: { field: dropdown.dataset.field, value: dropdown.dataset.value }
+        }));
+      });
+    });
+  });
+}
+
+function closeDropdowns(except = null) {
+  document.querySelectorAll('[data-dropdown].open').forEach(dropdown => {
+    if (dropdown !== except) dropdown.classList.remove('open');
+  });
 }
 
 function renderEventDetail(event) {
@@ -743,6 +875,12 @@ function esc(value) {
 
 document.getElementById('refresh-btn').addEventListener('click', load);
 document.getElementById('add-project-btn').addEventListener('click', addProject);
+document.addEventListener('click', event => {
+  if (!event.target.closest('[data-dropdown]')) closeDropdowns();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape') closeDropdowns();
+});
 load().catch(error => {
   document.getElementById('detail-pane').innerHTML = `<div class="finding"><div class="finding-header"><span class="sev-crit">error</span></div><div class="finding-msg">${esc(error.message)}</div></div>`;
 });
