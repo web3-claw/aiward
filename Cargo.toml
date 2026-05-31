@@ -1,5 +1,5 @@
 [package]
-name = "ward"
+name = "aiward"
 version = "0.1.0"
 edition = "2021"
 description = "Local-first AI secret firewall for development environments."
@@ -9,6 +9,10 @@ homepage = "https://github.com/aiWardsh/aiward"
 keywords = ["secrets", "security", "ai", "agents", "environment"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
+
+[[bin]]
+name = "ward"
+path = "src/main.rs"
 
 [dependencies]
 aes-gcm = "0.10"

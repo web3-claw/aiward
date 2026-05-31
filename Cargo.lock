@@ -47,6 +47,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "aiward"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "assert_cmd",
+ "base64",
+ "chrono",
+ "clap",
+ "dirs",
+ "dotenvy",
+ "ed25519-dalek",
+ "glob",
+ "hex",
+ "inquire",
+ "keyring",
+ "libc",
+ "predicates",
+ "rand",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha2",
+ "tempfile",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1499,37 +1530,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "ward"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "argon2",
- "assert_cmd",
- "base64",
- "chrono",
- "clap",
- "dirs",
- "dotenvy",
- "ed25519-dalek",
- "glob",
- "hex",
- "inquire",
- "keyring",
- "libc",
- "predicates",
- "rand",
- "rpassword",
- "serde",
- "serde_json",
- "serial_test",
- "sha2",
- "tempfile",
- "uuid",
- "zeroize",
 ]
 
 [[package]]

@@ -276,7 +276,8 @@ mod tests {
         assert_eq!(verified.project, "demo");
 
         let mut bad = claimed.clone();
-        bad.branch = Some("main".to_string());
+        let wrong_branch = format!("not-{}", git.branch.as_deref().unwrap_or("main"));
+        bad.branch = Some(wrong_branch);
         assert!(matches!(
             verify_no_prompt_context(&bad, repo.path(), &resolved, "key".to_string()),
             Err(ContextProblem::ContextMismatch {
