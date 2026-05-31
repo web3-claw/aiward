@@ -184,4 +184,4 @@ What ward guarantees:
 
 ## License
 
-[Elastic License 2.0](LICENSE) — source available, free for personal and commercial use within your own products, not for resale as a managed service.
+MIT OR Apache-2.0 — free to use, modify, and distribute.
