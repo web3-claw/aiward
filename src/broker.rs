@@ -34,6 +34,8 @@ pub struct BrokerStatus {
     pub running: bool,
     pub socket: PathBuf,
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub version: String,
     pub sessions: Vec<BrokerSessionStatus>,
 }
 
@@ -169,6 +171,8 @@ struct BrokerState {
     next_human_command_id: u64,
 }
 
+const BROKER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 struct BrokerSession {
     project: String,
     vault: PathBuf,
@@ -199,10 +203,16 @@ pub fn ensure_running() -> Result<()> {
 
 #[cfg(not(test))]
 pub fn ensure_running() -> Result<()> {
-    if ping().is_ok() {
-        return Ok(());
+    match ping_status() {
+        Ok(status) if broker_is_current(&status) => return Ok(()),
+        Ok(status) if status.running => {
+            stop_existing_broker(&status);
+            cleanup_stale_files()?;
+        }
+        _ => {
+            cleanup_stale_files()?;
+        }
     }
-    cleanup_stale_files()?;
     fs_util::ensure_private_dir(&run_dir())?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
@@ -228,6 +238,72 @@ fn wait_until_ready(timeout: StdDuration) -> Result<()> {
         thread::sleep(StdDuration::from_millis(25));
     }
     anyhow::bail!("Ward broker did not become ready");
+}
+
+#[cfg(not(test))]
+fn broker_is_current(status: &BrokerStatus) -> bool {
+    status.running && status.version == BROKER_VERSION
+}
+
+#[cfg(not(test))]
+fn stop_existing_broker(status: &BrokerStatus) {
+    let pid = status.pid.or_else(|| read_pid().ok());
+    if send_simple(BrokerRequest::Stop).is_ok() {
+        if let Some(pid) = pid {
+            let deadline = Instant::now() + StdDuration::from_secs(2);
+            while Instant::now() < deadline {
+                if !process_exists(pid) {
+                    return;
+                }
+                thread::sleep(StdDuration::from_millis(50));
+            }
+        } else {
+            return;
+        }
+    }
+    if let Some(pid) = pid {
+        terminate_broker_process(pid);
+    }
+}
+
+#[cfg(not(test))]
+fn terminate_broker_process(pid: u32) {
+    if !is_broker_process(pid) {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: target pid is selected by command-line inspection.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        let deadline = Instant::now() + StdDuration::from_secs(1);
+        while Instant::now() < deadline {
+            if !process_exists(pid) {
+                return;
+            }
+            thread::sleep(StdDuration::from_millis(50));
+        }
+        // SAFETY: best-effort hard stop for the same broker process if SIGTERM was ignored.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(test))]
+fn is_broker_process(pid: u32) -> bool {
+    command_line(pid)
+        .map(|line| line.contains("__broker") && line.contains("ward"))
+        .unwrap_or(false)
+}
+
+#[cfg(not(test))]
+fn command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(not(test))]
@@ -384,15 +460,22 @@ fn inherited_execution_env() -> BTreeMap<String, String> {
 }
 
 pub fn status() -> Result<BrokerStatus> {
-    match send_simple(BrokerRequest::Ping) {
-        Ok(BrokerResponse::Status { status }) => Ok(status),
-        Ok(other) => anyhow::bail!("unexpected broker response: {other:?}"),
+    match ping_status() {
+        Ok(status) => Ok(status),
         Err(_) => Ok(BrokerStatus {
             running: false,
             socket: socket_path(),
             pid: read_pid().ok(),
+            version: BROKER_VERSION.to_string(),
             sessions: Vec::new(),
         }),
+    }
+}
+
+fn ping_status() -> Result<BrokerStatus> {
+    match send_simple(BrokerRequest::Ping)? {
+        BrokerResponse::Status { status } => Ok(status),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
     }
 }
 
@@ -449,6 +532,7 @@ pub fn setup_project_with_active_passphrase(
     target_path: &Path,
     project: Option<String>,
 ) -> Result<BrokerProjectSetupStatus> {
+    ensure_running()?;
     match send_simple(BrokerRequest::SetupProject {
         source_project: source_project.to_string(),
         source_vault: source_vault.to_path_buf(),
@@ -468,6 +552,7 @@ pub fn list_vault_keys(_project: &str, _vault: &Path) -> Result<Vec<String>> {
 
 #[cfg(not(test))]
 pub fn list_vault_keys(project: &str, vault: &Path) -> Result<Vec<String>> {
+    ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
         anyhow::bail!("Ward broker is unavailable from this executable");
@@ -1235,6 +1320,7 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
         running: true,
         socket: socket_path(),
         pid: Some(std::process::id()),
+        version: BROKER_VERSION.to_string(),
         sessions: state
             .sessions
             .values()
@@ -1368,10 +1454,7 @@ fn broker_error(reason: impl Into<String>, message: impl Into<String>) -> Broker
 
 #[cfg(not(test))]
 fn ping() -> Result<()> {
-    match send_simple(BrokerRequest::Ping)? {
-        BrokerResponse::Status { .. } => Ok(()),
-        other => anyhow::bail!("unexpected broker response: {other:?}"),
-    }
+    ping_status().map(|_| ())
 }
 
 fn connect() -> Result<UnixStream> {
@@ -1449,6 +1532,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         running: true,
         socket: socket_path(),
         pid: Some(1),
+        version: BROKER_VERSION.to_string(),
         sessions: Vec::new(),
     };
     let ping_result = with_fake_broker(vec![vec![BrokerResponse::Ok]], ping)?;
@@ -1650,6 +1734,7 @@ fn with_fake_broker<T>(
 mod tests {
     use super::*;
     use crate::{agents, approval_receipts, approvals::ApprovalScope, policy::AccessRequest};
+    use serial_test::serial;
 
     fn broker_pair(
         request: BrokerRequest,
@@ -1672,6 +1757,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn setup_project_with_passphrase_creates_project_without_exposing_secret_values() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -1700,6 +1786,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn setup_project_request_requires_active_source_session() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -1724,6 +1811,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn setup_project_with_existing_config_registers_without_overwriting() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -1747,6 +1835,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn setup_project_with_missing_env_is_rejected() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -1759,6 +1848,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn setup_project_request_reuses_active_session_passphrase() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -1806,6 +1896,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn broker_paths_live_under_ward_run_dir() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -1819,13 +1910,33 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn status_reports_not_running_without_socket() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
         let status = status().unwrap();
         assert!(!status.running);
+        assert_eq!(status.version, BROKER_VERSION);
         assert!(status.sessions.is_empty());
         std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    fn broker_status_accepts_legacy_ping_without_version() {
+        let body = serde_json::json!({
+            "type": "status",
+            "status": {
+                "running": true,
+                "socket": "/tmp/ward.sock",
+                "pid": 123,
+                "sessions": []
+            }
+        });
+        let response: BrokerResponse = serde_json::from_value(body).unwrap();
+        let BrokerResponse::Status { status } = response else {
+            panic!("expected status response");
+        };
+        assert_eq!(status.version, "");
     }
 
     #[test]
@@ -1840,6 +1951,7 @@ mod tests {
             running: true,
             socket: socket_path(),
             pid: Some(123),
+            version: BROKER_VERSION.to_string(),
             sessions: vec![
                 BrokerSessionStatus {
                     project: "other".to_string(),
@@ -1881,6 +1993,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn broker_client_protocol_handles_ping_stop_unlock_sign_and_execute() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -2119,6 +2232,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn broker_helpers_report_closed_and_invalid_messages() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());

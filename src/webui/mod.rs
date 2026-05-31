@@ -18,6 +18,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
@@ -152,6 +154,7 @@ struct PickFolderResponse {
 struct ProjectSetupRequest {
     path: PathBuf,
     project: Option<String>,
+    source_project: Option<String>,
 }
 
 pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
@@ -197,7 +200,8 @@ pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("cannot locate ward binary")?;
-    let mut child = Command::new(exe)
+    let mut command = Command::new(exe);
+    command
         .arg("__dashboard-server")
         .arg("--port")
         .arg(port.to_string())
@@ -205,9 +209,17 @@ pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
         .arg(&token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start Ward dashboard")?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().context("failed to start Ward dashboard")?;
 
     let mut instance = current_instance(port, token)?;
     instance.pid = child.id();
@@ -315,7 +327,7 @@ fn serve_blocking(port: u16, token: String) -> Result<()> {
         match server.recv_timeout(Duration::from_millis(200)) {
             Ok(Some(req)) => handle(req, &token),
             Ok(None) => {}
-            Err(_) => break,
+            Err(_) => continue,
         }
     }
     Ok(())
@@ -842,14 +854,28 @@ fn setup_project_from_dashboard(
     req: &mut tiny_http::Request,
 ) -> Result<broker::BrokerProjectSetupStatus> {
     let requested: ProjectSetupRequest = read_json_body(req)?;
+    let target_path = validate_dashboard_setup_target(&requested.path)?;
     let cwd = std::env::current_dir()?;
-    let current = registry::resolve_project(None, &cwd)?;
+    let current = registry::resolve_project(requested.source_project.as_deref(), &cwd)?;
     broker::setup_project_with_active_passphrase(
         &current.name,
         &current.vault,
-        &requested.path,
+        &target_path,
         requested.project,
     )
+}
+
+fn validate_dashboard_setup_target(path: &Path) -> Result<PathBuf> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !path.is_dir() {
+        anyhow::bail!("selected path is not a directory: {}", path.display());
+    }
+    if !path.join(".ward.json").exists() && !path.join(".env").exists() {
+        anyhow::bail!(
+            "selected folder has no .env or .ward.json; choose a project folder that already has secrets or run ward setup manually"
+        );
+    }
+    Ok(path)
 }
 
 fn read_json_body<T: for<'de> Deserialize<'de>>(req: &mut tiny_http::Request) -> Result<T> {
@@ -1943,6 +1969,27 @@ mod tests {
         .unwrap();
         assert_eq!(response.path, PathBuf::from("/tmp/demo"));
         assert!(pick_folder_from_request(PickFolderRequest { path: None }).is_err());
+    }
+
+    #[test]
+    fn dashboard_setup_target_requires_env_or_config() {
+        let project = tempfile::tempdir().unwrap();
+        let error = validate_dashboard_setup_target(project.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no .env or .ward.json"));
+
+        config::write_project_config(
+            project.path(),
+            &config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
+                .unwrap(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            validate_dashboard_setup_target(project.path()).unwrap(),
+            project.path().canonicalize().unwrap()
+        );
     }
 
     #[test]
