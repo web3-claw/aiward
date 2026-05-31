@@ -41,7 +41,7 @@ Ward is not a shell monitor. It protects the explicit Ward path.
 
 ```mermaid
 flowchart TD
-    A["Start with project .env"] --> B["./install.sh"]
+    A["Start with project .env"] --> B["cargo install aiward"]
     B --> C["ward init --project my-app"]
     C --> D["Create .ward.json"]
     C --> E["Encrypt .env into .env.vault"]
@@ -65,7 +65,7 @@ flowchart TD
 Command version:
 
 ```bash
-./install.sh
+cargo install aiward
 ward init --project my-app
 ward doctor
 ```
@@ -353,7 +353,7 @@ OS user.
 
 | Goal | Command |
 | --- | --- |
-| Install locally | `./install.sh` |
+| Install | `cargo install aiward` |
 | One-command onboarding | `ward init --project my-app` |
 | Check project safety | `ward doctor` |
 | Refresh vault unlock for runs | `ward unlock --ttl 8h` |

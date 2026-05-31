@@ -9,11 +9,11 @@ terminal input, hook your shell, or monitor arbitrary commands. Secrets are
 protected when agents and users run secret-bearing commands through `ward run`
 or request access through `ward request`.
 
-## Local workflow
+## Quick start
 
 ```bash
-./install.sh
-ward init --project ambienta
+cargo install aiward
+ward init --project my-app
 ward unlock --ttl 8h
 ward allow --profile dev --scope always --agent codex
 ward dev --agent codex
@@ -22,9 +22,9 @@ ward dev --agent codex
 ## Current CLI surface
 
 ```bash
-ward setup --yes --project ambienta
-ward setup --yes --project ambienta --unlock-ttl 8h
-ward setup --yes --project ambienta --no-unlock
+ward setup --yes --project my-app
+ward setup --yes --project my-app --unlock-ttl 8h
+ward setup --yes --project my-app --no-unlock
 ward init
 ward init --bare
 ward import <source-env-file>
@@ -38,14 +38,14 @@ ward projects remove <project>
 ward broker status
 ward broker stop
 ward broker socket-path
-ward worktrees list --project ambienta
-ward worktrees allow-root --project ambienta /path/to/worktrees
-ward worktrees remove-root --project ambienta /path/to/worktrees
+ward worktrees list --project my-app
+ward worktrees allow-root --project my-app /path/to/worktrees
+ward worktrees remove-root --project my-app /path/to/worktrees
 ward worktrees approve <request-id>
 ward worktrees deny <request-id>
-ward env list --project ambienta
-ward env set --project ambienta KEY=value
-ward env unset --project ambienta KEY
+ward env list --project my-app
+ward env set --project my-app KEY=value
+ward env unset --project my-app KEY
 ward env unlock
 ward env lock
 ward env export --output .env.export
@@ -249,30 +249,45 @@ may leave the machine.
 Signed approvals and hash-chained logs are tamper-evident, not undeletable. A
 same-user process can still remove local files if the OS permits it.
 
+## Install
+
+The easiest way to install is from [crates.io](https://crates.io/crates/aiward):
+
+```bash
+cargo install aiward
+```
+
+This installs the `ward` binary to `~/.cargo/bin/ward`. Make sure `~/.cargo/bin`
+is on your `PATH`.
+
 ## Development
 
 ```bash
+git clone https://github.com/aiWardsh/aiward
+cd aiward
 cargo fmt --check
 cargo check
 cargo test -- --test-threads=1
 cargo run -- --help
 ```
 
-Local install and usage instructions are available in
-[docs/local-install-and-usage.md](docs/local-install-and-usage.md).
-The full feature and command reference is available in
-[docs/features-and-commands.md](docs/features-and-commands.md).
-Env file concepts and local templates are documented in
-[docs/env-files.md](docs/env-files.md).
-Simple visual user-flow infographics are available in
-[docs/infographics.md](docs/infographics.md).
+Local build and install from source:
+
+```bash
+./install.sh
+```
+
+This builds a release binary with Cargo and places it at `~/.local/bin/ward`.
+
+Full documentation:
+
+- [docs/local-install-and-usage.md](docs/local-install-and-usage.md) — install from source and usage guide
+- [docs/features-and-commands.md](docs/features-and-commands.md) — full feature and command reference
+- [docs/env-files.md](docs/env-files.md) — env file concepts and configuration
+- [docs/infographics.md](docs/infographics.md) — visual user-flow diagrams
 
 Coverage gate:
 
 ```bash
 ./scripts/coverage.sh
 ```
-
-Release scaffolding is included under `.github/workflows/release.yml`. Until a
-GitHub repo slug is finalized, `./install.sh` builds locally. After that, set
-`WARD_GITHUB_REPO=owner/ward` to install a published release artifact.

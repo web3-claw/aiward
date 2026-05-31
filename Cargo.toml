@@ -1,6 +1,6 @@
 [package]
 name = "aiward"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Local-first AI secret firewall for development environments."
 license = "MIT OR Apache-2.0"

@@ -1,7 +1,21 @@
-# Local Install and Usage
+# Install and Usage
 
-This guide explains how to install Ward from this local checkout and test the
-passive MVP on your machine.
+This guide explains how to install Ward and test it on your machine.
+
+## Install from crates.io
+
+The easiest way to install is from [crates.io](https://crates.io/crates/aiward):
+
+```bash
+cargo install aiward
+```
+
+This installs the `ward` binary to `~/.cargo/bin/ward`. Make sure `~/.cargo/bin`
+is on your `PATH`.
+
+## Install from Source
+
+Clone the repository and build locally:
 
 Ward is currently passive and explicit-call only. It does not hook your shell,
 scan all terminal input, or monitor commands that bypass it. Secrets are protected
@@ -24,13 +38,13 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 ```
 
-## Verify the Checkout
+## Verify the Source Checkout
 
-From the Ward repository:
+Clone the repository and verify:
 
 ```bash
-cd /Users/eduardonicoleit/Documents/ward
-
+git clone https://github.com/aiWardsh/aiward
+cd aiward
 cargo fmt --check
 cargo check
 cargo test -- --test-threads=1
@@ -61,12 +75,11 @@ cargo run -- init --project demo
 This is useful while developing, but installing locally is more convenient for
 real workflow testing.
 
-## Install Locally
+## Install from Source Checkout
 
-Install Ward from this checkout:
+Build and install Ward from your local clone:
 
 ```bash
-cd /Users/eduardonicoleit/Documents/ward
 ./install.sh
 ```
 
@@ -84,17 +97,6 @@ not on your shell path, the installer prints one short fix:
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 ```
-
-Once the GitHub repository slug is configured, the same installer can download a
-tagged release instead of building locally:
-
-```bash
-WARD_GITHUB_REPO=owner/ward ./install.sh
-WARD_GITHUB_REPO=owner/ward WARD_VERSION=v0.1.0 ./install.sh
-```
-
-Without `WARD_GITHUB_REPO`, `./install.sh` builds the local checkout with
-Cargo.
 
 ## Safe Demo Flow
 

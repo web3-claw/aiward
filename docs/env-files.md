@@ -1,27 +1,22 @@
 # Env Files
 
-Ward has two different env-file concerns:
+Ward works with two kinds of env files:
 
-1. Ward's own local development settings, used while building this CLI.
-2. The target project's dotenv secrets, which Ward imports into `.env.vault`.
+1. **Configuration variables** that control Ward's own behavior (overrides for
+   home directory, test helpers, editor selection).
+2. **Application secrets** in the target project's dotenv file, which Ward
+   imports into `.env.vault` and manages from there.
 
-Keep those separate. This repository can have a local `.env` for development
-knobs, but Ward-managed application secrets belong in the target project that
-is being protected.
+## Ward Configuration Variables
 
-## Ward Development Env
-
-Use `.env.example` as the template for this repository:
+These variables control Ward's runtime behavior. Set them in your shell or in a
+`.env` file loaded before running Ward:
 
 ```bash
-cp .env.example .env
 set -a; . ./.env; set +a
 ```
 
-Rust does not load `.env` automatically. The export step matters because the
-binary reads these values from the process environment.
-
-The main variables are:
+The available variables are:
 
 | Variable | Purpose |
 | --- | --- |

@@ -41,31 +41,23 @@ Use ward logs view/export only after PIN/passphrase confirmation.
 
 ## Package Behavior
 
-Ward is distributed as a local CLI binary named `ward`.
+Ward is distributed as a CLI binary named `ward`. Install from
+[crates.io](https://crates.io/crates/aiward):
 
-The local installer:
+```bash
+cargo install aiward
+```
+
+This installs the binary to `~/.cargo/bin/ward`.
+
+To build and install from source:
 
 ```bash
 ./install.sh
 ```
 
-builds the Rust release binary and installs it to:
-
-```txt
-~/.local/bin/ward
-```
-
+This builds the Rust release binary and installs it to `~/.local/bin/ward`.
 If `~/.local/bin` is not on `PATH`, the installer prints a short PATH fix.
-
-After the GitHub repository slug is configured, the same script can download a
-published release instead:
-
-```bash
-WARD_GITHUB_REPO=owner/ward ./install.sh
-WARD_GITHUB_REPO=owner/ward WARD_VERSION=v0.1.0 ./install.sh
-```
-
-Set `WARD_FORCE_LOCAL_BUILD=1` to force a local Cargo build.
 
 Ward uses local project files and global user state. It has no backend.
 
@@ -434,7 +426,7 @@ Encrypted audit logs are preserved by default.
 Recommended onboarding:
 
 ```bash
-./install.sh
+cargo install aiward
 ward init --project my-project
 ward allow --profile dev --scope always --agent codex
 ward dev --agent codex
@@ -1186,7 +1178,7 @@ Use `--restore-env` to explicitly restore plaintext `.env`. Passing
 ### Human Setup
 
 ```bash
-./install.sh
+cargo install aiward
 ward init --project my-project
 ward doctor
 ```

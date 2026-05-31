@@ -156,7 +156,7 @@ User runs ward env lock
 ### 3. Register project for worktrees
 
 ```txt
-User runs ward register ambienta
+User runs ward register my-app
   -> read .ward.json
   -> collect git remote and repo root
   -> write ~/.ward/registry.json
