@@ -1,16 +1,17 @@
+use aiward as ward;
 use assert_cmd::Command;
-use ward::{
-    approvals::ApprovalScope,
-    cli::{dispatch, Cli, Commands, EnvCommand, LogsCommand, ProjectsCommand},
-    config,
-    logs::LogKind,
-};
 use predicates::prelude::*;
 use serde_json::Value;
 use std::{
     env,
     path::{Path, PathBuf},
     process::Command as StdCommand,
+};
+use ward::{
+    approvals::ApprovalScope,
+    cli::{dispatch, Cli, Commands, EnvCommand, LogsCommand, ProjectsCommand},
+    config,
+    logs::LogKind,
 };
 
 const TEST_PASSPHRASE: &str = "correct horse battery staple";
@@ -84,9 +85,11 @@ impl TestProject {
             .args(["setup", "--yes", "--project", "demo"])
             .assert()
             .success()
-            .stdout(predicate::str::contains("Ward setup complete."))
-            .stdout(predicate::str::contains("Vault unlocked until"))
-            .stdout(predicate::str::contains("Next: ward dev"));
+            .stderr(
+                predicate::str::contains("Vault encrypted")
+                    .and(predicate::str::contains("Session unlocked"))
+                    .and(predicate::str::contains("Recovery key created")),
+            );
     }
 
     fn unlock(&self) {
@@ -271,8 +274,7 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
     assert!(!locked_env.contains("postgres://secret"));
     assert!(fixture.ward_home.path().join("registry.json").exists());
     let unlocks: Value = serde_json::from_str(
-        &std::fs::read_to_string(fixture.ward_home.path().join("sessions/unlocks.json"))
-            .unwrap(),
+        &std::fs::read_to_string(fixture.ward_home.path().join("sessions/unlocks.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(unlocks["sessions"][0]["purpose"], "run");
@@ -372,6 +374,419 @@ fn setup_profiles_only_include_vault_present_database_key() {
     assert_eq!(
         config["profiles"]["migrate"]["env"],
         serde_json::json!(["DATABASE_URI", "PAYLOAD_SECRET"])
+    );
+}
+
+#[test]
+fn rotate_moves_active_session_vault_to_derived_path_and_keeps_env_available() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+
+    let old_vault = fixture.project_dir.path().join(".env.vault");
+    assert!(old_vault.exists());
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["rotate"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Vault rotated"));
+
+    let project_config = config::read_project_config(fixture.project_dir.path()).unwrap();
+    let new_vault = config::resolve_vault_path_with_passphrase(
+        fixture.project_dir.path(),
+        &project_config,
+        TEST_PASSPHRASE,
+    );
+    assert_ne!(new_vault, old_vault);
+    assert!(!old_vault.exists());
+    assert!(new_vault.exists());
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["env", "list"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("DATABASE_URL")
+                .and(predicate::str::contains("PAYLOAD_SECRET")),
+        );
+
+    fixture.unlock();
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_APPROVAL", "once")
+        .args([
+            "run",
+            "--action",
+            "Verify rotated vault injection",
+            "--env",
+            "PAYLOAD_SECRET",
+            "--",
+            "sh",
+            "-c",
+            "test -n \"$PAYLOAD_SECRET\"",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn shell_init_wraps_common_dev_commands_even_outside_project() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(tempdir.path())
+        .env("WARD_HOME", ward_home.path())
+        .args(["shell-init", "--shell", "zsh"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("pnpm() { __ward_wrap pnpm \"$@\"; }")
+                .and(predicate::str::contains(
+                    "next() { __ward_wrap next \"$@\"; }",
+                ))
+                .and(predicate::str::contains(
+                    "node() { __ward_wrap node \"$@\"; }",
+                ))
+                .and(predicate::str::contains("command ward run -- \"$@\"")),
+        );
+}
+
+#[test]
+fn zsh_bad_order_does_not_install_pnpm_wrapper() {
+    if zsh_unavailable() {
+        return;
+    }
+    let tempdir = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
+    let ward_bin_dir = ward_bin_dir();
+    let rc = tempdir.path().join("bad.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "eval \"$(ward shell-init)\"\nexport PATH=\"{}:$PATH\"\ntype pnpm\n",
+            ward_bin_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("WARD_HOME", ward_home.path())
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(combined.contains("command not found: ward"));
+    assert!(!combined.contains("__ward_wrap pnpm"));
+}
+
+#[test]
+fn zsh_correct_order_installs_pnpm_wrapper() {
+    if zsh_unavailable() {
+        return;
+    }
+    let tempdir = tempfile::tempdir().unwrap();
+    let ward_home = tempfile::tempdir().unwrap();
+    let ward_bin_dir = ward_bin_dir();
+    let rc = tempdir.path().join("good.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:$PATH\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\ntype pnpm\nfunctions pnpm\n",
+            ward_bin_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("WARD_HOME", ward_home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("pnpm is a shell function"));
+    assert!(stdout.contains("__ward_wrap pnpm"));
+}
+
+#[test]
+fn zsh_prompt_badge_tracks_ward_project_state() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    let ward_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.project_dir.path().join(".ward.json"),
+        r#"{"version":1,"project":"demo","vault":".env.vault"}"#,
+    )
+    .unwrap();
+    let ward_bin_dir = ward_bin_dir();
+    let rc = fixture.project_dir.path().join("prompt-badge.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:$PATH\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\n__ward_precmd\nprint -r -- \"locked=$RPROMPT\"\nmkdir -p \"$WARD_HOME/run/human-$$\"\npython3 - \"$WARD_HOME/run/human-$$/guardian.sock\" <<'PY'\nimport socket\nimport sys\ns = socket.socket(socket.AF_UNIX)\ns.bind(sys.argv[1])\ns.close()\nPY\n__ward_precmd\nprint -r -- \"active=$RPROMPT\"\ncd /\n__ward_precmd\nprint -r -- \"outside=$RPROMPT\"\n",
+            ward_bin_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", ward_home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("locked=ward:locked"));
+    assert!(stdout.contains("active=ward:human"));
+    assert!(stdout.contains("outside="));
+    assert!(!stdout.contains("outside=ward:"));
+}
+
+#[test]
+fn zsh_ward_project_without_guardian_fails_closed_before_pnpm() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    let ward_home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        fixture.project_dir.path().join(".ward.json"),
+        r#"{"version":1,"project":"demo","vault":".env.vault"}"#,
+    )
+    .unwrap();
+    let marker = fixture.project_dir.path().join("pnpm-ran");
+    let fake_path = fixture.fake_pnpm_path(&format!(
+        "#!/bin/sh\nprintf ran > '{}'\nexit 0\n",
+        marker.display()
+    ));
+    let ward_bin_dir = ward_bin_dir();
+    let rc = fixture.project_dir.path().join("no-guardian.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\npnpm run dev\n",
+            ward_bin_dir.display(),
+            fake_path
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", ward_home.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(126));
+    assert!(!marker.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Ward human mode is not active"));
+}
+
+#[test]
+fn human_terminal_run_without_env_flags_injects_every_vault_key() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    std::fs::write(
+        fixture.project_dir.path().join(".env"),
+        "DATABASE_URL=postgres://secret\nPAYLOAD_SECRET=payload-secret\nUNLISTED_SECRET=only-human-mode\n",
+    )
+    .unwrap();
+    fixture.setup_yes();
+
+    let ward_bin_dir = ward_bin_dir();
+    let rc = fixture.project_dir.path().join("direct-human-run.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:$PATH\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\nward run -- sh -c 'test -n \"$DATABASE_URL\" && test -n \"$PAYLOAD_SECRET\" && test -n \"$UNLISTED_SECRET\"'\nward_status=$?\nward lock >/dev/null 2>/dev/null\nexit $ward_status\n",
+            ward_bin_dir.display()
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn zsh_human_mode_pnpm_run_dev_receives_all_vault_keys() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    std::fs::write(
+        fixture.project_dir.path().join(".env"),
+        "DATABASE_URL=postgres://secret\nPAYLOAD_SECRET=payload-secret\nUNLISTED_SECRET=only-human-mode\n",
+    )
+    .unwrap();
+    let fake_path = fixture.fake_pnpm_path(
+        "#!/bin/sh\nif [ \"$1\" != \"run\" ] || [ \"$2\" != \"dev\" ]; then exit 64; fi\ntest -n \"$DATABASE_URL\" || exit 10\ntest -n \"$PAYLOAD_SECRET\" || exit 11\ntest -n \"$UNLISTED_SECRET\" || exit 12\nprintf 'all env present\\n'\n",
+    );
+    fixture.setup_yes();
+
+    let ward_bin_dir = ward_bin_dir();
+    let subdir = fixture.project_dir.path().join("src").join("app");
+    std::fs::create_dir_all(&subdir).unwrap();
+    let rc = fixture.project_dir.path().join("human-test.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\npnpm run dev\nward_status=$?\nward lock >/dev/null 2>/dev/null\nexit $ward_status\n",
+            ward_bin_dir.display(),
+            fake_path
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(&subdir)
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("all env present"));
+}
+
+#[test]
+fn zsh_human_mode_client_disconnect_kills_child_process_group() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+    let child_pid_file = fixture.project_dir.path().join("child.pid");
+    let fake_path = fixture.fake_pnpm_path(&format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nsleep 60\n",
+        child_pid_file.display()
+    ));
+    let ward_bin_dir = ward_bin_dir();
+    let rc = fixture.project_dir.path().join("disconnect-kill.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\nWARD_HUMAN_SHELL_PID=$$ command ward run -- pnpm run dev &\nward_pid=$!\nfor i in {{1..100}}; do\n  test -s '{}' && break\n  sleep 0.05\ndone\nif ! test -s '{}'; then\n  ward lock >/dev/null 2>/dev/null\n  exit 70\nfi\nchild_pid=$(cat '{}')\nkill -TERM \"$ward_pid\" >/dev/null 2>/dev/null || true\nwait \"$ward_pid\" >/dev/null 2>/dev/null || true\nfor i in {{1..100}}; do\n  if ! kill -0 \"$child_pid\" >/dev/null 2>/dev/null; then\n    ward lock >/dev/null 2>/dev/null\n    exit 0\n  fi\n  sleep 0.05\ndone\nward lock >/dev/null 2>/dev/null\nexit 71\n",
+            ward_bin_dir.display(),
+            fake_path,
+            child_pid_file.display(),
+            child_pid_file.display(),
+            child_pid_file.display()
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn zsh_human_mode_lock_kills_active_child_process_group() {
+    if zsh_unavailable() {
+        return;
+    }
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+    let child_pid_file = fixture.project_dir.path().join("lock-child.pid");
+    let fake_path = fixture.fake_pnpm_path(&format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nsleep 60\n",
+        child_pid_file.display()
+    ));
+    let ward_bin_dir = ward_bin_dir();
+    let rc = fixture.project_dir.path().join("lock-kill.zshrc");
+    std::fs::write(
+        &rc,
+        format!(
+            "export PATH=\"{}:{}\"\nif command -v ward >/dev/null 2>&1; then\n  eval \"$(ward shell-init)\"\nfi\nward human --ttl 5m >/dev/null\nWARD_HUMAN_SHELL_PID=$$ command ward run -- pnpm run dev &\nward_pid=$!\nfor i in {{1..100}}; do\n  test -s '{}' && break\n  sleep 0.05\ndone\nif ! test -s '{}'; then\n  ward lock >/dev/null 2>/dev/null\n  exit 70\nfi\nchild_pid=$(cat '{}')\nward lock >/dev/null 2>/dev/null\nwait \"$ward_pid\" >/dev/null 2>/dev/null || true\nfor i in {{1..100}}; do\n  if ! kill -0 \"$child_pid\" >/dev/null 2>/dev/null; then\n    exit 0\n  fi\n  sleep 0.05\ndone\nkill -KILL \"$child_pid\" >/dev/null 2>/dev/null || true\nexit 71\n",
+            ward_bin_dir.display(),
+            fake_path,
+            child_pid_file.display(),
+            child_pid_file.display(),
+            child_pid_file.display()
+        ),
+    )
+    .unwrap();
+
+    let output = StdCommand::new("zsh")
+        .args(["-f", &rc.display().to_string()])
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -873,7 +1288,8 @@ fn post_run_execution_log_failure_returns_ward_error_after_child_success() {
     let fixture = TestProject::new();
     fixture.init_import_and_register();
     fixture.unlock();
-    let script = "rm -f \"$WARD_HOME/logs/executions.jsonl\"; mkdir \"$WARD_HOME/logs/executions.jsonl\"";
+    let script =
+        "rm -f \"$WARD_HOME/logs/executions.jsonl\"; mkdir \"$WARD_HOME/logs/executions.jsonl\"";
     let command_text = format!("sh -c {script}");
 
     fixture
@@ -1789,11 +2205,7 @@ fn run_rejects_misplaced_no_prompt_after_separator_as_json() {
 fn doctor_reports_active_unlock_with_local_log_key_storage() {
     let fixture = TestProject::new();
     fixture.setup_yes();
-    let log_key_path = fixture
-        .ward_home
-        .path()
-        .join("cache")
-        .join("log-key.json");
+    let log_key_path = fixture.ward_home.path().join("cache").join("log-key.json");
     assert!(log_key_path.exists());
     assert!(!fixture
         .ward_home
@@ -2434,18 +2846,17 @@ fn allow_unlock_reuse_lock_and_grant_management_flow() {
         .success()
         .stdout(predicate::str::contains("Always"));
 
-    let grant_id =
-        std::fs::read_to_string(fixture.ward_home.path().join("sessions/grants.jsonl"))
-            .unwrap()
-            .lines()
-            .find_map(|line| serde_json::from_str::<Value>(line).ok())
-            .and_then(|value| {
-                value["scope"]
-                    .as_str()
-                    .filter(|scope| *scope == "always")
-                    .and_then(|_| value["id"].as_str().map(str::to_string))
-            })
-            .unwrap();
+    let grant_id = std::fs::read_to_string(fixture.ward_home.path().join("sessions/grants.jsonl"))
+        .unwrap()
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .and_then(|value| {
+            value["scope"]
+                .as_str()
+                .filter(|scope| *scope == "always")
+                .and_then(|_| value["id"].as_str().map(str::to_string))
+        })
+        .unwrap();
     fixture
         .command()
         .args(["grants", "revoke", &grant_id])
@@ -2559,9 +2970,7 @@ fn edit_reencrypts_vault_and_updated_secret_can_be_injected() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "PAYLOAD_SECRET=[WARD_REDACTED]",
-        ));
+        .stdout(predicate::str::contains("PAYLOAD_SECRET=[WARD_REDACTED]"));
 }
 
 #[test]
@@ -2947,11 +3356,7 @@ fn import_with_explicit_vault_and_doctor_parse_error_are_reported() {
         .success()
         .stdout(predicate::str::contains("[ok] .env is Ward locked."));
 
-    std::fs::write(
-        fixture.project_dir.path().join(".ward.json"),
-        "{bad-json}",
-    )
-    .unwrap();
+    std::fs::write(fixture.project_dir.path().join(".ward.json"), "{bad-json}").unwrap();
     fixture
         .command()
         .arg("doctor")
@@ -3600,6 +4005,17 @@ fn context_parts_for_path(path: &Path, branch: &str) -> ContextParts {
         commit,
         branch: branch.to_string(),
     }
+}
+
+fn zsh_unavailable() -> bool {
+    StdCommand::new("zsh").arg("--version").output().is_err()
+}
+
+fn ward_bin_dir() -> PathBuf {
+    assert_cmd::cargo::cargo_bin("ward")
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 #[cfg(coverage)]

@@ -301,6 +301,17 @@ pub(crate) fn validate_new_passphrase(first: &str, second: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prompt for a new PIN with custom labels (used for recovery PIN during setup).
+pub fn read_new_pin(prompt: &str, confirm_prompt: &str) -> Result<String> {
+    if let Some(passphrase) = test_passphrase() {
+        return Ok(passphrase);
+    }
+    let first = rpassword::prompt_password(format!("{prompt}: "))?;
+    let second = rpassword::prompt_password(format!("{confirm_prompt}: "))?;
+    validate_new_passphrase(&first, &second)?;
+    Ok(first)
+}
+
 pub fn read_existing_passphrase() -> Result<String> {
     if let Some(passphrase) = test_passphrase() {
         return Ok(passphrase);
@@ -337,8 +348,8 @@ pub(crate) fn test_passphrase() -> Option<String> {
 
 #[cfg(not(coverage))]
 fn prompt_new_passphrase_pair() -> Result<(String, String)> {
-    let first = rpassword::prompt_password("New vault PIN/passphrase: ")?;
-    let second = rpassword::prompt_password("Confirm vault PIN/passphrase: ")?;
+    let first = rpassword::prompt_password("  New vault PIN/passphrase: ")?;
+    let second = rpassword::prompt_password("  Confirm vault PIN/passphrase: ")?;
     Ok((first, second))
 }
 
@@ -352,7 +363,7 @@ fn prompt_new_passphrase_pair() -> Result<(String, String)> {
 
 #[cfg(not(coverage))]
 fn prompt_existing_passphrase() -> Result<String> {
-    Ok(rpassword::prompt_password("Vault PIN/passphrase: ")?)
+    Ok(rpassword::prompt_password("  Vault PIN/passphrase: ")?)
 }
 
 #[cfg(coverage)]

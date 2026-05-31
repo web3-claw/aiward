@@ -7,8 +7,8 @@ use ratatui::{
     style::{Color, Style, Stylize},
     text::{Line, Span, Text},
     widgets::{
-        Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Table, TableState, Tabs, Wrap,
+        Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+        ScrollbarState, Table, TableState, Tabs, Wrap,
     },
     DefaultTerminal, Frame,
 };
@@ -116,8 +116,7 @@ impl App {
                 }
             }
         }
-        self.entries
-            .sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        self.entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
         self.entries.reverse();
 
         let mut agents: Vec<String> = self
@@ -466,7 +465,10 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     // Title bar
     let title = Paragraph::new(Line::from(vec![
-        Span::styled(" ward ", Style::default().fg(Color::Black).bg(Color::White).bold()),
+        Span::styled(
+            " ward ",
+            Style::default().fg(Color::Black).bg(Color::White).bold(),
+        ),
         Span::raw("  logs dashboard  "),
         Span::styled(
             format!("  {} events  ", app.filtered.len()),
@@ -478,7 +480,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Kind tabs
     let kind_titles: Vec<Line> = std::iter::once(Line::from("all"))
         .chain(ALL_KINDS.iter().map(|&k| {
-            Line::from(Span::styled(kind_label(k), Style::default().fg(kind_color(k))))
+            Line::from(Span::styled(
+                kind_label(k),
+                Style::default().fg(kind_color(k)),
+            ))
         }))
         .collect();
     let kind_tabs = Tabs::new(kind_titles)
@@ -500,12 +505,20 @@ fn draw(f: &mut Frame, app: &mut App) {
         .collect();
     let agent_tabs = if agent_titles.is_empty() {
         Tabs::new(vec![Line::from("all")])
-            .block(Block::default().borders(Borders::ALL).title(" agent [a/A] "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" agent [a/A] "),
+            )
             .select(0)
             .highlight_style(Style::default().bold().bg(Color::DarkGray))
     } else {
         Tabs::new(agent_titles)
-            .block(Block::default().borders(Borders::ALL).title(" agent [a/A] "))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" agent [a/A] "),
+            )
             .select(app.agent_tab)
             .highlight_style(Style::default().bold().bg(Color::DarkGray))
     };
@@ -588,11 +601,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 .timestamp
                 .get(11..19)
                 .unwrap_or(e.timestamp.get(..8).unwrap_or(&e.timestamp));
-            let label = e
-                .command
-                .as_deref()
-                .or(e.action.as_deref())
-                .unwrap_or("-");
+            let label = e.command.as_deref().or(e.action.as_deref()).unwrap_or("-");
             // truncate label
             let label = if label.len() > 35 {
                 format!("{}…", &label[..34])
@@ -750,10 +759,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 Style::default().fg(Color::DarkGray),
             )));
             for f in findings {
-                let sev = f
-                    .get("severity")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("info");
+                let sev = f.get("severity").and_then(|s| s.as_str()).unwrap_or("info");
                 let code = f.get("code").and_then(|s| s.as_str()).unwrap_or("?");
                 let msg = f.get("message").and_then(|s| s.as_str()).unwrap_or("");
                 let sev_color = match sev {
@@ -763,10 +769,7 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
                 };
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(
-                        format!("[{}] ", sev),
-                        Style::default().fg(sev_color).bold(),
-                    ),
+                    Span::styled(format!("[{}] ", sev), Style::default().fg(sev_color).bold()),
                     Span::styled(code, Style::default().fg(Color::DarkGray)),
                     Span::raw(format!("  {}", msg)),
                 ]));
@@ -858,7 +861,12 @@ fn draw_help(f: &mut Frame, area: ratatui::layout::Rect) {
     let height = 20u16.min(area.height.saturating_sub(4));
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
-    let popup = ratatui::layout::Rect { x, y, width, height };
+    let popup = ratatui::layout::Rect {
+        x,
+        y,
+        width,
+        height,
+    };
 
     f.render_widget(Clear, popup);
 

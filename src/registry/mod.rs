@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{read_project_config, resolve_vault_path},
+    config::{read_project_config, resolve_vault_path, resolve_vault_path_with_passphrase},
     fs_util,
     git_context::collect_git_context,
     logs,
@@ -103,6 +103,39 @@ pub fn register_project(
     Ok(registered)
 }
 
+pub fn update_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Result<()> {
+    let mut registry = load_registry()?;
+    let git = collect_git_context(&path);
+    let canonical_repo_path = path.canonicalize().ok();
+    match registry.projects.get_mut(project) {
+        Some(registered) => {
+            registered.path = path;
+            registered.vault = vault;
+            registered.git_remote = git.remote;
+            registered.last_used = Some(chrono::Utc::now().to_rfc3339());
+            registered.canonical_repo_path = canonical_repo_path;
+            registered.git_common_dir = git.common_dir;
+        }
+        None => {
+            let registered = RegisteredProject {
+                path,
+                vault,
+                git_remote: git.remote,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                last_used: Some(chrono::Utc::now().to_rfc3339()),
+                allowed_worktree_roots: Vec::new(),
+                known_worktrees: Vec::new(),
+                auto_bind_worktrees: true,
+                canonical_repo_path,
+                git_common_dir: git.common_dir,
+            };
+            registry.projects.insert(project.to_string(), registered);
+        }
+    }
+    registry.active_project = Some(project.to_string());
+    save_registry(&registry)
+}
+
 fn default_auto_bind_worktrees() -> bool {
     true
 }
@@ -141,7 +174,9 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
             .context(format!("project {project} is not registered"));
     }
 
-    if let Ok(config) = read_project_config(cwd) {
+    let local_config_root =
+        crate::config::find_project_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    if let Ok(config) = read_project_config(&local_config_root) {
         if let Some(registered) = registry.projects.get(&config.project) {
             return Ok(ResolvedProject {
                 name: config.project,
@@ -152,8 +187,8 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
 
         return Ok(ResolvedProject {
             name: config.project.clone(),
-            path: cwd.to_path_buf(),
-            vault: resolve_vault_path(cwd, &config),
+            path: local_config_root.clone(),
+            vault: resolve_vault_path(&local_config_root, &config),
         });
     }
 
@@ -190,6 +225,21 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
     }
 
     anyhow::bail!("could not resolve Ward project; run ward init or ward use <project>")
+}
+
+pub fn resolve_project_with_passphrase(
+    explicit_project: Option<&str>,
+    cwd: &Path,
+    passphrase: &str,
+) -> Result<ResolvedProject> {
+    let mut resolved = resolve_project(explicit_project, cwd)?;
+    if let Ok(config) = read_project_config(&resolved.path) {
+        if config.project == resolved.name {
+            resolved.vault =
+                resolve_vault_path_with_passphrase(&resolved.path, &config, passphrase);
+        }
+    }
+    Ok(resolved)
 }
 
 fn registered_project(registry: &Registry, project: &str) -> Option<ResolvedProject> {

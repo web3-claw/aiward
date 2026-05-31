@@ -53,8 +53,8 @@ pub fn load_local_modes(project_root: &Path) -> Result<Vec<ModeConfig>> {
     if !path.exists() {
         return Ok(vec![]);
     }
-    let content = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let content =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     let modes: Vec<ModeConfig> =
         serde_json::from_str(&content).context("failed to parse .ward.modes.json")?;
     Ok(modes)
@@ -96,7 +96,8 @@ pub fn load_broker_modes(project: &str, passphrase: &str) -> Result<Vec<ModeConf
         .with_context(|| format!("failed to read {}", vault_path.display()))?;
     let envelope: vault::VaultEnvelope =
         serde_json::from_str(&vault_json).context("failed to parse modes vault")?;
-    let plaintext = vault::decrypt_env(&envelope, passphrase).context("failed to decrypt modes vault — wrong passphrase?")?;
+    let plaintext = vault::decrypt_env(&envelope, passphrase)
+        .context("failed to decrypt modes vault — wrong passphrase?")?;
     let modes: Vec<ModeConfig> =
         serde_json::from_str(&plaintext).context("failed to parse decrypted modes")?;
     Ok(modes)
@@ -204,7 +205,10 @@ mod tests {
     fn glob_star() {
         assert!(glob_match("node scripts/*.mjs", "node scripts/seed.mjs"));
         assert!(glob_match("node scripts/*.mjs", "node scripts/cleanup.mjs"));
-        assert!(!glob_match("node scripts/*.mjs", "node scripts/sub/seed.mjs"));
+        assert!(!glob_match(
+            "node scripts/*.mjs",
+            "node scripts/sub/seed.mjs"
+        ));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # Ward User Flow Infographics
 
-This page is a simple visual explainer for Ward's passive MVP. The diagrams
-are written in Mermaid so they render on GitHub and remain easy to edit.
+This page is a simple visual explainer for Ward's agent-passive model and the
+human-mode shell-hook exception. The diagrams are written in Mermaid so they
+render on GitHub and remain easy to edit.
 
 ## One Sentence
 
@@ -15,7 +16,8 @@ need, injects them only into approved commands, and records encrypted audit logs
 ```mermaid
 flowchart LR
     A["Developer or AI agent"] --> B{"How is the command run?"}
-    B -->|"Plain shell command"| C["Not protected by Ward<br/>Example: pnpm dev"]
+    B -->|"Plain shell command outside human mode"| C["Not protected by Ward<br/>Example: pnpm dev"]
+    B -->|"Human-mode wrapped command"| D
     B -->|"ward run or profile shortcut"| D["Protected path"]
     D --> E["Policy and exploit checks"]
     E --> F["Approval or matching grant"]

@@ -14,12 +14,12 @@ use crate::{
     agents, anomaly,
     approvals::{self, ApprovalDecision, ApprovalScope},
     broker, config, context, detection, env_file, git_context, grants,
-    logs::{self as audit_logs, LogKind},
+    logs::{self as audit_logs, self as logs, LogKind},
     modes, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
     recovery, registry,
     runner::{self, RunCommandRequest},
-    unlock, vault, worktrees,
+    term, unlock, vault, worktrees,
 };
 
 #[derive(Debug)]
@@ -517,11 +517,15 @@ pub enum RecoveryCommand {
         output: Option<PathBuf>,
     },
     /// Import a recovery file backup into ~/.ward/recovery/.
-    Import {
-        path: PathBuf,
-    },
-    /// Create a new recovery file (requires vault passphrase and a PIN).
+    /// Omit PATH to be prompted — drag and drop the file into the terminal.
+    Import { path: Option<PathBuf> },
+    /// Create a new recovery file using the vault passphrase.
     Create,
+    /// Restore the vault file from recovery material.
+    Restore {
+        /// Recovery file to import and use. Defaults to the local recovery file.
+        path: Option<PathBuf>,
+    },
 }
 
 pub fn dispatch(cli: Cli) -> Result<()> {
@@ -1060,24 +1064,26 @@ fn setup(options: SetupOptions) -> Result<()> {
     let commit_vault = !options.ignore_vault;
     let remove_plaintext = options.remove_plaintext && !options.keep_plaintext;
     let source_exists = options.source.exists();
-    let vault_path = if options.vault.is_absolute() {
+    let configured_vault_path = if options.vault.is_absolute() {
         options.vault.clone()
     } else {
         cwd.join(&options.vault)
     };
+    let registered_vault_path = config::read_project_config(&cwd)
+        .ok()
+        .and_then(|existing| registry::resolve_project(Some(&existing.project), &cwd).ok())
+        .and_then(|resolved| {
+            let same_path = resolved.path == cwd
+                || resolved.path.canonicalize().ok() == cwd.canonicalize().ok();
+            same_path.then_some(resolved.vault)
+        })
+        .filter(|path| path.exists());
+    let vault_path = registered_vault_path.unwrap_or(configured_vault_path);
     let source_is_locked = if source_exists {
         env_file::is_locked_env_file(&options.source)?
     } else {
         false
     };
-
-    if !source_exists && !vault_path.exists() {
-        anyhow::bail!(
-            "{} does not exist and {} is missing",
-            options.source.display(),
-            vault_path.display()
-        );
-    }
 
     let env_keys = if source_exists && !source_is_locked {
         config::env_keys_from_dotenv_file(&options.source)?
@@ -1107,15 +1113,19 @@ fn setup(options: SetupOptions) -> Result<()> {
     };
     config::merge_default_profiles(&mut project_config, &env_keys, &cwd);
 
-    let mut config_path = config::write_project_config(&cwd, &project_config, true)?;
+    config::write_project_config(&cwd, &project_config, true)?;
     let env_example = config::ensure_env_example(&cwd)?;
     let agent_instructions = config::ensure_agent_instructions(&cwd, &project_config.project)?;
-    let gitignore = config::ensure_gitignore(&cwd, commit_vault)?;
+    config::ensure_gitignore(&cwd, commit_vault)?;
+
+    // Print header before any prompts so PIN input is visually grouped below it.
+    term::header(&project_config.project);
 
     let mut imported = false;
     let mut locked_env = false;
     let mut setup_passphrase = None;
     let mut verified_env_keys = None;
+    let mut recovery_plaintext = None;
     if source_exists {
         if source_is_locked {
             if !vault_path.exists() {
@@ -1129,28 +1139,48 @@ fn setup(options: SetupOptions) -> Result<()> {
             locked_env = true;
         } else {
             let passphrase = vault::read_new_passphrase()?;
+            term::blank();
+            let sp = term::spinner("Encrypting vault");
             vault::import_env_file(&options.source, &vault_path, &passphrase)?;
             let plaintext = vault::decrypt_vault_file(&vault_path, &passphrase)?;
             verified_env_keys = Some(config::env_keys_from_dotenv_str(&plaintext)?);
+            recovery_plaintext = Some(plaintext);
             setup_passphrase = Some(passphrase);
             imported = true;
             if !options.keep_plaintext && !remove_plaintext {
                 env_file::lock_env_file(&options.source, &vault_path)?;
                 locked_env = true;
             }
+            term::done(sp, "Vault encrypted");
         }
+    } else if !vault_path.exists() {
+        let passphrase = vault::read_new_passphrase()?;
+        term::blank();
+        let sp = term::spinner("Creating empty vault");
+        let envelope = vault::encrypt_env("", &passphrase)?;
+        vault::write_vault(&vault_path, &envelope)?;
+        vault::decrypt_vault_file(&vault_path, &passphrase)?;
+        env_file::lock_env_file(&options.source, &vault_path)?;
+        verified_env_keys = Some(Vec::new());
+        recovery_plaintext = Some(String::new());
+        setup_passphrase = Some(passphrase);
+        locked_env = true;
+        term::done(sp, "Empty vault encrypted");
     }
 
     if let Some(env_keys) = verified_env_keys.as_deref() {
         config::replace_default_profiles(&mut project_config, env_keys, &cwd);
-        config_path = config::write_project_config(&cwd, &project_config, true)?;
+        config::write_project_config(&cwd, &project_config, true)?;
     }
 
-    registry::register_project(
-        project_config.project.clone(),
-        cwd.clone(),
-        vault_path.clone(),
-    )?;
+    registry::update_project_vault(&project_config.project, cwd.clone(), vault_path.clone())?;
+    term::ok(".gitignore updated");
+    if env_example.is_some() {
+        term::ok(".env.example created");
+    }
+    if agent_instructions.is_some() {
+        term::ok("AGENTS.md written");
+    }
 
     let mut removed_plaintext = false;
     if source_exists && !source_is_locked && remove_plaintext {
@@ -1159,29 +1189,46 @@ fn setup(options: SetupOptions) -> Result<()> {
         removed_plaintext = true;
     }
 
+    // Resolve passphrase at outer scope so we can reuse it for recovery creation.
+    let setup_passphrase_final: Option<String> = if options.no_unlock {
+        setup_passphrase
+    } else {
+        Some(match setup_passphrase {
+            Some(p) => p,
+            None => vault::read_existing_passphrase()?,
+        })
+    };
+
+    if recovery_plaintext.is_none() {
+        if let Some(passphrase) = setup_passphrase_final.as_deref() {
+            recovery_plaintext = vault::decrypt_vault_file(&vault_path, passphrase).ok();
+        }
+    }
+
     let unlock_session = if options.no_unlock {
         None
     } else {
-        let passphrase = match setup_passphrase {
-            Some(passphrase) => passphrase,
-            None => vault::read_existing_passphrase()?,
-        };
+        let passphrase = setup_passphrase_final.as_deref().unwrap();
+        let sp = term::spinner("Starting broker session");
         match create_run_unlock_session(
             &project_config.project,
             &vault_path,
-            &passphrase,
+            passphrase,
             &options.unlock_ttl,
             None,
         ) {
-            Ok(session) => Some(session),
+            Ok(session) => {
+                let expires = session.expires_at.format("%H:%M").to_string();
+                term::done(sp, &format!("Session unlocked · expires {}", expires));
+                Some(session)
+            }
             Err(error) => {
                 if error.to_string().contains("failed to decrypt vault") {
+                    term::warn_step(sp, "Broker unlock failed");
                     return Err(error);
                 }
-                println!(
-                    "Warning: setup completed, but broker unlock failed: {error}. Run ward unlock --ttl {} before running protected commands.",
-                    options.unlock_ttl
-                );
+                term::warn_step(sp, &format!("Broker unlock failed: {error}"));
+                term::info("Run `ward unlock` before running protected commands.");
                 None
             }
         }
@@ -1203,36 +1250,84 @@ fn setup(options: SetupOptions) -> Result<()> {
     };
     audit_logs::append_event(LogKind::Sessions, event)?;
 
-    println!("Ward setup complete.");
-    println!("Config: {}", config_path.display());
-    println!("Vault: {}", vault_path.display());
-    println!("Gitignore: {}", gitignore.display());
-    if let Some(path) = env_example {
-        println!("Env example: {}", path.display());
+    // Auto-create recovery key using the same PIN/passphrase — no extra prompt.
+    if let Some(ref passphrase) = setup_passphrase_final {
+        let sp = term::spinner("Creating recovery key");
+        match recovery::create_recovery_files_with_material(
+            &project_config.project,
+            passphrase,
+            passphrase,
+            recovery_plaintext.as_deref(),
+        ) {
+            Ok(recovery_file) => {
+                term::done(
+                    sp,
+                    &format!("Recovery key created  {}", term::short_path(&recovery_file)),
+                );
+                project_config.recovery_created = true;
+                let _ = config::write_project_config(&cwd, &project_config, true);
+
+                // Offer to export a backup immediately.
+                #[cfg(not(coverage))]
+                {
+                    term::blank();
+                    let export = options.yes
+                        || inquire::Confirm::new(
+                            "Export a recovery backup now? (store it somewhere safe — USB, cloud backup)",
+                        )
+                        .with_default(true)
+                        .prompt()
+                        .unwrap_or(false);
+
+                    if export {
+                        let dest = dirs::desktop_dir()
+                            .or_else(dirs::home_dir)
+                            .unwrap_or_else(|| PathBuf::from("."));
+                        match recovery::export_recovery_file(
+                            &project_config.project,
+                            passphrase,
+                            &dest,
+                        ) {
+                            Ok(out_path) => {
+                                project_config.backup_exported = true;
+                                let _ = config::write_project_config(&cwd, &project_config, true);
+                                term::ok(&format!("Backup saved  {}", term::short_path(&out_path)));
+                                let _ = std::process::Command::new("open")
+                                    .arg("-R")
+                                    .arg(&out_path)
+                                    .spawn();
+                            }
+                            Err(e) => {
+                                term::warn(&format!("Export failed — {e}"));
+                                term::info("Run `ward recovery export` manually.");
+                            }
+                        }
+                    } else {
+                        term::info("Run `ward recovery export` when ready.");
+                    }
+                }
+            }
+            Err(error) => {
+                term::warn_step(sp, &format!("Recovery key creation failed: {error}"));
+                term::info("Run `ward recovery create` manually.");
+            }
+        }
     }
-    if let Some(path) = agent_instructions {
-        println!("Agent instructions: {}", path.display());
+
+    term::blank();
+    if unlock_session.is_none() {
+        term::next(&format!(
+            "ward unlock --ttl {}  — restore broker session",
+            options.unlock_ttl
+        ));
     }
-    if let Some(session) = &unlock_session {
-        println!("Vault unlocked until {}.", session.expires_at.to_rfc3339());
-        println!("Next: ward dev");
-    } else {
-        println!("Next: ward unlock --ttl {}", options.unlock_ttl);
-        println!("Then: ward dev");
-    }
-    if locked_env {
-        println!("Locked env: {}", options.source.display());
-    }
+    term::blank();
+
     if options.keep_plaintext {
-        println!("Warning: plaintext env was kept by --keep-plaintext.");
+        term::warn("plaintext env was kept (--keep-plaintext)");
     }
-    if options.yes {
-        println!("Used setup defaults.");
-    }
-    println!("Recovery: run `ward recovery create` to create a recovery key (recommended).");
     if let Some(rc) = ensure_shell_integration() {
-        println!();
-        println!("Shell integration added to {}.", rc.display());
+        term::ok(&format!("Shell integration added to {}", rc.display()));
         prompt_shell_reload(&rc);
     }
     Ok(())
@@ -1288,8 +1383,15 @@ fn init_bare(project: Option<String>, force: bool) -> Result<()> {
 
 fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     let cwd = env::current_dir()?;
-    let mut config = config::read_project_config(&cwd)
-        .context("missing .ward.json; run ward init first")?;
+    let mut config =
+        config::read_project_config(&cwd).context("missing .ward.json; run ward init first")?;
+    if env_file::is_locked_env_file(&source)? {
+        anyhow::bail!(
+            "{} is already an Ward locked marker; use ward env unlock to restore plaintext before importing",
+            source.display()
+        );
+    }
+    let passphrase = vault::read_new_passphrase()?;
     let vault_path = match explicit_vault {
         Some(vault) => {
             config.vault = vault.clone();
@@ -1300,19 +1402,19 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
                 cwd.join(vault)
             }
         }
-        None => config::resolve_vault_path(&cwd, &config),
+        None => registry::resolve_project(Some(&config.project), &cwd)
+            .ok()
+            .map(|resolved| resolved.vault)
+            .filter(|path| path.exists())
+            .unwrap_or_else(|| {
+                config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase)
+            }),
     };
-    if env_file::is_locked_env_file(&source)? {
-        anyhow::bail!(
-            "{} is already an Ward locked marker; use ward env unlock to restore plaintext before importing",
-            source.display()
-        );
-    }
-    let passphrase = vault::read_new_passphrase()?;
 
     let written = vault::import_env_file(&source, &vault_path, &passphrase)?;
     vault::decrypt_vault_file(&written, &passphrase)?;
     env_file::lock_env_file(&source, &written)?;
+    registry::update_project_vault(&config.project, cwd.clone(), written.clone())?;
     let event = VaultImportEvent {
         event_type: "vault.import",
         project: &config.project,
@@ -1487,9 +1589,12 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
 fn env_command(command: EnvCommand) -> Result<()> {
     match command {
         EnvCommand::List { project } => {
-            let resolved = resolve_env_project(project.as_deref())?;
             let passphrase = vault::read_existing_passphrase()?;
-            for name in env_file::list_env_names(&resolved.vault, &passphrase)? {
+            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let names = with_passphrase_vault_access(&resolved, &passphrase, || {
+                env_file::list_env_names(&resolved.vault, &passphrase)
+            })?;
+            for name in names {
                 println!("{name}");
             }
         }
@@ -1497,17 +1602,21 @@ fn env_command(command: EnvCommand) -> Result<()> {
             project,
             assignment,
         } => {
-            let resolved = resolve_env_project(project.as_deref())?;
             let passphrase = vault::read_existing_passphrase()?;
-            let key = env_file::set_env_value(&resolved.vault, &passphrase, &assignment)?;
+            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let key = with_passphrase_vault_access(&resolved, &passphrase, || {
+                env_file::set_env_value(&resolved.vault, &passphrase, &assignment)
+            })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.set", &resolved, None, Some(&key))?;
             println!("Set encrypted env {key}");
         }
         EnvCommand::Unset { project, key } => {
-            let resolved = resolve_env_project(project.as_deref())?;
             let passphrase = vault::read_existing_passphrase()?;
-            let removed = env_file::unset_env_value(&resolved.vault, &passphrase, &key)?;
+            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let removed = with_passphrase_vault_access(&resolved, &passphrase, || {
+                env_file::unset_env_value(&resolved.vault, &passphrase, &key)
+            })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.unset", &resolved, None, Some(&key))?;
             if removed {
@@ -1521,24 +1630,25 @@ fn env_command(command: EnvCommand) -> Result<()> {
             output,
             force,
         } => {
-            let resolved = resolve_env_project(project.as_deref())?;
-            let output = project_relative_path(&resolved.path, output);
             let passphrase = vault::read_existing_passphrase()?;
-            env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)?;
+            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let output = project_relative_path(&resolved.path, output);
+            with_passphrase_vault_access(&resolved, &passphrase, || {
+                env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)
+            })?;
             log_env_file_event("env.unlock", &resolved, Some(&output), None)?;
             println!("Wrote plaintext env {}", output.display());
             println!("Run ward env lock when you are done.");
         }
         EnvCommand::Lock { project, source } => {
-            let resolved = resolve_env_project(project.as_deref())?;
-            let source = project_relative_path(&resolved.path, source);
-            let active_broker_expires_at =
-                broker::active_session_expiry(&resolved.name, &resolved.vault)?;
             let passphrase = vault::read_existing_passphrase()?;
-            env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)?;
+            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let source = project_relative_path(&resolved.path, source);
+            with_passphrase_vault_access(&resolved, &passphrase, || {
+                env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)
+            })?;
             log_env_file_event("env.lock", &resolved, Some(&source), None)?;
             println!("Re-encrypted vault and locked {}", source.display());
-            refresh_broker_after_env_lock(&resolved, &passphrase, active_broker_expires_at)?;
         }
         EnvCommand::Export {
             project,
@@ -1546,11 +1656,14 @@ fn env_command(command: EnvCommand) -> Result<()> {
             force,
             unsafe_stdout,
         } => {
-            let resolved = resolve_env_project(project.as_deref())?;
             let passphrase = vault::read_existing_passphrase()?;
+            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
             if unsafe_stdout {
-                let plaintext = vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
-                vault::validate_dotenv(&plaintext)?;
+                let plaintext = with_passphrase_vault_access(&resolved, &passphrase, || {
+                    let plaintext = vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
+                    vault::validate_dotenv(&plaintext)?;
+                    Ok(plaintext)
+                })?;
                 print!("{plaintext}");
                 log_env_file_event("env.export.stdout", &resolved, None, None)?;
             } else {
@@ -1559,7 +1672,9 @@ fn env_command(command: EnvCommand) -> Result<()> {
                     None => ".env.export".into(),
                 };
                 let output = project_relative_path(&resolved.path, output_path);
-                env_file::export_env_file(&output, &resolved.vault, &passphrase, force)?;
+                with_passphrase_vault_access(&resolved, &passphrase, || {
+                    env_file::export_env_file(&output, &resolved.vault, &passphrase, force)
+                })?;
                 log_env_file_event("env.export", &resolved, Some(&output), None)?;
                 println!("Exported plaintext env {}", output.display());
             }
@@ -1568,9 +1683,20 @@ fn env_command(command: EnvCommand) -> Result<()> {
     Ok(())
 }
 
-fn resolve_env_project(project: Option<&str>) -> Result<registry::ResolvedProject> {
+fn resolve_env_project_with_passphrase(
+    project: Option<&str>,
+    passphrase: &str,
+) -> Result<registry::ResolvedProject> {
     let cwd = env::current_dir()?;
-    registry::resolve_project(project, &cwd)
+    let resolved = registry::resolve_project_with_passphrase(project, &cwd, passphrase)?;
+    if resolved.vault.exists() {
+        registry::update_project_vault(
+            &resolved.name,
+            resolved.path.clone(),
+            resolved.vault.clone(),
+        )?;
+    }
+    Ok(resolved)
 }
 
 fn project_relative_path(project_path: &Path, path: PathBuf) -> PathBuf {
@@ -1597,36 +1723,36 @@ fn log_env_file_event(
     audit_logs::append_event(LogKind::Sessions, event)
 }
 
-fn refresh_broker_after_env_lock(
+fn with_passphrase_vault_access<T>(
     resolved: &registry::ResolvedProject,
     passphrase: &str,
-    active_broker_expires_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> Result<()> {
-    let Some(expires_at) = active_broker_expires_at else {
-        println!(
-            "No active agent unlock session. Run ward unlock --ttl 8h if agents need access."
-        );
-        return Ok(());
-    };
-    let Some(ttl) = remaining_session_ttl(expires_at, chrono::Utc::now()) else {
-        println!(
-            "No active agent unlock session. Run ward unlock --ttl 8h if agents need access."
-        );
-        return Ok(());
-    };
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let active_expires_at = broker::active_session_expiry(&resolved.name, &resolved.vault)?;
+    let active_ttl = active_expires_at
+        .and_then(|expires_at| remaining_session_ttl(expires_at, chrono::Utc::now()));
 
-    if let Err(error) = broker::unlock_project(&resolved.name, &resolved.vault, passphrase, ttl) {
-        eprintln!(
-            "Warning: .env was locked, but Ward could not refresh the active agent unlock session: {error}"
-        );
-        anyhow::bail!("active agent unlock session refresh failed; run ward unlock --ttl 8h");
+    if active_ttl.is_some() {
+        broker::stop().context("failed to restore active broker session before vault access")?;
     }
 
-    println!(
-        "Refreshed active agent unlock session until {}.",
-        expires_at.to_rfc3339()
-    );
-    Ok(())
+    let result = operation();
+    if let Some(ttl) = active_ttl {
+        let refresh_result =
+            broker::unlock_project(&resolved.name, &resolved.vault, passphrase, ttl);
+        match (&result, refresh_result) {
+            (Ok(_), Err(error)) => {
+                return Err(error).context(
+                    "vault operation succeeded, but Ward could not refresh the active broker session",
+                );
+            }
+            (Err(_), Err(error)) => {
+                eprintln!("Warning: Ward could not refresh the active broker session: {error}");
+            }
+            _ => {}
+        }
+    }
+    result
 }
 
 fn remaining_session_ttl(
@@ -2140,7 +2266,7 @@ fn run(options: RunOptions) -> Result<()> {
     run_with_context(options, AgentContextOptions::default())
 }
 
-fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -> Result<()> {
+fn run_with_context(mut options: RunOptions, context_options: AgentContextOptions) -> Result<()> {
     if reject_misplaced_run_flags(&options.command)? {
         return Ok(());
     }
@@ -2150,6 +2276,7 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
     let git = git_context::collect_git_context(&cwd);
     let branch = options.branch.or(git.branch.clone());
     let mut context_options = context_options;
+    let human_terminal = crate::human::is_human_terminal();
     if context_options.agent.is_none() {
         context_options.agent = options.agent.clone();
     }
@@ -2157,9 +2284,12 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
         context_options.branch = branch.clone();
     }
     // In a human terminal, infer remaining context from the current git repo.
-    if crate::human::is_human_terminal() {
+    if human_terminal {
         if context_options.agent.is_none() {
             context_options.agent = Some("human".to_string());
+        }
+        if options.agent.is_none() {
+            options.agent = Some("human".to_string());
         }
         if context_options.worktree.is_none() {
             context_options.worktree = git.worktree_path.as_deref().map(PathBuf::from);
@@ -2170,6 +2300,12 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
         if context_options.git_remote.is_none() {
             context_options.git_remote = git.remote.clone();
         }
+        // Inject all vault keys automatically when no --env was specified.
+        if options.env_names.is_empty() && options.profile.is_none() {
+            options.env_names = broker::list_vault_keys(&resolved.name, &resolved.vault).context(
+                "human mode requires an active broker session; run `ward human` or `ward unlock --ttl 8h`",
+            )?;
+        }
     }
     let resolved_profile = resolve_run_profile(
         &config,
@@ -2177,6 +2313,7 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
         options.action,
         options.env_names,
         options.command,
+        human_terminal,
     )?;
     let command_text = resolved_profile.command.clone();
 
@@ -2186,11 +2323,20 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
         branch,
         action: resolved_profile.action,
         command: command_text.clone(),
-        env: resolved_profile.env_names,
+        env: resolved_profile.env_names.clone(),
     };
     let evaluation = evaluate_access(&config, &access);
     let mut verified_context = None;
-    let decision = if options.no_prompt {
+    let decision = if human_terminal && !options.no_prompt {
+        ApprovalDecision {
+            approved: true,
+            scope: ApprovalScope::Once,
+            approved_env: resolved_profile.env_names.clone(),
+            denied_env: Vec::new(),
+            source: approvals::ApprovalSource::LocalTty,
+            grant_id: None,
+        }
+    } else if options.no_prompt {
         if !options.json {
             anyhow::bail!("--no-prompt requires --json");
         }
@@ -2296,6 +2442,7 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
             &cwd,
             decision.approved_env.clone(),
             resolved_profile.command_args,
+            None,
             Some(proof),
         ) {
             Ok(outcome) => outcome,
@@ -2316,10 +2463,26 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
             &cwd,
             decision.approved_env.clone(),
             resolved_profile.command_args.clone(),
+            if human_terminal {
+                Some(crate::human::current_shell_pid())
+            } else {
+                None
+            },
             None,
         ) {
             Ok(outcome) => outcome,
-            Err(_) => {
+            Err(broker_err) => {
+                // If an active unlock session exists but the broker isn't running,
+                // the vault may be session-encrypted. Direct decryption won't work.
+                let has_session = unlock::active_run_lookup(&resolved.name, &resolved.vault)
+                    .map(|r| !matches!(r, unlock::RunUnlockLookup::Missing))
+                    .unwrap_or(false);
+                if has_session {
+                    anyhow::bail!(
+                        "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
+                        broker_err
+                    );
+                }
                 let passphrase = vault::read_existing_passphrase()?;
                 runner::run_command(RunCommandRequest {
                     cwd: cwd.clone(),
@@ -2328,6 +2491,13 @@ fn run_with_context(options: RunOptions, context_options: AgentContextOptions) -
                     command: resolved_profile.command_args,
                     passphrase,
                     inherited_env: std::env::vars().collect(),
+                    cancellation: None,
+                    human_shell_pid: if human_terminal {
+                        Some(crate::human::current_shell_pid())
+                    } else {
+                        None
+                    },
+                    child_pid: None,
                 })?
             }
         }
@@ -2396,153 +2566,259 @@ fn doctor() -> Result<()> {
     let cwd = env::current_dir()?;
     let config_path = config::config_path(&cwd);
     let plaintext_env = cwd.join(".env");
+    let project_name = cwd
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
 
-    println!("Ward doctor");
-    println!("{} {}", marker(config_path.exists()), config_path.display());
+    term::header_cmd("doctor", &project_name);
 
-    match config::read_project_config(&cwd) {
-        Ok(project_config) => {
-            println!("[ok] Project config parses.");
-            let vault_path = config::resolve_vault_path(&cwd, &project_config);
-            println!("{} {}", marker(vault_path.exists()), vault_path.display());
+    // ── config ────────────────────────────────────────────────────────────────
+    term::section("config");
+
+    if !config_path.exists() {
+        term::fail(".ward.json missing — run ward setup");
+        term::blank();
+        return Ok(());
+    }
+    term::ok(&format!(".ward.json  {}", term::short_path(&config_path)));
+
+    let project_config = config::read_project_config(&cwd);
+    match &project_config {
+        Ok(cfg) => {
+            term::ok(&format!("project  {}", cfg.project));
+            let vault_path = doctor_vault_path(&cwd, cfg);
+            if vault_path.exists() {
+                term::ok(&format!("vault  {}", term::short_path(&vault_path)));
+            } else {
+                term::fail(&format!(
+                    "vault not found  {}",
+                    term::short_path(&vault_path)
+                ));
+            }
         }
-        Err(error) if config_path.exists() => {
-            println!("! Project config does not parse: {error}");
-        }
-        Err(_) => {
-            println!("! Project config missing. Run ward init.");
+        Err(e) => {
+            term::fail(&format!("config parse error — {e}"));
         }
     }
 
-    match config::read_project_config(&cwd) {
-        Ok(project_config) => {
-            let vault_path = config::resolve_vault_path(&cwd, &project_config);
+    // ── secrets ───────────────────────────────────────────────────────────────
+    term::section("secrets");
+
+    match &project_config {
+        Ok(cfg) => {
+            let vault_path = doctor_vault_path(&cwd, cfg);
             match env_file::inspect_env_file(&plaintext_env, &vault_path) {
-                Ok(env_file::EnvFileState::Locked) => println!("[ok] .env is Ward locked."),
+                Ok(env_file::EnvFileState::Locked) => term::ok(".env  locked"),
                 Ok(env_file::EnvFileState::StaleLocked) => {
-                    println!("! .env is Ward locked but stale; run ward env lock.")
+                    term::warn(".env locked but stale — run ward env lock")
                 }
                 Ok(env_file::EnvFileState::Plaintext) => {
-                    println!("! Plaintext .env exists. Run ward env lock.")
+                    term::warn(".env is plaintext — run ward env lock")
                 }
-                Ok(env_file::EnvFileState::Missing) => println!("! .env missing."),
-                Err(error) => println!("! .env state check failed: {error}"),
+                Ok(env_file::EnvFileState::Missing) => term::warn(".env missing"),
+                Err(e) => term::fail(&format!(".env check failed — {e}")),
             }
         }
         Err(_) if plaintext_env.exists() => {
-            println!("! Plaintext .env exists. Run ward setup or ward import .env.");
+            term::warn(".env is plaintext — run ward setup or ward import .env");
         }
-        Err(_) => println!("! .env missing."),
+        Err(_) => term::warn(".env missing"),
     }
 
-    let likely_secret_env_files = likely_secret_env_files(&cwd)?;
-    if likely_secret_env_files.is_empty() {
-        println!("[ok] No .env.* secret variants found.");
+    let secret_files = likely_secret_env_files(&cwd)?;
+    if secret_files.is_empty() {
+        term::ok("no .env.* secret variants found");
     } else {
-        for path in likely_secret_env_files {
-            println!("! Likely plaintext env file: {}", path.display());
+        for path in &secret_files {
+            term::warn(&format!(
+                "plaintext env variant  {}",
+                term::short_path(path)
+            ));
         }
     }
 
+    // ── gitignore ─────────────────────────────────────────────────────────────
+    term::section("gitignore");
     check_gitignore(&cwd)?;
+
+    let gitignore_path = cwd.join(".gitignore");
+    if gitignore_path.exists() {
+        match fs::read_to_string(&gitignore_path) {
+            Ok(contents) if contents.contains(config::WARD_JSON_GITIGNORE_ENTRY) => {
+                term::ok(".ward.json  excluded");
+            }
+            Ok(_) => {
+                term::warn(".ward.json not in .gitignore — vault nonce may leak into git history");
+            }
+            Err(_) => {}
+        }
+    }
+
+    // ── broker ────────────────────────────────────────────────────────────────
+    term::section("broker");
 
     match registry::resolve_project(None, &cwd) {
         Ok(project) => {
-            println!("[ok] Resolved project: {}", project.name);
-            println!("  Vault: {}", project.vault.display());
-            println!(
-                "{} Registered vault exists: {}",
-                marker(project.vault.exists()),
-                project.vault.display()
-            );
+            term::ok(&format!("project  {}", project.name));
+            if !project.vault.exists() {
+                term::warn(&format!(
+                    "vault not found  {}",
+                    term::short_path(&project.vault)
+                ));
+            }
             match broker::status() {
                 Ok(status) if status.running => {
-                    let active = status.sessions.iter().any(|session| {
-                        session.project == project.name && session.vault == project.vault
-                    });
+                    let active = status
+                        .sessions
+                        .iter()
+                        .any(|s| s.project == project.name && s.vault == project.vault);
                     if active {
-                        println!("[ok] Active broker unlock session is available.");
-                        println!("[ok] Active signing key capability is broker-held.");
+                        term::ok("session active — secrets unlocked");
                     } else {
-                        println!("! Broker is running without an active session for this project. Run ward unlock --ttl 8h.");
+                        term::warn("no active session — run ward unlock --ttl 8h");
                     }
                 }
-                Ok(_) => {
-                    println!("! Broker is not running. Run ward unlock --ttl 8h.")
-                }
-                Err(error) => {
-                    println!("! Broker status check failed: {error}")
-                }
+                Ok(_) => term::warn("broker not running — run ward unlock --ttl 8h"),
+                Err(e) => term::fail(&format!("broker status failed — {e}")),
             }
         }
-        Err(error) => println!("! Registry resolution failed: {error}"),
+        Err(e) => term::fail(&format!("registry resolve failed — {e}")),
     }
 
+    // ── human mode ───────────────────────────────────────────────────────────
+    term::section("human mode");
+    let human = crate::human::runtime_diagnostics();
+    if human.shell_hooks_loaded {
+        term::ok("shell hooks loaded");
+    } else {
+        term::warn("shell hooks not loaded — reload your shell, then run ward human");
+    }
+    if human.guardian_socket_exists {
+        term::ok(&format!("guardian active for shell {}", human.shell_pid));
+    } else {
+        term::warn(&format!(
+            "guardian missing for shell {} — run ward human",
+            human.shell_pid
+        ));
+        term::info(&format!(
+            "expected socket {}",
+            term::short_path(&human.socket_path)
+        ));
+    }
+    if human.stale_guardian_pids.is_empty() && human.stale_run_dirs.is_empty() {
+        term::ok("no stale human runtime files");
+    } else {
+        if !human.stale_guardian_pids.is_empty() {
+            term::warn(&format!(
+                "stale guardian process(es): {}",
+                human
+                    .stale_guardian_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for dir in &human.stale_run_dirs {
+            term::warn(&format!("stale runtime dir  {}", term::short_path(dir)));
+        }
+        term::info("run ward human to clean stale human runtime state");
+    }
+
+    // ── grants ────────────────────────────────────────────────────────────────
+    term::section("grants");
+
     match grants::load_grants() {
-        Ok(loaded_grants) => {
+        Ok(loaded) => {
             let now = chrono::Utc::now();
-            let unsigned = loaded_grants
+            let unsigned = loaded
                 .iter()
-                .filter(|grant| {
-                    grants::grant_integrity_status(grant, now)
+                .filter(|g| {
+                    grants::grant_integrity_status(g, now)
                         == grants::GrantIntegrityStatus::LegacyUnsigned
                 })
                 .count();
-            let invalid = loaded_grants
+            let invalid = loaded
                 .iter()
-                .filter(|grant| {
-                    grants::grant_integrity_status(grant, now)
-                        == grants::GrantIntegrityStatus::Invalid
+                .filter(|g| {
+                    grants::grant_integrity_status(g, now) == grants::GrantIntegrityStatus::Invalid
                 })
                 .count();
-            for message in grant_integrity_messages(unsigned, invalid) {
-                println!("{message}");
+            if unsigned == 0 && invalid == 0 {
+                term::ok("all approval grants signed and valid");
+            }
+            if unsigned > 0 {
+                term::warn(&format!(
+                    "{unsigned} legacy unsigned grant(s) — re-approve them"
+                ));
+            }
+            if invalid > 0 {
+                term::warn(&format!(
+                    "{invalid} invalid grant signature(s) — revoke and re-approve"
+                ));
             }
         }
-        Err(error) => println!("! Approval grant check failed: {error}"),
+        Err(e) => term::fail(&format!("grant check failed — {e}")),
     }
+
+    // ── logs ──────────────────────────────────────────────────────────────────
+    term::section("logs");
 
     match audit_logs::entry_count(LogKind::Alerts) {
-        Ok(0) => println!("[ok] No encrypted alerts logged."),
-        Ok(count) => println!("! Encrypted alerts: {count}. Run ward logs view alerts."),
-        Err(error) => println!("! Alert log check failed: {error}"),
+        Ok(0) => term::ok("no alerts"),
+        Ok(n) => term::warn(&format!("{n} alert(s) — run ward logs view alerts")),
+        Err(e) => term::fail(&format!("alert log check failed — {e}")),
     }
 
-    // Recovery and security checks
-    if let Ok(project_config) = config::read_project_config(&cwd) {
-        let gitignore_path = cwd.join(".gitignore");
-        if gitignore_path.exists() {
-            match fs::read_to_string(&gitignore_path) {
-                Ok(contents) if contents.contains(config::WARD_JSON_GITIGNORE_ENTRY) => {
-                    println!("[ok] .ward.json is in .gitignore.");
-                }
-                Ok(_) => {
-                    println!(
-                        "! .ward.json is not in .gitignore — vault nonce may leak into git history. Add `.ward.json` to .gitignore."
-                    );
-                }
-                Err(_) => {}
-            }
-        }
+    // ── recovery ──────────────────────────────────────────────────────────────
+    term::section("recovery");
 
-        // Check recovery file
-        let passphrase_available = vault::test_passphrase().is_some();
-        if passphrase_available {
-            let passphrase = vault::test_passphrase().unwrap();
-            if recovery::recovery_file_exists(&project_config.project, &passphrase) {
-                println!("[ok] Recovery file exists.");
-                if !project_config.backup_exported {
-                    println!("! No recovery backup exported — run: ward recovery export");
-                } else {
-                    println!("[ok] Recovery backup has been exported.");
-                }
+    if let Ok(cfg) = &project_config {
+        let recovery_dir = logs::recovery_dir();
+        let key_files_exist = recovery_dir.exists()
+            && fs::read_dir(&recovery_dir)
+                .map(|mut d| {
+                    d.any(|e| {
+                        e.map(|e| e.path().extension().and_then(|x| x.to_str()) == Some("key"))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+
+        if cfg.recovery_created && !key_files_exist {
+            term::fail("recovery key missing — run: ward recovery create");
+            term::info(&format!("expected in {}", term::short_path(&recovery_dir)));
+        } else if cfg.recovery_created {
+            term::ok("recovery key present");
+            if !cfg.backup_exported {
+                term::warn("no backup exported — run: ward recovery export");
             } else {
-                println!("! Recovery file missing — run: ward recovery create");
+                term::ok("recovery backup exported");
+            }
+        } else {
+            term::warn("recovery key not created — run: ward recovery create");
+        }
+
+        if vault::test_passphrase().is_some() {
+            let passphrase = vault::test_passphrase().unwrap();
+            if !recovery::recovery_file_exists(&cfg.project, &passphrase) {
+                term::fail("recovery file not found at derived path — run: ward recovery create");
             }
         }
+    } else {
+        term::warn("unable to check recovery — config not readable");
     }
 
+    term::blank();
     Ok(())
+}
+
+fn doctor_vault_path(cwd: &Path, cfg: &config::ProjectConfig) -> PathBuf {
+    registry::resolve_project(Some(&cfg.project), cwd)
+        .map(|resolved| resolved.vault)
+        .unwrap_or_else(|_| config::resolve_vault_path(cwd, cfg))
 }
 
 #[cfg(any(test, coverage))]
@@ -2625,9 +2901,11 @@ fn render_log_events(events: &[Value]) -> Result<String> {
 
 fn edit() -> Result<()> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
-    vault::edit_vault_file(&resolved.vault, &passphrase)?;
+    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
+    with_passphrase_vault_access(&resolved, &passphrase, || {
+        vault::edit_vault_file(&resolved.vault, &passphrase)
+    })?;
     let event = VaultEditEvent {
         event_type: "vault.edit",
         project: &resolved.name,
@@ -2646,24 +2924,23 @@ pub(crate) fn create_run_unlock_session(
     mode: Option<&str>,
 ) -> Result<unlock::UnlockSession> {
     let ttl = unlock::parse_ttl(ttl)?;
-    match vault::decrypt_vault_file(vault_path, passphrase) {
-        Ok(_) => {
-            let session = if let Some(mode_name) = mode {
-                unlock::create_mode_unlock(project, vault_path, passphrase, ttl, mode_name)?
-            } else {
-                unlock::create_run_unlock(project, vault_path, passphrase, ttl)?
-            };
-            broker::unlock_project_with_mode(project, vault_path, passphrase, ttl, mode.map(str::to_string))?;
-            let event = VaultUnlockEvent {
-                event_type: "vault.unlock",
-                status: "success",
-                project,
-                vault: vault_path,
-                error: None,
-                expires_at: Some(session.expires_at.to_rfc3339()),
-            };
-            audit_logs::append_event(LogKind::Sessions, event)?;
-            Ok(session)
+
+    // Send unlock to broker first. The broker handles both passphrase-encrypted and
+    // session-encrypted vaults (restoring from the existing session before re-decrypting).
+    // Fall back to direct decrypt only if the broker is unavailable (e.g. unsupported platform).
+    let broker_result = broker::unlock_project_with_mode(
+        project,
+        vault_path,
+        passphrase,
+        ttl,
+        mode.map(str::to_string),
+    );
+
+    let validated = match broker_result {
+        Ok(()) => true,
+        Err(error) if broker_unavailable_error(&error) => {
+            // Broker unavailable — validate passphrase directly against the vault file.
+            vault::decrypt_vault_file(vault_path, passphrase).is_ok()
         }
         Err(error) => {
             let error_message = error.to_string();
@@ -2676,18 +2953,66 @@ pub(crate) fn create_run_unlock_session(
                 expires_at: None,
             };
             audit_logs::append_event(LogKind::Sessions, event)?;
-            Err(error)
+            anyhow::bail!("{error_message}");
         }
+    };
+
+    if validated {
+        let session = if let Some(mode_name) = mode {
+            unlock::create_mode_unlock(project, vault_path, passphrase, ttl, mode_name)?
+        } else {
+            unlock::create_run_unlock(project, vault_path, passphrase, ttl)?
+        };
+        let event = VaultUnlockEvent {
+            event_type: "vault.unlock",
+            status: "success",
+            project,
+            vault: vault_path,
+            error: None,
+            expires_at: Some(session.expires_at.to_rfc3339()),
+        };
+        audit_logs::append_event(LogKind::Sessions, event)?;
+        Ok(session)
+    } else {
+        let error_message = "failed to decrypt vault; passphrase may be incorrect".to_string();
+        let event = VaultUnlockEvent {
+            event_type: "vault.unlock",
+            status: "failure",
+            project,
+            vault: vault_path,
+            error: Some(&error_message),
+            expires_at: None,
+        };
+        audit_logs::append_event(LogKind::Sessions, event)?;
+        anyhow::bail!("{error_message}")
     }
+}
+
+fn broker_unavailable_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("Ward broker is unavailable")
+        || message.contains("failed to connect to Ward broker")
+        || message.contains("failed to start Ward broker")
+        || message.contains("Ward broker did not become ready")
 }
 
 fn unlock_vault(ttl: &str, mode: Option<&str>) -> Result<()> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
-    let session = create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, mode)?;
+    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
+    registry::update_project_vault(
+        &resolved.name,
+        resolved.path.clone(),
+        resolved.vault.clone(),
+    )?;
+    let session =
+        create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, mode)?;
     if let Some(mode_name) = mode {
-        println!("Vault unlocked with mode '{}' until {}.", mode_name, session.expires_at.to_rfc3339());
+        println!(
+            "Vault unlocked with mode '{}' until {}.",
+            mode_name,
+            session.expires_at.to_rfc3339()
+        );
     } else {
         println!("Vault unlocked until {}.", session.expires_at.to_rfc3339());
     }
@@ -2723,34 +3048,74 @@ fn rotate_vault(project_override: Option<&str>) -> Result<()> {
 
     let passphrase = vault::read_existing_passphrase()?;
 
-    // Find current vault — may be dynamic or static
-    let old_vault = config::resolve_vault_path_dynamic(&cwd, &config, &passphrase);
+    // Find current vault — may be legacy static or already dynamic.
+    let old_vault = config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase);
     anyhow::ensure!(
         old_vault.exists(),
         "vault not found at {}; unlock before rotating",
         old_vault.display()
     );
 
+    if broker::active_session_expiry(&project_name, &old_vault)?.is_some() {
+        broker::stop().context("failed to restore active broker session before rotation")?;
+        unlock::clear_project_unlocks(&project_name)?;
+    }
+
     let plaintext = vault::decrypt_vault_file(&old_vault, &passphrase)?;
-    config.vault_nonce = vault::generate_vault_nonce();
-    let new_vault = config::resolve_vault_path_dynamic(&cwd, &config, &passphrase);
+    let new_vault = loop {
+        config.vault_nonce = vault::generate_vault_nonce();
+        let candidate = config::resolve_vault_path_dynamic(&cwd, &config, &passphrase);
+        if candidate != old_vault && !candidate.exists() {
+            break candidate;
+        }
+    };
 
     let envelope = vault::encrypt_env(&plaintext, &passphrase)?;
     vault::write_vault(&new_vault, &envelope)?;
-    fs::remove_file(&old_vault)
-        .context(format!("failed to remove old vault {}", old_vault.display()))?;
+    fs::remove_file(&old_vault).context(format!(
+        "failed to remove old vault {}",
+        old_vault.display()
+    ))?;
 
     config::write_project_config(&cwd, &config, true)?;
+    registry::update_project_vault(&project_name, cwd.clone(), new_vault.clone())?;
+    env_file::refresh_locked_env(&cwd, &new_vault)?;
+    config::ensure_gitignore(&cwd, true)?;
     println!("[ok] Vault rotated to {}", new_vault.display());
     println!("[ok] .ward.json updated with new nonce.");
     Ok(())
+}
+
+fn prompt_drag_drop_path() -> Result<std::path::PathBuf> {
+    use std::io::{self, BufRead};
+    eprint!("  Drag the recovery file here and press Enter: ");
+    let stdin = io::stdin();
+    let line = stdin
+        .lock()
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no input"))??;
+    // macOS wraps paths with spaces in single quotes when dragged; strip them.
+    let raw = line.trim().trim_matches('\'').trim_matches('"').trim();
+    // Expand leading ~ manually since PathBuf doesn't do it.
+    let path = if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?
+            .join(rest)
+    } else {
+        std::path::PathBuf::from(raw)
+    };
+    if !path.exists() {
+        anyhow::bail!("file not found: {}", path.display());
+    }
+    Ok(path)
 }
 
 fn recovery_command(command: RecoveryCommand) -> Result<()> {
     match command {
         RecoveryCommand::Export { output } => {
             let cwd = env::current_dir()?;
-            let config = config::read_project_config(&cwd)?;
+            let mut config = config::read_project_config(&cwd)?;
             let passphrase = vault::read_existing_passphrase()?;
 
             let dest = output.unwrap_or_else(|| {
@@ -2759,40 +3124,94 @@ fn recovery_command(command: RecoveryCommand) -> Result<()> {
                     .unwrap_or_else(|| PathBuf::from("."))
             });
 
-            let out_path =
-                recovery::export_recovery_file(&config.project, &passphrase, &dest)?;
+            let out_path = recovery::export_recovery_file(&config.project, &passphrase, &dest)?;
+            config.backup_exported = true;
+            config::write_project_config(&cwd, &config, true)?;
             println!("[ok] Recovery file exported to {}", out_path.display());
             println!("  Store this file somewhere safe (USB drive, secure cloud backup).");
-            println!("  You will need it and your PIN to restore access if the broker crashes.");
+            println!("  You will need it and your vault passphrase to restore access.");
         }
         RecoveryCommand::Import { path } => {
-            let dest = recovery::import_recovery_file(&path)?;
-            println!("[ok] Recovery file imported to {}", dest.display());
+            let resolved_path = match path {
+                Some(p) => p,
+                None => prompt_drag_drop_path()?,
+            };
+            let dest = recovery::import_recovery_file(&resolved_path)?;
+            term::ok(&format!("Recovery file imported to {}", dest.display()));
         }
         RecoveryCommand::Create => {
             let cwd = env::current_dir()?;
-            let config = config::read_project_config(&cwd)?;
+            let mut config = config::read_project_config(&cwd)?;
             let passphrase = vault::read_existing_passphrase()?;
+            let vault_path = config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase);
+            let plaintext = decrypt_vault_for_recovery(&config.project, &vault_path, &passphrase)?;
 
-            #[cfg(not(coverage))]
-            let pin = {
-                let first =
-                    rpassword::prompt_password("Create a recovery PIN (min 4 characters): ")?;
-                let second = rpassword::prompt_password("Confirm recovery PIN: ")?;
-                vault::validate_new_passphrase(&first, &second)?;
-                first
-            };
-            #[cfg(coverage)]
-            let pin = "test-pin".to_string();
-
-            let real_path =
-                recovery::create_recovery_files(&config.project, &passphrase, &pin)?;
+            let real_path = recovery::create_recovery_files_with_material(
+                &config.project,
+                &passphrase,
+                &passphrase,
+                Some(&plaintext),
+            )?;
+            config.recovery_created = true;
+            config::write_project_config(&cwd, &config, true)?;
             println!("[ok] Recovery file created at {}", real_path.display());
             println!("[ok] Decoy files generated to prevent fingerprinting.");
             println!("  Run `ward recovery export` to save a backup to a safe location.");
         }
+        RecoveryCommand::Restore { path } => {
+            let cwd = env::current_dir()?;
+            let mut config = config::read_project_config(&cwd)?;
+            let passphrase = vault::read_existing_passphrase()?;
+            let vault_path = config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase);
+
+            if let Some(source) = path {
+                let recovery_file = recovery::import_recovery_file(&source)?;
+                recovery::restore_vault_from_recovery_file(
+                    &config.project,
+                    &vault_path,
+                    &recovery_file,
+                    &passphrase,
+                )?;
+                println!(
+                    "[ok] Recovery file imported from {}",
+                    recovery_file.display()
+                );
+            } else {
+                recovery::restore_vault_from_recovery(
+                    &config.project,
+                    &vault_path,
+                    Some(&passphrase),
+                    &passphrase,
+                )?;
+            }
+
+            config.recovery_created = true;
+            config::write_project_config(&cwd, &config, true)?;
+            env_file::refresh_locked_env(&cwd, &vault_path)?;
+            registry::update_project_vault(&config.project, cwd, vault_path.clone())?;
+            println!("[ok] Vault restored to {}", vault_path.display());
+            println!("  Run `ward unlock --ttl 8h` to start a fresh broker session.");
+        }
     }
     Ok(())
+}
+
+fn decrypt_vault_for_recovery(
+    project: &str,
+    vault_path: &Path,
+    passphrase: &str,
+) -> Result<String> {
+    match vault::decrypt_vault_file(vault_path, passphrase) {
+        Ok(plaintext) => Ok(plaintext),
+        Err(first_error) => {
+            if broker::active_session_expiry(project, vault_path)?.is_some() {
+                broker::stop()?;
+                return vault::decrypt_vault_file(vault_path, passphrase)
+                    .context("failed to decrypt vault after stopping the active broker session");
+            }
+            Err(first_error)
+        }
+    }
 }
 
 fn prompt_shell_reload(_rc: &Path) {
@@ -2828,25 +3247,97 @@ fn prompt_shell_reload(_rc: &Path) {
 fn ensure_shell_integration() -> Option<PathBuf> {
     let shell = detect_shell()?;
     let rc_path = shell_rc_path(&shell)?;
-    let marker = "ward shell-init";
     let contents = fs::read_to_string(&rc_path).unwrap_or_default();
-    if contents.contains(marker) {
-        return None; // already installed
+    let updated = install_shell_integration_contents(&shell, &contents);
+    if updated == contents {
+        return None;
     }
-    let line = if shell == "fish" {
-        "\n# ward shell integration\nward shell-init | source\n"
-    } else {
-        "\n# ward shell integration\neval \"$(ward shell-init)\"\n"
-    };
-    if fs::OpenOptions::new()
-        .append(true)
-        .open(&rc_path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()))
-        .is_ok()
-    {
+    if fs::write(&rc_path, updated).is_ok() {
         Some(rc_path)
     } else {
         None
+    }
+}
+
+fn install_shell_integration_contents(shell: &str, contents: &str) -> String {
+    let mut updated = strip_ward_shell_integration(contents)
+        .trim_end_matches('\n')
+        .to_string();
+    if !updated.is_empty() {
+        updated.push_str("\n\n");
+    }
+    if !shell_path_present(&updated, shell) {
+        updated.push_str(shell_path_snippet(shell));
+        updated.push('\n');
+    }
+    updated.push_str(shell_integration_snippet(shell));
+    updated
+}
+
+fn strip_ward_shell_integration(contents: &str) -> String {
+    let lines = contents.lines().collect::<Vec<_>>();
+    let mut retained = Vec::with_capacity(lines.len());
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index].trim() == "# ward shell integration" {
+            index += 1;
+            if index < lines.len() {
+                let next = lines[index].trim();
+                if next == "if command -v ward >/dev/null 2>&1; then" || next == "if type -q ward" {
+                    index += 1;
+                    while index < lines.len()
+                        && lines[index].trim() != "fi"
+                        && lines[index].trim() != "end"
+                    {
+                        index += 1;
+                    }
+                    if index < lines.len() {
+                        index += 1;
+                    }
+                } else if next == "eval \"$(ward shell-init)\""
+                    || next == "ward shell-init | source"
+                {
+                    index += 1;
+                }
+            }
+            while index < lines.len() && lines[index].trim().is_empty() {
+                index += 1;
+            }
+            continue;
+        }
+        retained.push(lines[index]);
+        index += 1;
+    }
+    let mut stripped = retained.join("\n");
+    if contents.ends_with('\n') && !stripped.is_empty() {
+        stripped.push('\n');
+    }
+    stripped
+}
+
+fn shell_path_present(contents: &str, shell: &str) -> bool {
+    if shell == "fish" {
+        contents.contains(".cargo/bin")
+    } else {
+        contents.contains("export PATH=\"$HOME/.cargo/bin:$PATH\"")
+            || contents.contains("export PATH=\"$HOME/.cargo/bin:${PATH}\"")
+            || contents.contains("export PATH=$HOME/.cargo/bin:$PATH")
+    }
+}
+
+fn shell_path_snippet(shell: &str) -> &'static str {
+    if shell == "fish" {
+        "# Added by ward installer\nfish_add_path \"$HOME/.cargo/bin\"\n"
+    } else {
+        "# Added by ward installer\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\n"
+    }
+}
+
+fn shell_integration_snippet(shell: &str) -> &'static str {
+    if shell == "fish" {
+        "# ward shell integration\nif type -q ward\n    set -gx WARD_SHELL_INTEGRATION 1\n    ward shell-init | source\nend\n"
+    } else {
+        "# ward shell integration\nif command -v ward >/dev/null 2>&1; then\n  export WARD_SHELL_INTEGRATION=1\n  eval \"$(ward shell-init)\"\nfi\n"
     }
 }
 
@@ -2862,10 +3353,7 @@ fn shell_rc_path(shell: &str) -> Option<PathBuf> {
                 home.join(".bash_profile")
             }
         }
-        "fish" => home
-            .join(".config")
-            .join("fish")
-            .join("config.fish"),
+        "fish" => home.join(".config").join("fish").join("config.fish"),
         _ => return None,
     };
     Some(path)
@@ -2891,6 +3379,10 @@ fn detect_shell() -> Option<String> {
 
 fn collect_command_prefixes(cwd: &Path) -> Vec<String> {
     let mut prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for prefix in default_human_wrapped_commands() {
+        prefixes.insert(prefix.to_string());
+    }
 
     if let Ok(project_config) = config::read_project_config(cwd) {
         for profile in project_config.profiles.values() {
@@ -2926,6 +3418,26 @@ fn collect_command_prefixes(cwd: &Path) -> Vec<String> {
         .collect()
 }
 
+fn default_human_wrapped_commands() -> &'static [&'static str] {
+    &[
+        "bun",
+        "cargo",
+        "deno",
+        "dotenv",
+        "drizzle-kit",
+        "next",
+        "node",
+        "npm",
+        "npx",
+        "pnpm",
+        "prisma",
+        "tsx",
+        "ts-node",
+        "vite",
+        "yarn",
+    ]
+}
+
 fn is_safe_shell_function_name(name: &str) -> bool {
     if name == "ward" {
         return false;
@@ -2938,7 +3450,9 @@ fn is_safe_shell_function_name(name: &str) -> bool {
     if BUILTINS.iter().any(|b| *b == name) {
         return false;
     }
-    name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') && !name.starts_with('-')
+    name.chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        && !name.starts_with('-')
 }
 
 fn shell_init_code(shell: &str) -> String {
@@ -2956,26 +3470,62 @@ fn shell_init_code(shell: &str) -> String {
     if shell == "fish" {
         fish_init_code(&ward_home, &cmds_ref)
     } else {
-        posix_init_code(&ward_home, &sock_path, &cmds_ref)
+        posix_init_code(shell, &ward_home, &sock_path, &cmds_ref)
     }
 }
 
-fn posix_init_code(ward_home: &std::path::Path, sock_path: &str, cmds: &[&str]) -> String {
-    let mut out = String::from(
-        "# ward shell integration — only active in human mode inside ward projects\n",
-    );
-    out.push_str("__ward_wrap() {\n");
-    out.push_str(&format!(
-        "  if [ -S \"{sock_path}\" ] && [ -f \".ward.json\" ]; then\n"
-    ));
-    out.push_str("    command ward run -- \"$@\"\n");
-    out.push_str("  else\n");
-    out.push_str("    command \"$@\"\n");
-    out.push_str("  fi\n");
+fn posix_init_code(
+    shell: &str,
+    ward_home: &std::path::Path,
+    sock_path: &str,
+    cmds: &[&str],
+) -> String {
+    let mut out =
+        String::from("# ward shell integration — only active in human mode inside ward projects\n");
+    out.push_str("export WARD_SHELL_INTEGRATION=1\n");
+    out.push_str("__ward_project_root() {\n");
+    out.push_str("  __ward_dir=\"$PWD\"\n");
+    out.push_str("  while [ -n \"$__ward_dir\" ]; do\n");
+    out.push_str("    if [ -f \"$__ward_dir/.ward.json\" ]; then\n");
+    out.push_str("      printf '%s\\n' \"$__ward_dir\"\n");
+    out.push_str("      return 0\n");
+    out.push_str("    fi\n");
+    out.push_str("    if [ \"$__ward_dir\" = \"/\" ]; then\n");
+    out.push_str("      break\n");
+    out.push_str("    fi\n");
+    out.push_str("    __ward_dir=$(dirname \"$__ward_dir\")\n");
+    out.push_str("  done\n");
+    out.push_str("  return 1\n");
     out.push_str("}\n");
-    let reload_marker = ward_home.join("run").join("shell-reload").display().to_string();
+    out.push_str("__ward_wrap() {\n");
+    out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
+    out.push_str("  if [ -z \"$__ward_root\" ]; then\n");
+    out.push_str("    command \"$@\"\n");
+    out.push_str("    return $?\n");
+    out.push_str("  fi\n");
+    out.push_str(&format!("  if [ -S \"{sock_path}\" ]; then\n"));
+    out.push_str("    WARD_HUMAN_SHELL_PID=$$ command ward run -- \"$@\"\n");
+    out.push_str("    return $?\n");
+    out.push_str("  fi\n");
+    out.push_str(
+        "  printf '%s\\n' 'Ward human mode is not active for this terminal; run ward human' >&2\n",
+    );
+    out.push_str("  printf '%s\\n' \"shell pid: $$\" >&2\n");
+    out.push_str(&format!(
+        "  printf '%s\\n' \"expected guardian: {sock_path}\" >&2\n"
+    ));
+    out.push_str("  return 126\n");
+    out.push_str("}\n");
+    if shell == "zsh" {
+        out.push_str(&zsh_prompt_badge_code(sock_path));
+    }
+    let reload_marker = ward_home
+        .join("run")
+        .join("shell-reload")
+        .display()
+        .to_string();
     out.push_str("ward() {\n");
-    out.push_str("  command ward \"$@\"\n");
+    out.push_str("  WARD_HUMAN_SHELL_PID=$$ command ward \"$@\"\n");
     out.push_str("  __ward_exit=$?\n");
     out.push_str("  case \"$1\" in\n");
     out.push_str("    setup|init)\n");
@@ -2997,24 +3547,90 @@ fn posix_init_code(ward_home: &std::path::Path, sock_path: &str, cmds: &[&str]) 
     out
 }
 
+fn zsh_prompt_badge_code(sock_path: &str) -> String {
+    let mut out = String::new();
+    out.push_str("if [ -n \"${ZSH_VERSION:-}\" ]; then\n");
+    out.push_str("__ward_prompt_badge() {\n");
+    out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
+    out.push_str("  if [ -z \"$__ward_root\" ]; then\n");
+    out.push_str("    return 0\n");
+    out.push_str("  fi\n");
+    out.push_str(&format!("  if [ -S \"{sock_path}\" ]; then\n"));
+    out.push_str("    printf '%s' 'ward:human'\n");
+    out.push_str("  else\n");
+    out.push_str("    printf '%s' 'ward:locked'\n");
+    out.push_str("  fi\n");
+    out.push_str("}\n");
+    out.push_str("__ward_prompt_without_badge() {\n");
+    out.push_str("  __ward_prompt=\"${1:-}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt// ward:human/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt//ward:human/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt// ward:locked/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt//ward:locked/}\"\n");
+    out.push_str("  printf '%s' \"$__ward_prompt\"\n");
+    out.push_str("}\n");
+    out.push_str("__ward_precmd() {\n");
+    out.push_str("  __ward_badge=\"$(__ward_prompt_badge)\"\n");
+    out.push_str("  RPROMPT=\"$(__ward_prompt_without_badge \"${RPROMPT:-}\")\"\n");
+    out.push_str("  if [ -n \"$__ward_badge\" ]; then\n");
+    out.push_str("    if [ -n \"$RPROMPT\" ]; then\n");
+    out.push_str("      RPROMPT=\"$RPROMPT $__ward_badge\"\n");
+    out.push_str("    else\n");
+    out.push_str("      RPROMPT=\"$__ward_badge\"\n");
+    out.push_str("    fi\n");
+    out.push_str("  fi\n");
+    out.push_str("}\n");
+    out.push_str("if ! (( ${precmd_functions[(I)__ward_precmd]} )); then\n");
+    out.push_str("  precmd_functions+=(__ward_precmd)\n");
+    out.push_str("fi\n");
+    out.push_str("__ward_precmd\n");
+    out.push_str("fi\n");
+    out
+}
+
 fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
     let sock_dir = ward_home.join("run").display().to_string();
-    let mut out = String::from(
-        "# ward shell integration — only active in human mode inside ward projects\n",
-    );
+    let mut out =
+        String::from("# ward shell integration — only active in human mode inside ward projects\n");
+    out.push_str("set -gx WARD_SHELL_INTEGRATION 1\n");
+    out.push_str("function __ward_project_root\n");
+    out.push_str("    set dir (pwd)\n");
+    out.push_str("    while test -n \"$dir\"\n");
+    out.push_str("        if test -f \"$dir/.ward.json\"\n");
+    out.push_str("            echo $dir\n");
+    out.push_str("            return 0\n");
+    out.push_str("        end\n");
+    out.push_str("        if test \"$dir\" = \"/\"\n");
+    out.push_str("            break\n");
+    out.push_str("        end\n");
+    out.push_str("        set dir (dirname \"$dir\")\n");
+    out.push_str("    end\n");
+    out.push_str("    return 1\n");
+    out.push_str("end\n");
     out.push_str("function __ward_wrap\n");
     // Use $fish_pid directly — it's the fish shell PID, matching getppid() in child processes.
     out.push_str(&format!(
         "    set sock \"{sock_dir}/human-$fish_pid/guardian.sock\"\n"
     ));
-    out.push_str("    if test -S $sock; and test -f \".ward.json\"\n");
-    out.push_str("        command ward run -- $argv\n");
-    out.push_str("    else\n");
+    out.push_str("    set project_root (__ward_project_root)\n");
+    out.push_str("    if test -z \"$project_root\"\n");
     out.push_str("        command $argv\n");
+    out.push_str("        return $status\n");
+    out.push_str("    end\n");
+    out.push_str("    if test -S $sock\n");
+    out.push_str("        env WARD_HUMAN_SHELL_PID=$fish_pid command ward run -- $argv\n");
+    out.push_str("        return $status\n");
+    out.push_str("    else\n");
+    out.push_str(
+        "        echo 'Ward human mode is not active for this terminal; run ward human' >&2\n",
+    );
+    out.push_str("        echo \"shell pid: $fish_pid\" >&2\n");
+    out.push_str("        echo \"expected guardian: $sock\" >&2\n");
+    out.push_str("        return 126\n");
     out.push_str("    end\n");
     out.push_str("end\n");
     out.push_str("function ward\n");
-    out.push_str("    command ward $argv\n");
+    out.push_str("    env WARD_HUMAN_SHELL_PID=$fish_pid command ward $argv\n");
     out.push_str("    set __ward_exit $status\n");
     out.push_str("    if contains -- $argv[1] setup init\n");
     out.push_str("        source ~/.config/fish/config.fish 2>/dev/null\n");
@@ -3041,25 +3657,39 @@ fn modes_command(command: ModesCommand) -> Result<()> {
                 println!("No modes defined in .ward.modes.json");
             } else {
                 for mode in &modes {
-                    println!("{} ({})", mode.name, serde_json::to_string(&mode.level).unwrap_or_default().trim_matches('"'));
+                    println!(
+                        "{} ({})",
+                        mode.name,
+                        serde_json::to_string(&mode.level)
+                            .unwrap_or_default()
+                            .trim_matches('"')
+                    );
                 }
             }
             Ok(())
         }
         ModesCommand::Push { project, .. } => {
             let cwd = env::current_dir()?;
-            let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
-            let modes_path = modes::local_modes_path(&resolved.path);
-            let local_modes = modes::load_local_modes(&resolved.path)?;
+            let initial = registry::resolve_project(project.as_deref(), &cwd)?;
+            let modes_path = modes::local_modes_path(&initial.path);
+            let local_modes = modes::load_local_modes(&initial.path)?;
             if local_modes.is_empty() {
                 anyhow::bail!("no modes found in {}", modes_path.display());
             }
             let passphrase = vault::read_existing_passphrase()?;
+            let resolved =
+                registry::resolve_project_with_passphrase(project.as_deref(), &cwd, &passphrase)?;
             // Validate passphrase by decrypting the vault
-            vault::decrypt_vault_file(&resolved.vault, &passphrase)
-                .context("invalid passphrase — cannot push modes")?;
+            with_passphrase_vault_access(&resolved, &passphrase, || {
+                vault::decrypt_vault_file(&resolved.vault, &passphrase)
+                    .context("invalid passphrase — cannot push modes")
+            })?;
             modes::push_modes(&local_modes, &resolved.name, &passphrase, &modes_path)?;
-            println!("Pushed {} mode(s) for project '{}'.", local_modes.len(), resolved.name);
+            println!(
+                "Pushed {} mode(s) for project '{}'.",
+                local_modes.len(),
+                resolved.name
+            );
             Ok(())
         }
         ModesCommand::Status => {
@@ -3090,14 +3720,14 @@ fn teardown(
         anyhow::bail!("teardown requires --yes");
     }
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
+    let initial = registry::resolve_project(project.as_deref(), &cwd)?;
     let export_path = if restore_env && export_path == PathBuf::from(".env.export") {
         PathBuf::from(".env")
     } else {
         export_path
     };
-    let output = project_relative_path(&resolved.path, export_path);
-    if output == resolved.path.join(".env") && !restore_env {
+    let output = project_relative_path(&initial.path, export_path);
+    if output == initial.path.join(".env") && !restore_env {
         anyhow::bail!("restoring plaintext .env requires --restore-env");
     }
     if env::var_os("WARD_UNSAFE_TEST_PASSPHRASE").is_none() && !std::io::stdin().is_terminal() {
@@ -3108,7 +3738,11 @@ fn teardown(
     let passphrase = vault::read_existing_passphrase().context(
         "teardown requires the vault PIN/passphrase even with --yes; run from an interactive terminal or set the unsafe test passphrase only in tests",
     )?;
-    env_file::export_env_file(&output, &resolved.vault, &passphrase, true)?;
+    let resolved =
+        registry::resolve_project_with_passphrase(project.as_deref(), &cwd, &passphrase)?;
+    with_passphrase_vault_access(&resolved, &passphrase, || {
+        env_file::export_env_file(&output, &resolved.vault, &passphrase, true)
+    })?;
     vault::validate_dotenv(&fs::read_to_string(&output)?)?;
 
     let mut removed_files = Vec::new();
@@ -3190,9 +3824,11 @@ fn remove_agent_instruction_section(path: &Path) -> Result<bool> {
 
 fn unlock_logs(ttl: &str) -> Result<()> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
-    vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
+    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
+    with_passphrase_vault_access(&resolved, &passphrase, || {
+        vault::decrypt_vault_file(&resolved.vault, &passphrase)
+    })?;
     let event = LogsUnlockEvent {
         event_type: "logs.unlock",
         project: &resolved.name,
@@ -3209,9 +3845,11 @@ fn unlock_logs(ttl: &str) -> Result<()> {
 
 fn ensure_logs_passphrase() -> Result<()> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
-    vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
+    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
+    with_passphrase_vault_access(&resolved, &passphrase, || {
+        vault::decrypt_vault_file(&resolved.vault, &passphrase)
+    })?;
     Ok(())
 }
 
@@ -3263,6 +3901,7 @@ fn resolve_run_profile(
     action: Option<String>,
     env_names: Vec<String>,
     command: Vec<String>,
+    allow_empty_env: bool,
 ) -> Result<ResolvedProfile> {
     if let Some(profile_name) = profile {
         if !command.is_empty() || !env_names.is_empty() {
@@ -3283,7 +3922,7 @@ fn resolve_run_profile(
     if command.is_empty() {
         anyhow::bail!("command args are required unless --profile is used");
     }
-    if env_names.is_empty() {
+    if env_names.is_empty() && !allow_empty_env {
         anyhow::bail!("at least one --env is required unless --profile is used");
     }
     Ok(ResolvedProfile {
@@ -3619,6 +4258,7 @@ fn run_risk_summary(evaluation: &policy::PolicyEvaluation) -> String {
     }
 }
 
+#[cfg(any(test, coverage))]
 fn marker(ok: bool) -> &'static str {
     if ok {
         "[ok]"
@@ -3627,6 +4267,7 @@ fn marker(ok: bool) -> &'static str {
     }
 }
 
+#[cfg(any(test, coverage))]
 fn grant_integrity_messages(unsigned: usize, invalid: usize) -> Vec<String> {
     let mut messages = Vec::new();
     if unsigned == 0 && invalid == 0 {
@@ -4308,7 +4949,7 @@ fn likely_secret_env_files(cwd: &Path) -> Result<Vec<PathBuf>> {
 fn check_gitignore(cwd: &Path) -> Result<()> {
     let path = cwd.join(".gitignore");
     if !path.exists() {
-        println!("! .gitignore missing; add .env and .env.*");
+        term::warn(".gitignore missing — add .env and .env.*");
         return Ok(());
     }
 
@@ -4318,20 +4959,20 @@ fn check_gitignore(cwd: &Path) -> Result<()> {
     let has_env_variants = gitignore_contains(&contents, ".env.*");
 
     if has_env {
-        println!("[ok] .gitignore contains .env");
+        term::ok(".gitignore  .env");
     } else {
-        println!("! .gitignore should contain .env");
+        term::warn(".gitignore should include .env");
     }
 
     if has_env_variants {
-        println!("[ok] .gitignore contains .env.*");
+        term::ok(".gitignore  .env.*");
         if gitignore_contains(&contents, "!.env.vault") {
-            println!("[ok] .gitignore allows .env.vault");
+            term::ok(".gitignore  !.env.vault");
         } else {
-            println!("! If encrypted vaults should be committed, add !.env.vault after .env.*");
+            term::info("tip: add !.env.vault after .env.* to commit encrypted vaults");
         }
     } else {
-        println!("! .gitignore should contain .env.*");
+        term::warn(".gitignore should include .env.*");
     }
 
     Ok(())
@@ -6569,6 +7210,7 @@ mod tests {
             storage_mode: config::StorageMode::default(),
             vault_nonce: String::new(),
             backup_exported: false,
+            recovery_created: false,
         };
         let mut access = access();
         access.action = Some("Run lint".to_string());
@@ -6605,8 +7247,15 @@ mod tests {
         assert_eq!(manual.command_args, vec!["pnpm", "lint"]);
         assert_eq!(manual.default_scope, ApprovalScope::Once);
 
-        let run_profile =
-            resolve_run_profile(&config, Some("migrate"), None, Vec::new(), Vec::new()).unwrap();
+        let run_profile = resolve_run_profile(
+            &config,
+            Some("migrate"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         assert_eq!(run_profile.command_args, vec!["pnpm", "payload", "migrate"]);
         assert_eq!(run_profile.default_scope, ApprovalScope::Branch);
 
@@ -6621,6 +7270,7 @@ mod tests {
             Some("Run".to_string()),
             vec!["DATABASE_URL".to_string()],
             vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+            false,
         )
         .unwrap();
         assert_eq!(explicit_run.command, "sh -c true");
@@ -6648,18 +7298,26 @@ mod tests {
             None,
             vec!["DATABASE_URL".to_string()],
             Vec::new(),
+            false,
         )
         .is_err());
-        assert!(
-            resolve_run_profile(&config, Some("missing"), None, Vec::new(), Vec::new()).is_err()
-        );
-        assert!(resolve_run_profile(&config, None, None, Vec::new(), Vec::new()).is_err());
+        assert!(resolve_run_profile(
+            &config,
+            Some("missing"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            false
+        )
+        .is_err());
+        assert!(resolve_run_profile(&config, None, None, Vec::new(), Vec::new(), false).is_err());
         assert!(resolve_run_profile(
             &config,
             None,
             None,
             Vec::new(),
             vec!["pnpm".to_string(), "dev".to_string()],
+            false,
         )
         .is_err());
     }

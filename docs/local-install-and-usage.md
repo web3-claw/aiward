@@ -91,17 +91,17 @@ Check the setup:
 ward doctor
 ```
 
-## Create a Recovery Key
+## Recovery Key
 
-After setup, create a recovery key. This lets you restore access if a session
-is interrupted and the broker can't restore the vault automatically.
+Setup creates a recovery key automatically. Recreate it only if the local
+recovery files were lost.
 
 ```bash
 ward recovery create
 ```
 
-You'll be prompted for your vault passphrase and a new recovery PIN (minimum
-4 characters, any characters). The PIN is independent from your vault passphrase.
+You'll be prompted for your vault passphrase. Ward uses the same passphrase for
+the recovery file; there is no separate recovery PIN.
 
 Export a backup to a safe location:
 
@@ -114,6 +114,13 @@ machine — a USB drive, a secure cloud backup, or a password manager.
 
 `ward doctor` will warn you if the recovery key is missing or no backup has
 been exported.
+
+If an interrupted broker session leaves the vault encrypted with a lost
+session key, restore the vault from the recovery material:
+
+```bash
+ward recovery restore
+```
 
 ## Session Encryption
 
@@ -296,8 +303,8 @@ The intended workflow is:
 1. Encrypt `.env` into the vault during setup.
 2. Keep `.env` locked unless you explicitly run `ward env unlock`.
 3. Run secret-bearing commands through `ward run`.
-4. Create a recovery key and export a backup.
-5. Review encrypted logs through PIN-gated `ward logs view` when needed.
+4. Export a recovery backup.
+5. Review encrypted logs through passphrase-gated `ward logs view` when needed.
 
 Ward is not anti-malware. A same-user process can still delete local files if
 the OS allows it. Encrypted hash-chained logs provide confidentiality and tamper

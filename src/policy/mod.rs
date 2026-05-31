@@ -184,6 +184,7 @@ mod tests {
             storage_mode: crate::config::StorageMode::default(),
             vault_nonce: String::new(),
             backup_exported: false,
+            recovery_created: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),
@@ -229,6 +230,7 @@ mod tests {
             storage_mode: crate::config::StorageMode::default(),
             vault_nonce: String::new(),
             backup_exported: false,
+            recovery_created: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),
@@ -269,6 +271,7 @@ mod tests {
             storage_mode: crate::config::StorageMode::default(),
             vault_nonce: String::new(),
             backup_exported: false,
+            recovery_created: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),
@@ -312,6 +315,7 @@ mod tests {
             storage_mode: crate::config::StorageMode::default(),
             vault_nonce: String::new(),
             backup_exported: false,
+            recovery_created: false,
         };
         let request = AccessRequest {
             project: "demo".to_string(),

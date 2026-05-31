@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -11,13 +12,15 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::{broker, fs_util, logs, webui};
 use base64::Engine as _;
-use crate::{broker, fs_util, logs};
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
 
 pub fn human_run_dir(shell_pid: u32) -> PathBuf {
-    logs::ward_home().join("run").join(format!("human-{shell_pid}"))
+    logs::ward_home()
+        .join("run")
+        .join(format!("human-{shell_pid}"))
 }
 
 pub fn guardian_socket_path(shell_pid: u32) -> PathBuf {
@@ -42,8 +45,59 @@ pub fn parent_pid() -> u32 {
     }
 }
 
+pub fn current_shell_pid() -> u32 {
+    std::env::var("WARD_HUMAN_SHELL_PID")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .filter(|pid| *pid != 0)
+        .unwrap_or_else(parent_pid)
+}
+
 pub fn is_human_terminal() -> bool {
-    guardian_socket_path(parent_pid()).exists()
+    guardian_socket_path(current_shell_pid()).exists()
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeDiagnostics {
+    pub shell_pid: u32,
+    pub socket_path: PathBuf,
+    pub shell_hooks_loaded: bool,
+    pub guardian_socket_exists: bool,
+    pub stale_guardian_pids: Vec<u32>,
+    pub stale_run_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct GuardianProcess {
+    pid: u32,
+    shell_pid: u32,
+}
+
+pub fn runtime_diagnostics() -> RuntimeDiagnostics {
+    let shell_pid = current_shell_pid();
+    let socket_path = guardian_socket_path(shell_pid);
+    RuntimeDiagnostics {
+        shell_pid,
+        guardian_socket_exists: socket_path.exists(),
+        socket_path,
+        shell_hooks_loaded: std::env::var_os("WARD_SHELL_INTEGRATION").is_some(),
+        stale_guardian_pids: stale_guardian_processes()
+            .into_iter()
+            .map(|guardian| guardian.pid)
+            .collect(),
+        stale_run_dirs: stale_human_run_dirs(),
+    }
+}
+
+pub fn cleanup_stale_runtime() -> RuntimeDiagnostics {
+    let diagnostics = runtime_diagnostics();
+    for pid in &diagnostics.stale_guardian_pids {
+        terminate_process(*pid);
+    }
+    for dir in &diagnostics.stale_run_dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    diagnostics
 }
 
 // ── Guardian protocol ─────────────────────────────────────────────────────────
@@ -81,19 +135,37 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
     }
 
     fs_util::ensure_private_dir(&dir)?;
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind guardian socket at {}", socket_path.display()))?;
+    let listener = UnixListener::bind(&socket_path).with_context(|| {
+        format!(
+            "failed to bind guardian socket at {}",
+            socket_path.display()
+        )
+    })?;
     listener.set_nonblocking(true)?;
 
     broker::ensure_running()?;
     broker::register_human_session(shell_pid, session_token, ttl_seconds)?;
 
-    fs_util::write_private_file(&ready_path, b"")?;
+    // Start the web dashboard server. `stop` is flipped to true when the
+    // guardian exits so the server thread shuts down cleanly.
+    let stop = Arc::new(Mutex::new(false));
+    let web_port = webui::start(Arc::clone(&stop)).map(|h| h.port).ok();
+
+    // Write the ready marker — `activate_human_mode` polls for this.
+    // Include the web UI port so the parent can print the URL.
+    let ready_content = match web_port {
+        Some(port) => format!("{port}"),
+        None => String::new(),
+    };
+    fs_util::write_private_file(&ready_path, ready_content.as_bytes())?;
 
     let deadline = Instant::now() + Duration::from_secs(ttl_seconds.max(0) as u64);
 
     'accept: loop {
         if Instant::now() >= deadline {
+            break;
+        }
+        if !process_exists(shell_pid) {
             break;
         }
         match listener.accept() {
@@ -125,7 +197,8 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
         }
     }
 
-    // Cleanup
+    // Cleanup — stop web server, deregister session, remove files.
+    *stop.lock().unwrap() = true;
     let _ = broker::deregister_human_session(shell_pid, session_token);
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&ready_path);
@@ -134,15 +207,31 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
     Ok(())
 }
 
+pub fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(pid, 0) does not send a signal; it only checks process visibility.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 // ── Shutdown from lock() ──────────────────────────────────────────────────────
 
 pub fn send_guardian_shutdown() -> Result<()> {
-    let socket_path = guardian_socket_path(parent_pid());
+    let socket_path = guardian_socket_path(current_shell_pid());
     if !socket_path.exists() {
         return Ok(());
     }
-    let mut stream = UnixStream::connect(&socket_path)
-        .context("failed to connect to human guardian socket")?;
+    let mut stream =
+        UnixStream::connect(&socket_path).context("failed to connect to human guardian socket")?;
     let mut msg = serde_json::to_string(&GuardianRequest::Shutdown)?;
     msg.push('\n');
     stream.write_all(msg.as_bytes())?;
@@ -159,17 +248,19 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     use crate::{logs::LogKind, registry, unlock, vault};
 
     let cwd = std::env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
-
     let passphrase = vault::read_existing_passphrase()?;
-    vault::decrypt_vault_file(&resolved.vault, &passphrase)
-        .context("incorrect passphrase — human mode not activated")?;
-
+    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
+    registry::update_project_vault(
+        &resolved.name,
+        resolved.path.clone(),
+        resolved.vault.clone(),
+    )?;
     let duration = unlock::parse_ttl(ttl)?;
     let ttl_seconds = duration.num_seconds();
 
-    // Unlock vault in broker so ward run/dev/migrate work from this terminal.
-    crate::cli::create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, None)?;
+    // Unlock vault in broker (handles both passphrase-encrypted and session-encrypted vaults).
+    crate::cli::create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, None)
+        .context("incorrect passphrase — human mode not activated")?;
 
     // Generate a random session token.
     use rand::RngCore;
@@ -178,13 +269,16 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     let session_token = base64::engine::general_purpose::STANDARD.encode(bytes);
 
     let shell_pid = parent_pid();
+    warn_if_shell_hooks_not_loaded();
+    let _ = cleanup_stale_runtime();
 
     // Clean up any stale previous session for this terminal.
+    terminate_existing_guardians(shell_pid);
     let stale_socket = guardian_socket_path(shell_pid);
     if stale_socket.exists() {
         let _ = std::fs::remove_file(&stale_socket);
-        let _ = std::fs::remove_dir(human_run_dir(shell_pid));
     }
+    let _ = std::fs::remove_dir_all(human_run_dir(shell_pid));
 
     // Spawn guardian subprocess.
     let exe = std::env::current_exe().context("cannot locate ward binary")?;
@@ -202,9 +296,9 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
         .spawn()
         .context("failed to spawn human guardian")?;
 
-    // Wait up to 2 seconds for ready-marker.
+    // Wait up to 3 seconds for ready-marker (web server adds a little startup time).
     let ready = ready_marker_path(shell_pid);
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(3);
     while !ready.exists() {
         if Instant::now() >= deadline {
             anyhow::bail!("human guardian did not become ready in time");
@@ -212,11 +306,23 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
 
+    // Read port from ready file (guardian writes it there).
+    let web_port: Option<u16> = std::fs::read_to_string(&ready)
+        .ok()
+        .and_then(|s| s.trim().parse().ok());
+
     display::print_padlock_opening();
 
     let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
     let ttl_label = format_ttl_label(ttl_seconds);
-    println!("{}", display::format_session_prefix(&resolved.name, &ttl_label));
+    println!(
+        "{}",
+        display::format_session_prefix(&resolved.name, &ttl_label)
+    );
+
+    if let Some(port) = web_port {
+        println!("  ◆ dashboard  →  http://localhost:{port}");
+    }
 
     #[derive(serde::Serialize)]
     struct HumanModeEvent {
@@ -234,6 +340,102 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+fn warn_if_shell_hooks_not_loaded() {
+    if std::env::var_os("WARD_SHELL_INTEGRATION").is_some() {
+        return;
+    }
+    eprintln!(
+        "Warning: Ward shell hooks are not loaded in this shell. Reload your shell after installing shell integration, then run `ward human` again if commands like pnpm are not wrapped."
+    );
+}
+
+fn terminate_existing_guardians(shell_pid: u32) {
+    #[cfg(unix)]
+    {
+        let current_pid = std::process::id();
+        for guardian in guardian_processes() {
+            if guardian.shell_pid != shell_pid || guardian.pid == current_pid {
+                continue;
+            }
+            terminate_process(guardian.pid);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn guardian_processes() -> Vec<GuardianProcess> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .filter(|line| line.contains("__human-guardian"))
+        .filter_map(parse_guardian_process)
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn guardian_processes() -> Vec<GuardianProcess> {
+    Vec::new()
+}
+
+fn parse_guardian_process(line: &str) -> Option<GuardianProcess> {
+    let parts = line.split_whitespace().collect::<Vec<_>>();
+    let pid = parts.first()?.parse::<u32>().ok()?;
+    let shell_pid = parts
+        .windows(2)
+        .find_map(|window| (window[0] == "--shell-pid").then(|| window[1]))
+        .and_then(|raw| raw.parse::<u32>().ok())?;
+    Some(GuardianProcess { pid, shell_pid })
+}
+
+fn stale_guardian_processes() -> Vec<GuardianProcess> {
+    guardian_processes()
+        .into_iter()
+        .filter(|guardian| !process_exists(guardian.shell_pid))
+        .collect()
+}
+
+fn stale_human_run_dirs() -> Vec<PathBuf> {
+    let run_dir = logs::ward_home().join("run");
+    let Ok(entries) = std::fs::read_dir(run_dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            let shell_pid = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("human-"))
+                .and_then(|raw| raw.parse::<u32>().ok())?;
+            if !process_exists(shell_pid) || !path.join("guardian.sock").exists() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn terminate_process(pid: u32) {
+    #[cfg(unix)]
+    {
+        // SAFETY: sends SIGTERM to a Ward guardian process selected by command line.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 fn format_ttl_label(ttl_seconds: i64) -> String {

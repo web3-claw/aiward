@@ -46,6 +46,9 @@ pub struct ProjectConfig {
     /// Whether the user has exported a recovery backup.
     #[serde(default)]
     pub backup_exported: bool,
+    /// Whether a recovery key has been created for this project.
+    #[serde(default)]
+    pub recovery_created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,12 +103,19 @@ impl ProjectConfig {
             storage_mode: StorageMode::VaultFile,
             vault_nonce: vault::generate_vault_nonce(),
             backup_exported: false,
+            recovery_created: false,
         })
     }
 }
 
 pub fn config_path(cwd: &Path) -> PathBuf {
     cwd.join(PROJECT_CONFIG_FILE)
+}
+
+pub fn find_project_root(cwd: &Path) -> Option<PathBuf> {
+    cwd.ancestors()
+        .find(|dir| config_path(dir).is_file())
+        .map(Path::to_path_buf)
 }
 
 pub fn read_project_config(cwd: &Path) -> Result<ProjectConfig> {
@@ -448,6 +458,25 @@ pub fn resolve_vault_path_dynamic(cwd: &Path, config: &ProjectConfig, passphrase
     }
     let filename = vault::derive_vault_filename(passphrase, &config.project, &config.vault_nonce);
     cwd.join(filename)
+}
+
+/// Resolves the current vault path when a passphrase is available.
+///
+/// Legacy projects may still have a static `.env.vault` even after a nonce was
+/// added to `.ward.json`. Prefer the derived path only once it exists, or when
+/// the configured static path is absent.
+pub fn resolve_vault_path_with_passphrase(
+    cwd: &Path,
+    config: &ProjectConfig,
+    passphrase: &str,
+) -> PathBuf {
+    let configured = resolve_vault_path(cwd, config);
+    let derived = resolve_vault_path_dynamic(cwd, config, passphrase);
+    if derived.exists() || !configured.exists() {
+        derived
+    } else {
+        configured
+    }
 }
 
 fn default_anomaly_detection() -> AnomalyDetectionConfig {

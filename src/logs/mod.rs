@@ -74,9 +74,7 @@ pub fn ward_home() -> PathBuf {
 }
 
 fn default_ward_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or(PathBuf::from("."))
-        .join(".ward")
+    dirs::home_dir().unwrap_or(PathBuf::from(".")).join(".ward")
 }
 
 pub fn logs_dir() -> PathBuf {
@@ -94,7 +92,13 @@ pub fn project_modes_dir(project: &str) -> PathBuf {
 fn slugify(project: &str) -> String {
     project
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 

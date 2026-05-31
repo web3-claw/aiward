@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use rand::{rngs::OsRng, RngCore};
@@ -10,78 +10,120 @@ use crate::{fs_util, logs, vault};
 const RECOVERY_MEMORY_COST: u32 = 262_144; // 256 MiB — ~2s per attempt
 const RECOVERY_TIME_COST: u32 = 8;
 
+#[derive(Debug, Clone)]
+pub struct RecoveryMaterial {
+    pub passphrase: String,
+    pub vault_plaintext: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RecoveryBlob {
     version: u32,
     project: String,
     passphrase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vault_plaintext: Option<String>,
 }
 
 /// Creates the real recovery file and 39-59 same-size decoys in ~/.ward/recovery/.
 /// Returns the path to the real recovery file.
-pub fn create_recovery_files(project: &str, passphrase: &str, pin: &str) -> Result<PathBuf> {
+pub fn create_recovery_files(
+    project: &str,
+    passphrase: &str,
+    recovery_passphrase: &str,
+) -> Result<PathBuf> {
+    create_recovery_files_with_material(project, passphrase, recovery_passphrase, None)
+}
+
+/// Creates a recovery file that can restore both the vault passphrase and,
+/// when provided, the vault plaintext after a lost broker session key.
+pub fn create_recovery_files_with_material(
+    project: &str,
+    passphrase: &str,
+    recovery_passphrase: &str,
+    vault_plaintext: Option<&str>,
+) -> Result<PathBuf> {
     let dir = logs::recovery_dir();
     fs_util::ensure_private_dir(&dir)?;
 
     let blob = RecoveryBlob {
-        version: 1,
+        version: if vault_plaintext.is_some() { 2 } else { 1 },
         project: project.to_string(),
         passphrase: passphrase.to_string(),
+        vault_plaintext: vault_plaintext.map(str::to_string),
     };
     let plaintext = serde_json::to_string(&blob)?;
-    let envelope = vault::encrypt_env_with_params(&plaintext, pin, RECOVERY_MEMORY_COST, RECOVERY_TIME_COST)?;
+    let envelope = vault::encrypt_env_with_params(
+        &plaintext,
+        recovery_passphrase,
+        RECOVERY_MEMORY_COST,
+        RECOVERY_TIME_COST,
+    )?;
     let real_bytes = serde_json::to_vec_pretty(&envelope)?;
 
     let real_filename = derive_recovery_filename(passphrase, project);
     let real_path = dir.join(&real_filename);
     fs_util::write_private_file(&real_path, &real_bytes)?;
 
-    // Generate 39-59 decoys of identical serialized size
+    // Generate 39-59 decoys of identical serialized size.
     let decoy_count = (OsRng.next_u32() % 21 + 39) as usize;
     for _ in 0..decoy_count {
         let mut key = [0u8; 32];
-        let mut random_plain = vec![0u8; real_bytes.len()];
+        let mut random_plain = vec![0u8; plaintext.len()];
         OsRng.fill_bytes(&mut key);
         OsRng.fill_bytes(&mut random_plain);
-        let decoy_envelope = vault::encrypt_raw_bytes(&random_plain, &key)?;
-        let mut decoy_bytes = serde_json::to_vec_pretty(&decoy_envelope)?;
-        // Pad or trim to exactly real_bytes.len() so all files are identical size
-        decoy_bytes.resize(real_bytes.len(), b' ');
+        let mut decoy_envelope = vault::encrypt_raw_bytes(&random_plain, &key)?;
+        decoy_envelope.kdf.memory_cost = RECOVERY_MEMORY_COST;
+        decoy_envelope.kdf.time_cost = RECOVERY_TIME_COST;
+        decoy_envelope.created_at = envelope.created_at.clone();
+        decoy_envelope.updated_at = envelope.updated_at.clone();
+        let decoy_bytes = serde_json::to_vec_pretty(&decoy_envelope)?;
+        anyhow::ensure!(
+            decoy_bytes.len() == real_bytes.len(),
+            "recovery decoy size mismatch"
+        );
         fs_util::write_private_file(&dir.join(generate_decoy_filename()), &decoy_bytes)?;
     }
 
     Ok(real_path)
 }
 
-/// Restores the vault passphrase from a recovery file using the PIN.
+/// Restores the vault passphrase from a recovery file using the recovery passphrase.
 /// If passphrase is known it derives the filename directly; otherwise tries all .key files.
 pub fn restore_from_recovery(
     project: &str,
     known_passphrase: Option<&str>,
-    pin: &str,
+    recovery_passphrase: &str,
 ) -> Result<String> {
+    Ok(restore_material_from_recovery(project, known_passphrase, recovery_passphrase)?.passphrase)
+}
+
+/// Restores the vault passphrase and optional vault material from a recovery file.
+pub fn restore_material_from_recovery(
+    project: &str,
+    known_passphrase: Option<&str>,
+    recovery_passphrase: &str,
+) -> Result<RecoveryMaterial> {
     let dir = logs::recovery_dir();
 
     if let Some(passphrase) = known_passphrase {
         let filename = derive_recovery_filename(passphrase, project);
         let path = dir.join(filename);
-        return decrypt_recovery_file(&path, pin);
+        return material_from_recovery_file(project, &path, recovery_passphrase);
     }
 
-    // Try all .key files — only the real one will decrypt successfully with the correct PIN
-    let entries = std::fs::read_dir(&dir)
-        .context(format!("failed to read recovery directory {}", dir.display()))?;
+    // Try all .key files — only the real one will decrypt successfully.
+    let entries = std::fs::read_dir(&dir).context(format!(
+        "failed to read recovery directory {}",
+        dir.display()
+    ))?;
 
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("key") {
-            if let Ok(passphrase) = decrypt_recovery_file(&path, pin) {
-                // Verify the recovered blob belongs to this project
-                let blob: RecoveryBlob = serde_json::from_str(&passphrase)
-                    .map_err(|_| anyhow::anyhow!("invalid recovery blob"))?;
-                if blob.project == project {
-                    return Ok(blob.passphrase);
-                }
+            if let Ok(material) = material_from_recovery_file(project, &path, recovery_passphrase) {
+                return Ok(material);
             }
         }
     }
@@ -91,6 +133,37 @@ pub fn restore_from_recovery(
         dir.display(),
         project
     )
+}
+
+/// Restores recovery material from a specific recovery file path.
+pub fn restore_material_from_file(
+    project: &str,
+    path: &Path,
+    recovery_passphrase: &str,
+) -> Result<RecoveryMaterial> {
+    material_from_recovery_file(project, path, recovery_passphrase)
+}
+
+/// Rewrites the vault from recovery material, returning it to passphrase encryption.
+pub fn restore_vault_from_recovery(
+    project: &str,
+    vault_path: &Path,
+    known_passphrase: Option<&str>,
+    recovery_passphrase: &str,
+) -> Result<()> {
+    let material = restore_material_from_recovery(project, known_passphrase, recovery_passphrase)?;
+    write_recovered_vault(vault_path, &material)
+}
+
+/// Rewrites the vault from a specific recovery file path.
+pub fn restore_vault_from_recovery_file(
+    project: &str,
+    vault_path: &Path,
+    recovery_file: &Path,
+    recovery_passphrase: &str,
+) -> Result<()> {
+    let material = restore_material_from_file(project, recovery_file, recovery_passphrase)?;
+    write_recovered_vault(vault_path, &material)
 }
 
 /// Imports a recovery file backup from an external path into ~/.ward/recovery/.
@@ -105,8 +178,7 @@ pub fn import_recovery_file(source: &std::path::Path) -> Result<PathBuf> {
         .into_owned();
 
     let dest = dir.join(&filename);
-    let contents = std::fs::read(source)
-        .context(format!("failed to read {}", source.display()))?;
+    let contents = std::fs::read(source).context(format!("failed to read {}", source.display()))?;
     fs_util::write_private_file(&dest, &contents)?;
     Ok(dest)
 }
@@ -127,8 +199,8 @@ pub fn export_recovery_file(
         source.display()
     );
 
-    let contents = std::fs::read(&source)
-        .context(format!("failed to read {}", source.display()))?;
+    let contents =
+        std::fs::read(&source).context(format!("failed to read {}", source.display()))?;
 
     let out_path = if dest.is_dir() {
         dest.join(&filename)
@@ -144,15 +216,54 @@ pub fn export_recovery_file(
 /// Returns true if the real recovery file exists for this project.
 pub fn recovery_file_exists(project: &str, passphrase: &str) -> bool {
     let dir = logs::recovery_dir();
-    dir.join(derive_recovery_filename(passphrase, project)).exists()
+    dir.join(derive_recovery_filename(passphrase, project))
+        .exists()
 }
 
 fn decrypt_recovery_file(path: &std::path::Path, pin: &str) -> Result<String> {
-    let contents = std::fs::read_to_string(path)
-        .context(format!("failed to read {}", path.display()))?;
-    let envelope: vault::VaultEnvelope = serde_json::from_str(&contents)
-        .context(format!("failed to parse {}", path.display()))?;
+    let contents =
+        std::fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
+    let envelope: vault::VaultEnvelope =
+        serde_json::from_str(&contents).context(format!("failed to parse {}", path.display()))?;
     vault::decrypt_env(&envelope, pin)
+}
+
+fn decrypt_recovery_blob(
+    path: &std::path::Path,
+    recovery_passphrase: &str,
+) -> Result<RecoveryBlob> {
+    let plaintext = decrypt_recovery_file(path, recovery_passphrase)?;
+    let blob: RecoveryBlob = serde_json::from_str(&plaintext).context("invalid recovery blob")?;
+    anyhow::ensure!(
+        blob.version == 1 || blob.version == 2,
+        "unsupported recovery blob version {}",
+        blob.version
+    );
+    Ok(blob)
+}
+
+fn material_from_recovery_file(
+    project: &str,
+    path: &Path,
+    recovery_passphrase: &str,
+) -> Result<RecoveryMaterial> {
+    let blob = decrypt_recovery_blob(path, recovery_passphrase)?;
+    anyhow::ensure!(
+        blob.project == project,
+        "recovery file belongs to another project"
+    );
+    Ok(RecoveryMaterial {
+        passphrase: blob.passphrase,
+        vault_plaintext: blob.vault_plaintext,
+    })
+}
+
+fn write_recovered_vault(vault_path: &Path, material: &RecoveryMaterial) -> Result<()> {
+    let plaintext = material.vault_plaintext.as_deref().context(
+        "this recovery file only contains the vault passphrase and cannot restore vault contents; create a new recovery key after unlocking a healthy vault",
+    )?;
+    let envelope = vault::encrypt_env(plaintext, &material.passphrase)?;
+    vault::write_vault(vault_path, &envelope)
 }
 
 fn derive_recovery_filename(passphrase: &str, project: &str) -> String {
@@ -210,7 +321,11 @@ mod tests {
             .collect();
 
         // At least 40 files (real + minimum 39 decoys)
-        assert!(key_files.len() >= 40, "expected >= 40 .key files, got {}", key_files.len());
+        assert!(
+            key_files.len() >= 40,
+            "expected >= 40 .key files, got {}",
+            key_files.len()
+        );
 
         // All .key files have identical size
         let sizes: std::collections::HashSet<u64> = key_files

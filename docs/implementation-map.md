@@ -6,10 +6,11 @@ Ward protects against accidental local secret exposure in AI-assisted coding
 workflows. It is not a malware sandbox, kernel isolation layer, enterprise vault,
 or complete exfiltration prevention system.
 
-The MVP succeeds when plaintext `.env` files are replaced by Ward locked
-marker files, commands that need secrets run through `ward run`, and every
-secret-bearing execution has an approval and audit trail. This is the passive
-version: no shell hooks, no daemon, and no terminal-wide command scanning.
+Ward succeeds when plaintext `.env` files are replaced by Ward locked marker
+files, agent commands that need secrets run through explicit Ward commands, and
+every secret-bearing execution has an audit trail. Agent mode is passive.
+Human mode is the intentional exception: `ward human` can enable shell hooks for
+the current terminal while the guardian session is active.
 
 ## Core modules
 
@@ -19,7 +20,7 @@ src/
   config/       Project-local .ward.json (vault nonce, storage mode, profiles)
   env_file/     Locked .env, manual unlock/export, and encrypted env edits
   vault/        Vault encryption, dynamic filename derivation, session key generation
-  recovery/     PIN-protected recovery key creation, decoy generation, and restore
+  recovery/     Passphrase-protected recovery key creation, decoy generation, and restore
   registry/     ~/.ward project registry and active project selection
   policy/       Preset matching and scoped env decisions
   approvals/    Interactive and agent-mediated approval decisions
@@ -49,13 +50,14 @@ src/
 | Config | `write_project_config` | Persist `.ward.json`. |
 | Vault | `encrypt_env` | Encrypt dotenv plaintext using Argon2id and AES-256-GCM. |
 | Vault | `decrypt_env` | Decrypt vault into in-memory dotenv text. |
-| Vault | `import_env_file` | Read `.env`, encrypt it, and write to derived vault path. |
+| Vault | `import_env_file` | Read dotenv plaintext, encrypt it, and write to the configured vault path. |
 | Vault | `derive_vault_filename` | SHA256(passphrase + project + nonce) → hidden dot-prefixed filename. |
 | Vault | `generate_vault_nonce` | Generate 16-byte random hex nonce for vault filename rotation. |
 | Vault | `encrypt_env_with_params` | Encrypt with custom Argon2 params (used for recovery blobs). |
 | Config | `resolve_vault_path_dynamic` | Derive vault path from passphrase + nonce; falls back to static path for legacy configs. |
-| Recovery | `create_recovery_files` | Create PIN-encrypted recovery blob plus decoy files in `~/.ward/recovery/`. |
-| Recovery | `restore_from_recovery` | Decrypt recovery file with PIN to retrieve vault passphrase. |
+| Recovery | `create_recovery_files_with_material` | Create passphrase-encrypted recovery blob with optional vault material plus decoy files in `~/.ward/recovery/`. |
+| Recovery | `restore_from_recovery` | Decrypt recovery file with the vault passphrase to retrieve vault passphrase. |
+| Recovery | `restore_vault_from_recovery` | Re-encrypt recovered vault material with the vault passphrase after lost session encryption. |
 | Recovery | `export_recovery_file` | Copy real recovery file to external backup location. |
 | Env file | `lock_env_file` | Replace plaintext `.env` with a safe locked marker. |
 | Env file | `unlock_env_file` | Write plaintext `.env` for explicit manual local development. |
@@ -87,23 +89,29 @@ src/
 User runs ward init
   -> create .ward.json with random vault_nonce and storage_mode
   -> generate dev and migrate profiles with vault-present exact env names
-  -> derive vault filename from passphrase + project + nonce
-  -> import .env into derived vault path when present
+  -> import .env into the configured vault path, or create an empty vault
   -> verify decrypt
   -> replace plaintext .env with locked marker by default
   -> register project
   -> update .gitignore (includes .env, .env.*, .ward.json)
   -> create .env.example and agent instructions
+  -> create recovery key and offer Desktop backup export
   -> create approval key material and initial run unlock session unless --no-unlock is used
   -> session encryption: vault re-encrypted with ephemeral key, passphrase form gone from disk
 
 User runs ward recovery create
-  -> prompt for vault passphrase + recovery PIN
-  -> create PIN-encrypted recovery blob at derived filename in ~/.ward/recovery/
+  -> use the vault passphrase
+  -> decrypt current vault material, stopping an active broker session first if needed
+  -> create passphrase-encrypted recovery blob at derived filename in ~/.ward/recovery/
   -> create 39-59 size-identical decoy .key files in same directory
 
 User runs ward recovery export
   -> copy real recovery file to Desktop or specified path
+
+User runs ward recovery restore
+  -> decrypt recovery material with the vault passphrase
+  -> re-encrypt vault material to the current vault path with the vault passphrase
+  -> refresh the locked .env marker and project registry
 ```
 
 `ward setup --yes` runs the same recommended flow for scripts.
@@ -114,7 +122,7 @@ User runs ward recovery export
 User runs ward import .env
   -> prompt for vault PIN/passphrase
   -> parse dotenv file
-  -> encrypt full env content into .env.vault
+  -> encrypt full env content into the configured vault path
   -> replace source .env with locked marker
   -> log vault import
 ```
@@ -166,11 +174,11 @@ mismatched context returns structured JSON and the command does not execute.
 ```txt
 User runs ward env unlock
   -> prompt for vault PIN/passphrase
-  -> decrypt .env.vault
+  -> decrypt the configured vault
   -> write plaintext .env with warning header and private permissions
 User runs ward env lock
   -> parse current .env
-  -> re-encrypt .env.vault
+  -> re-encrypt the configured vault
   -> restore locked .env marker
 ```
 
@@ -194,7 +202,7 @@ Agent/user runs ward run --env DATABASE_URL -- pnpm dev
   -> bypass durable grants when critical findings are present
   -> prompt for approval when needed
   -> require active broker unlock session or prompt for PIN/passphrase
-  -> no-prompt agent runs use broker memory instead of direct unlock file/keychain lookup
+  -> no-prompt agent runs use broker memory instead of direct passphrase lookup
   -> write execution.started log before spawning
   -> decrypt vault in memory
   -> inject only DATABASE_URL

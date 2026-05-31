@@ -2,6 +2,8 @@ target/
 .env
 .env.*
 !.env.example
+.ward.json
+.env.vault
 .envgate-local/
 .envgate-test/
 .envgate-install/

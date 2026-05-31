@@ -41,9 +41,8 @@ ward setup
 
 Ward will walk you through:
 - Encrypting your `.env`
-- Choosing where to store secrets (OS keychain or encrypted vault file)
 - Creating a vault passphrase
-- Creating a recovery PIN and recovery key
+- Creating a recovery key with the same passphrase
 - Wiring up your shell
 
 Your plaintext `.env` is replaced with a locked marker file — secrets live in the encrypted vault from this point on.
@@ -107,7 +106,7 @@ Create a `.ward.modes.json` in your project:
 ]
 ```
 
-Push modes to your local vault (PIN required):
+Push modes to your local vault (passphrase required):
 
 ```bash
 ward modes push
@@ -183,9 +182,9 @@ Ward is designed for a specific threat: AI agents accessing secrets through comm
 
 Within that boundary, ward gives you hard guarantees:
 
-- **Vault filename is derived, not fixed.** The vault has no predictable name on disk — it changes on each rotation and is only derivable with your passphrase.
+- **Vault rotation can move the vault to a derived filename.** The default vault file is `.env.vault`; `ward rotate` moves it to a passphrase-derived hidden filename and updates the registry and locked `.env` marker.
 - **Session encryption.** While an unlock session is active, the vault on disk is re-encrypted with a random ephemeral key held only in broker memory. Your passphrase-encrypted form does not exist on disk during an active session.
-- **Recovery key with PIN.** A PIN-protected recovery key is stored locally. It contains your vault passphrase, encrypted with your PIN. If a session is interrupted and the broker can't restore the vault automatically, entering your PIN decrypts the recovery key and ward uses the recovered passphrase to restore access. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct PIN.
+- **Recovery key.** A recovery key is stored locally and encrypted with the same vault passphrase. If a session is interrupted and the broker can't restore the vault automatically, ward can use the recovery file plus your passphrase to restore access. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct passphrase.
 - **Secrets are never written to disk in plaintext** during normal operation.
 - **Every secret injection is logged** with the requesting identity and scope.
 - **Approval grants are signed** — editing them invalidates them.
@@ -199,9 +198,10 @@ Ward operates at the workflow layer, not the OS level. The protection is effecti
 
 ```bash
 ward rotate                         # rotate vault to a new derived filename
-ward recovery create                # create a PIN-protected recovery key
+ward recovery create                # create a passphrase-protected recovery key
 ward recovery export                # save a backup to a safe location
 ward recovery import /path/to/file  # restore a recovery key from backup
+ward recovery restore               # rewrite the vault from recovery material
 ```
 
 Ward doctor will warn you if the recovery key is missing or if no backup has been exported.

@@ -3,14 +3,18 @@
 This document explains what Ward does, how the package is expected to work,
 and what each command is responsible for.
 
-Ward is a local-first, passive AI secret firewall for development machines.
-It keeps env secrets encrypted at rest, gives agents scoped access only through
-explicit Ward commands, and writes encrypted tamper-evident audit logs.
+Ward is a local-first AI secret firewall for development machines. It keeps env
+secrets encrypted at rest, gives agents scoped access only through explicit Ward
+commands, and writes encrypted tamper-evident audit logs.
 
 ## Security Model
 
-Ward is passive. It does not install a daemon, shell hook, filesystem watcher,
-PTY wrapper, network monitor, or terminal-wide scanner.
+Agent mode is passive. Agents must use explicit `ward request`, `ward run`,
+`ward dev`, or `ward migrate` flows with scoped env names and full context.
+
+Human mode is the intentional exception. `ward human` may enable shell hooks for
+the current terminal so normal developer commands are routed through Ward while
+the guardian session is active.
 
 Ward protects secrets only when the user or agent follows the Ward flow:
 
@@ -28,6 +32,9 @@ cat .env
 printenv
 pnpm dev
 ```
+
+When human mode is active in that terminal, the shell hook wraps configured
+commands and routes them through `ward run -- <command>` automatically.
 
 The expected safe behavior is:
 
@@ -86,11 +93,12 @@ state files: 0600
 
 ## Core Features
 
-### Encrypted Env Vault — Dynamic Filename
+### Encrypted Env Vault
 
-Ward stores canonical secrets in an encrypted vault file. Starting with v0.4, the
-vault has no fixed name. Its filename is derived from your passphrase, project name,
-and a random nonce stored in `.ward.json`. The filename:
+Ward stores canonical secrets in an encrypted vault file. Setup uses
+`.env.vault` by default. `ward rotate` can move the vault to a derived hidden
+filename based on your passphrase, project name, and a random nonce stored in
+`.ward.json`. The rotated filename:
 
 - Looks like random data to anyone who doesn't know your passphrase
 - Changes on every `ward rotate`
@@ -119,38 +127,27 @@ ephemeral key — your passphrase-encrypted form does not exist on disk. When yo
 run `ward lock`, the broker decrypts with the session key and re-encrypts with your
 passphrase before shutting down.
 
-If the broker crashes mid-session, use `ward recovery restore` or `ward unlock`
-to trigger the recovery flow.
-
-### Storage Mode
-
-During setup, you choose where secrets are stored:
-
-```txt
-vault-file  — encrypted vault file (works everywhere, including CI and Docker)
-keychain    — OS keychain protected by Touch ID / system login
-```
-
-The choice is stored in `.ward.json` as `storageMode`. Keychain mode uses the
-platform native secret store; vault-file mode uses the Argon2id+AES-GCM vault.
+If the broker crashes mid-session and the vault remains encrypted with a lost
+session key, run `ward recovery restore` with the recovery file and vault
+passphrase to rewrite the vault back to passphrase encryption.
 
 ### Recovery System
 
-Ward creates a PIN-protected recovery key during setup. If a session is interrupted
-and the broker cannot restore the vault automatically, the recovery key can decrypt
-it using only your PIN.
+Ward creates a recovery key during setup using the same vault passphrase. There
+is no separate recovery PIN prompt.
 
 The recovery directory at `~/.ward/recovery/` contains the real key alongside
 a number of decoy files. All files in the directory are the same size and
-indistinguishable without the correct PIN. The real recovery file is identified
+indistinguishable without the correct passphrase. The real recovery file is identified
 by a filename derived from your passphrase — ward finds it automatically.
 
 Recovery commands:
 
 ```bash
-ward recovery create                # create recovery key (prompts for passphrase + PIN)
+ward recovery create                # recreate recovery key with the vault passphrase
 ward recovery export --output ~/Desktop  # save backup to Desktop
 ward recovery import /path/to/file  # restore from external backup
+ward recovery restore               # restore the vault from recovery material
 ```
 
 `ward doctor` warns if the recovery key is missing or no backup has been exported.
@@ -260,8 +257,9 @@ private Unix socket:
 ```
 
 The broker is not installed as a daemon. It starts only when Ward is
-contacted, does not hook the shell, and does not monitor the filesystem or
-terminal input.
+contacted. The broker itself does not monitor the filesystem or terminal input;
+human-mode shell hooks are installed separately by `ward shell-init` and only
+route commands while the guardian session is active.
 
 While the broker is running:
 - The vault on disk is session-encrypted (ephemeral key, not your passphrase)
@@ -417,14 +415,16 @@ exposure.
 
 ### `ward recovery create`
 
-Create a PIN-protected recovery key for this project. Generates the real key
-and a set of decoy files in `~/.ward/recovery/`.
+Create a recovery key for this project using the vault passphrase. Generates
+the real key and a set of decoy files in `~/.ward/recovery/`. New recovery
+keys include encrypted vault material so they can repair a vault left under a
+lost broker session key.
 
 ```bash
 ward recovery create
 ```
 
-Prompts for the vault passphrase and a new PIN (min 4 characters, any characters).
+Prompts for the vault passphrase. No separate recovery PIN is created.
 
 ### `ward recovery export`
 
@@ -444,6 +444,16 @@ Restore a recovery key backup into `~/.ward/recovery/`.
 
 ```bash
 ward recovery import /path/to/backup.key
+```
+
+### `ward recovery restore`
+
+Restore the current project's vault file from recovery material and return it
+to passphrase encryption.
+
+```bash
+ward recovery restore
+ward recovery restore /path/to/backup.key
 ```
 
 ### `ward init`

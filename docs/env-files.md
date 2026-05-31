@@ -58,7 +58,7 @@ The setup flow:
 1. Parses the plaintext dotenv file and records the exact env names.
 2. Creates or updates `.ward.json`.
 3. Generates `dev` and `migrate` profiles from vault-present env names only.
-4. Encrypts the plaintext dotenv contents into `.env.vault`.
+4. Encrypts the plaintext dotenv contents into the configured vault file.
 5. Verifies the vault can decrypt with the chosen PIN/passphrase.
 6. Replaces plaintext `.env` with an Ward locked marker file by default.
 7. Creates the initial run unlock session unless `--no-unlock` is used.
@@ -71,12 +71,12 @@ After setup, the intended checked-in files are:
 AGENTS.md or CLAUDE.md
 ```
 
-`.ward.json` is gitignored automatically because it contains the vault nonce —
-leaking the nonce weakens the derived filename. The vault itself has a derived
-filename (not `.env.vault`) and is also gitignored.
+`.ward.json` is gitignored automatically because it contains the vault nonce.
+Setup uses `.env.vault` by default; after `ward rotate`, Ward moves the vault to
+a passphrase-derived hidden filename and updates the registry plus locked marker.
 
-If you were previously committing `.env.vault`, run `ward rotate` after upgrading
-to 0.4+ to get a derived filename, and remove the old file from git history.
+If the vault filename was exposed, run `ward rotate` to move it to a new derived
+filename.
 
 The generated profiles in `.ward.json` store exact env names:
 
@@ -137,9 +137,10 @@ encryption before stopping.
 
 ## How Commands Get Secrets
 
-Ward is passive. It does not hook the shell or stop commands that bypass it.
-Secrets are protected when secret-bearing commands run through `ward run` or a
-profile shortcut.
+Agent mode is passive. Agents must use `ward request`, `ward run`, or a profile
+shortcut explicitly. Human mode is the intentional exception: `ward human` can
+activate shell hooks for the current terminal so normal developer commands are
+routed through `ward run -- <command>` while the guardian session is active.
 
 Typical flow:
 

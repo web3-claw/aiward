@@ -1,15 +1,19 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc, Mutex,
+    },
     thread,
+    time::Duration as StdDuration,
 };
 #[cfg(not(test))]
 use std::{
     process::{Command, Stdio},
-    time::{Duration as StdDuration, Instant},
+    time::Instant,
 };
 
 use anyhow::{Context, Result};
@@ -77,7 +81,13 @@ enum BrokerRequest {
         env_names: Vec<String>,
         command: Vec<String>,
         inherited_env: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        human_shell_pid: Option<u32>,
         agent_proof: Option<AgentProof>,
+    },
+    ListKeys {
+        project: String,
+        vault: PathBuf,
     },
 }
 
@@ -89,6 +99,7 @@ enum BrokerResponse {
     Signed { receipt: ApprovalReceipt },
     Output { stream: String, line: String },
     Finished { outcome: RunCommandOutcome },
+    Keys { names: Vec<String> },
     Error { reason: String, message: String },
 }
 
@@ -125,14 +136,20 @@ impl std::error::Error for BrokerError {}
 
 struct HumanSessionEntry {
     session_token: String,
-    #[allow(dead_code)]
     expires_at: DateTime<Utc>,
+}
+
+struct ActiveHumanCommand {
+    cancellation: Arc<AtomicBool>,
+    child_pid: Arc<AtomicU32>,
 }
 
 #[derive(Default)]
 struct BrokerState {
     sessions: BTreeMap<String, BrokerSession>,
     human_sessions: HashMap<u32, HumanSessionEntry>,
+    human_commands: HashMap<u32, BTreeMap<u64, ActiveHumanCommand>>,
+    next_human_command_id: u64,
 }
 
 struct BrokerSession {
@@ -302,6 +319,7 @@ pub fn execute(
     cwd: &Path,
     env_names: Vec<String>,
     command: Vec<String>,
+    human_shell_pid: Option<u32>,
     agent_proof: Option<AgentProof>,
 ) -> Result<RunCommandOutcome> {
     ensure_running()?;
@@ -318,6 +336,7 @@ pub fn execute(
         env_names,
         command,
         inherited_env,
+        human_shell_pid,
         agent_proof,
     };
     write_request(&mut stream, &request)?;
@@ -408,7 +427,32 @@ pub fn stop() -> Result<()> {
 }
 
 #[cfg(test)]
-pub fn register_human_session(_shell_pid: u32, _session_token: &str, _ttl_seconds: i64) -> Result<()> {
+pub fn list_vault_keys(_project: &str, _vault: &Path) -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(test))]
+pub fn list_vault_keys(project: &str, vault: &Path) -> Result<Vec<String>> {
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::ListKeys {
+        project: project.to_string(),
+        vault: vault.to_path_buf(),
+    })? {
+        BrokerResponse::Keys { names } => Ok(names),
+        BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+pub fn register_human_session(
+    _shell_pid: u32,
+    _session_token: &str,
+    _ttl_seconds: i64,
+) -> Result<()> {
     Ok(())
 }
 
@@ -448,6 +492,7 @@ pub fn serve() -> Result<()> {
     let listener = UnixListener::bind(socket_path()).context("failed to bind Ward broker")?;
     fs_util::write_private_file(&pid_path(), std::process::id().to_string().as_bytes())?;
     let state = Arc::new(Mutex::new(BrokerState::default()));
+    install_shutdown_handler(Arc::clone(&state));
     for stream in listener.incoming() {
         let stream = stream.context("failed to accept broker client")?;
         let state = Arc::clone(&state);
@@ -467,20 +512,21 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
         let mut reader = BufReader::new(stream.try_clone()?);
         read_request(&mut reader)?
     };
+    cleanup_inactive_human_sessions(&mut state.lock().expect("broker state poisoned"));
     match request {
         BrokerRequest::Ping => {
             let status = status_from_state(&state.lock().expect("broker state poisoned"));
             write_response(&mut stream, &BrokerResponse::Status { status })?;
         }
         BrokerRequest::Stop => {
-            // Restore all session-encrypted vaults before shutting down
-            {
-                let state = state.lock().expect("broker state poisoned");
-                for session in state.sessions.values() {
-                    if let Some(ref ek) = session.session_key {
-                        restore_vault_from_session(&session.vault, ek, &session.passphrase);
-                    }
-                }
+            cancel_all_human_commands(&mut state.lock().expect("broker state poisoned"));
+            if let Err(error) = restore_all_sessions(&state) {
+                let response = broker_error(
+                    "restore_failed",
+                    format!("failed to restore vaults before broker shutdown: {error}"),
+                );
+                write_response(&mut stream, &response)?;
+                return Ok(false);
             }
             write_response(&mut stream, &BrokerResponse::Ok)?;
             return Ok(true);
@@ -492,6 +538,25 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             ttl_seconds,
             mode,
         } => {
+            // If the vault is currently session-encrypted (active session exists),
+            // restore it to passphrase-encrypted form before attempting to decrypt.
+            {
+                let state = state.lock().expect("broker state poisoned");
+                if let Some(session) = state.sessions.get(&session_key(&project, &vault)) {
+                    if let Some(ref ek) = session.session_key {
+                        if let Err(error) =
+                            restore_vault_from_session(&vault, ek, &session.passphrase)
+                        {
+                            let response = broker_error(
+                                "restore_failed",
+                                format!("failed to restore active session before unlock: {error}"),
+                            );
+                            write_response(&mut stream, &response)?;
+                            return Ok(false);
+                        }
+                    }
+                }
+            }
             match vault::decrypt_vault_file(&vault, &passphrase).and_then(|plaintext| {
                 approval_receipts::ensure_project_key(&project, &passphrase).map(|_| plaintext)
             }) {
@@ -508,33 +573,79 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                         },
                         Err(_) => None,
                     };
+                    let session_id = session_key(&project, &vault);
+                    state
+                        .lock()
+                        .expect("broker state poisoned")
+                        .sessions
+                        .insert(
+                            session_id.clone(),
+                            BrokerSession {
+                                project: project.clone(),
+                                vault: vault.clone(),
+                                passphrase: passphrase.clone(),
+                                session_key: ephemeral_key.clone(),
+                                expires_at,
+                                active_mode: None,
+                            },
+                        );
 
                     // Load active mode config from broker vault if requested
                     let active_mode = if let Some(mode_name) = &mode {
                         match modes::load_broker_modes(&project, &passphrase) {
-                            Ok(mode_configs) => {
-                                match modes::find_mode(&mode_configs, mode_name) {
-                                    Some(config) => Some(modes::ActiveMode {
-                                        config: config.clone(),
-                                        expires_at,
-                                    }),
-                                    None => {
-                                        if let Some(ref ek) = ephemeral_key {
-                                            restore_vault_from_session(&vault, ek, &passphrase);
+                            Ok(mode_configs) => match modes::find_mode(&mode_configs, mode_name) {
+                                Some(config) => Some(modes::ActiveMode {
+                                    config: config.clone(),
+                                    expires_at,
+                                }),
+                                None => {
+                                    if let Some(ref ek) = ephemeral_key {
+                                        if let Err(error) =
+                                            restore_vault_from_session(&vault, ek, &passphrase)
+                                        {
+                                            let response = broker_error(
+                                                "restore_failed",
+                                                format!(
+                                                    "failed to restore vault after mode lookup failure: {error}"
+                                                ),
+                                            );
+                                            write_response(&mut stream, &response)?;
+                                            return Ok(false);
                                         }
-                                        let response = broker_error(
+                                    }
+                                    state
+                                        .lock()
+                                        .expect("broker state poisoned")
+                                        .sessions
+                                        .remove(&session_id);
+                                    let response = broker_error(
                                             "mode_not_found",
                                             format!("mode '{mode_name}' not found — run `ward modes push` first"),
+                                        );
+                                    write_response(&mut stream, &response)?;
+                                    return Ok(false);
+                                }
+                            },
+                            Err(error) => {
+                                if let Some(ref ek) = ephemeral_key {
+                                    if let Err(restore_error) =
+                                        restore_vault_from_session(&vault, ek, &passphrase)
+                                    {
+                                        let response = broker_error(
+                                            "restore_failed",
+                                            format!(
+                                                "failed to restore vault after mode load failure: {restore_error}"
+                                            ),
                                         );
                                         write_response(&mut stream, &response)?;
                                         return Ok(false);
                                     }
                                 }
-                            }
-                            Err(error) => {
-                                if let Some(ref ek) = ephemeral_key {
-                                    restore_vault_from_session(&vault, ek, &passphrase);
-                                }
+                                state
+                                    .lock()
+                                    .expect("broker state poisoned")
+                                    .sessions
+                                    .remove(&session_id);
                                 let response = broker_error(
                                     "modes_vault_unavailable",
                                     format!("could not load modes vault: {error} — run `ward modes push` first"),
@@ -547,21 +658,14 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                         None
                     };
 
-                    state
+                    if let Some(session) = state
                         .lock()
                         .expect("broker state poisoned")
                         .sessions
-                        .insert(
-                            session_key(&project, &vault),
-                            BrokerSession {
-                                project,
-                                vault,
-                                passphrase,
-                                session_key: ephemeral_key,
-                                expires_at,
-                                active_mode,
-                            },
-                        );
+                        .get_mut(&session_id)
+                    {
+                        session.active_mode = active_mode;
+                    }
                     write_response(&mut stream, &BrokerResponse::Ok)?;
                 }
                 Err(error) => {
@@ -598,7 +702,13 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 .lock()
                 .expect("broker state poisoned")
                 .human_sessions
-                .insert(shell_pid, HumanSessionEntry { session_token, expires_at });
+                .insert(
+                    shell_pid,
+                    HumanSessionEntry {
+                        session_token,
+                        expires_at,
+                    },
+                );
             write_response(&mut stream, &BrokerResponse::Ok)?;
         }
         BrokerRequest::DeregisterHumanSession {
@@ -609,6 +719,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             match state.human_sessions.get(&shell_pid) {
                 Some(entry) if entry.session_token == session_token => {
                     state.human_sessions.remove(&shell_pid);
+                    cancel_human_commands(&mut state, shell_pid);
                     write_response(&mut stream, &BrokerResponse::Ok)?;
                 }
                 Some(_) => {
@@ -627,8 +738,21 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             env_names,
             command,
             inherited_env,
+            human_shell_pid,
             agent_proof,
         } => {
+            let cancellation = Arc::new(AtomicBool::new(false));
+            let child_pid = Arc::new(AtomicU32::new(0));
+            if let Some(shell_pid) = human_shell_pid {
+                let mut broker_state = state.lock().expect("broker state poisoned");
+                cleanup_inactive_human_sessions(&mut broker_state);
+                if let Err(message) = validate_human_session(&broker_state, shell_pid) {
+                    let response = broker_error("human_session_required", message);
+                    write_response(&mut stream, &response)?;
+                    return Ok(false);
+                }
+            }
+
             if let Some(proof) = &agent_proof {
                 if !agents::verify_proof(&project, proof)? {
                     let response =
@@ -641,7 +765,10 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 let state = state.lock().expect("broker state poisoned");
                 active_session(&state, &project, &vault).map(|session| {
                     // Use ephemeral session key if vault is currently session-encrypted
-                    session.session_key.clone().unwrap_or_else(|| session.passphrase.clone())
+                    session
+                        .session_key
+                        .clone()
+                        .unwrap_or_else(|| session.passphrase.clone())
                 })
             };
             let (passphrase, active_mode) = match passphrase {
@@ -695,31 +822,54 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             }
 
             let output = Arc::new(Mutex::new(stream.try_clone()?));
+            monitor_client_disconnect(stream.try_clone()?, Arc::clone(&cancellation));
             let emitter = {
                 let output = Arc::clone(&output);
+                let cancellation = Arc::clone(&cancellation);
                 Arc::new(move |stream_name: &str, line: &str| {
                     if let Ok(mut stream) = output.lock() {
-                        let _ = write_response(
+                        if write_response(
                             &mut stream,
                             &BrokerResponse::Output {
                                 stream: stream_name.to_string(),
                                 line: line.to_string(),
                             },
-                        );
+                        )
+                        .is_err()
+                        {
+                            cancellation.store(true, Ordering::SeqCst);
+                        }
                     }
                 })
             };
             let outcome = runner::run_command_with_emitter(
-                RunCommandRequest {
-                    cwd,
-                    vault,
-                    env_names,
-                    command,
-                    passphrase,
-                    inherited_env,
+                {
+                    if let Some(shell_pid) = human_shell_pid {
+                        register_human_command(
+                            &mut state.lock().expect("broker state poisoned"),
+                            shell_pid,
+                            Arc::clone(&cancellation),
+                            Arc::clone(&child_pid),
+                        );
+                    }
+                    RunCommandRequest {
+                        cwd,
+                        vault,
+                        env_names,
+                        command,
+                        passphrase,
+                        inherited_env,
+                        cancellation: Some(Arc::clone(&cancellation)),
+                        human_shell_pid,
+                        child_pid: Some(Arc::clone(&child_pid)),
+                    }
                 },
                 emitter,
             );
+            if let Some(shell_pid) = human_shell_pid {
+                let mut broker_state = state.lock().expect("broker state poisoned");
+                unregister_human_command(&mut broker_state, shell_pid, &cancellation);
+            }
             match outcome {
                 Ok(outcome) => {
                     let mut stream = output.lock().expect("broker output stream poisoned");
@@ -732,6 +882,36 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     } else {
                         broker_error("execution_failed", error.to_string())
                     };
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
+        BrokerRequest::ListKeys { project, vault } => {
+            let key_result = {
+                let state = state.lock().expect("broker state poisoned");
+                active_session(&state, &project, &vault).and_then(|session| {
+                    let decrypt_key = session
+                        .session_key
+                        .clone()
+                        .unwrap_or_else(|| session.passphrase.clone());
+                    let plaintext = vault::decrypt_vault_file(&vault, &decrypt_key)?;
+                    let names = plaintext
+                        .lines()
+                        .filter_map(|line| {
+                            let line = line.trim();
+                            if line.is_empty() || line.starts_with('#') {
+                                return None;
+                            }
+                            line.splitn(2, '=').next().map(str::to_string)
+                        })
+                        .collect::<Vec<_>>();
+                    Ok(names)
+                })
+            };
+            match key_result {
+                Ok(names) => write_response(&mut stream, &BrokerResponse::Keys { names })?,
+                Err(e) => {
+                    let response = broker_error("list_keys_failed", e.to_string());
                     write_response(&mut stream, &response)?;
                 }
             }
@@ -769,6 +949,103 @@ fn active_session<'a>(
     Ok(session)
 }
 
+fn validate_human_session(state: &BrokerState, shell_pid: u32) -> std::result::Result<(), String> {
+    let Some(entry) = state.human_sessions.get(&shell_pid) else {
+        return Err(format!(
+            "Ward human mode is not active for this terminal; run ward human (shell pid: {shell_pid})"
+        ));
+    };
+    if entry.expires_at <= Utc::now() {
+        return Err(format!(
+            "Ward human mode expired for this terminal; run ward human (shell pid: {shell_pid})"
+        ));
+    }
+    if !process_exists(shell_pid) {
+        return Err(format!(
+            "Ward human shell is no longer running; run ward human in the active terminal (shell pid: {shell_pid})"
+        ));
+    }
+    Ok(())
+}
+
+fn register_human_command(
+    state: &mut BrokerState,
+    shell_pid: u32,
+    cancellation: Arc<AtomicBool>,
+    child_pid: Arc<AtomicU32>,
+) {
+    let command_id = state.next_human_command_id;
+    state.next_human_command_id = state.next_human_command_id.saturating_add(1);
+    state.human_commands.entry(shell_pid).or_default().insert(
+        command_id,
+        ActiveHumanCommand {
+            cancellation,
+            child_pid,
+        },
+    );
+}
+
+fn unregister_human_command(
+    state: &mut BrokerState,
+    shell_pid: u32,
+    cancellation: &Arc<AtomicBool>,
+) {
+    let Some(commands) = state.human_commands.get_mut(&shell_pid) else {
+        return;
+    };
+    let remove_id = commands.iter().find_map(|(id, active)| {
+        if Arc::ptr_eq(&active.cancellation, cancellation) {
+            Some(*id)
+        } else {
+            None
+        }
+    });
+    if let Some(id) = remove_id {
+        commands.remove(&id);
+    }
+    if commands.is_empty() {
+        state.human_commands.remove(&shell_pid);
+    }
+}
+
+fn cancel_human_commands(state: &mut BrokerState, shell_pid: u32) {
+    if let Some(commands) = state.human_commands.remove(&shell_pid) {
+        for command in commands.values() {
+            command.cancellation.store(true, Ordering::SeqCst);
+            let child_pid = command.child_pid.load(Ordering::SeqCst);
+            if child_pid != 0 {
+                terminate_process_group(child_pid);
+            }
+        }
+    }
+}
+
+fn cancel_all_human_commands(state: &mut BrokerState) {
+    let shell_pids = state.human_commands.keys().copied().collect::<Vec<_>>();
+    for shell_pid in shell_pids {
+        cancel_human_commands(state, shell_pid);
+    }
+}
+
+fn cleanup_inactive_human_sessions(state: &mut BrokerState) {
+    let now = Utc::now();
+    let stale = state
+        .human_sessions
+        .iter()
+        .filter_map(|(shell_pid, entry)| {
+            if entry.expires_at <= now || !process_exists(*shell_pid) {
+                Some(*shell_pid)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for shell_pid in stale {
+        state.human_sessions.remove(&shell_pid);
+        cancel_human_commands(state, shell_pid);
+    }
+}
+
 fn status_from_state(state: &BrokerState) -> BrokerStatus {
     BrokerStatus {
         running: true,
@@ -792,6 +1069,59 @@ fn session_key(project: &str, vault: &Path) -> String {
     format!("{}|{}", project, vault.display())
 }
 
+fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(pid, 0) checks process visibility without sending a signal.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn terminate_process_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pgid = pid as libc::pid_t;
+        // SAFETY: sends SIGTERM to the process group created for a human-mode child.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        thread::sleep(StdDuration::from_millis(100));
+        // SAFETY: best-effort hard stop if the process group ignored SIGTERM.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
+}
+
+fn monitor_client_disconnect(mut stream: UnixStream, cancellation: Arc<AtomicBool>) {
+    thread::spawn(move || {
+        let mut buf = [0u8; 1];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    cancellation.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => {
+                    cancellation.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+        }
+    });
+}
+
 fn generate_session_key() -> String {
     use rand::RngCore;
     let mut key = [0u8; 32];
@@ -799,13 +1129,43 @@ fn generate_session_key() -> String {
     hex::encode(key)
 }
 
-/// Decrypts the session-encrypted vault and re-writes it with the original passphrase.
-/// Best-effort — silently ignores errors so lock/stop never fails due to restoration.
-fn restore_vault_from_session(vault: &Path, session_key: &str, passphrase: &str) {
-    let Ok(plaintext) = vault::decrypt_vault_file(vault, session_key) else { return };
-    if let Ok(envelope) = vault::encrypt_env(&plaintext, passphrase) {
-        let _ = vault::write_vault(vault, &envelope);
+fn install_shutdown_handler(state: Arc<Mutex<BrokerState>>) {
+    #[cfg(test)]
+    {
+        let _ = state;
     }
+    #[cfg(not(test))]
+    {
+        if let Err(error) = ctrlc::set_handler(move || {
+            let _ = restore_all_sessions(&state);
+            let _ = cleanup_stale_files();
+            std::process::exit(0);
+        }) {
+            eprintln!("ward broker warning: failed to install shutdown handler: {error}");
+        }
+    }
+}
+
+fn restore_all_sessions(state: &Arc<Mutex<BrokerState>>) -> Result<()> {
+    let state = state.lock().expect("broker state poisoned");
+    for session in state.sessions.values() {
+        if let Some(ref ek) = session.session_key {
+            restore_vault_from_session(&session.vault, ek, &session.passphrase).context(
+                format!(
+                    "failed to restore {} before broker shutdown",
+                    session.vault.display()
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Decrypts the session-encrypted vault and re-writes it with the original passphrase.
+fn restore_vault_from_session(vault: &Path, session_key: &str, passphrase: &str) -> Result<()> {
+    let plaintext = vault::decrypt_vault_file(vault, session_key)?;
+    let envelope = vault::encrypt_env(&plaintext, passphrase)?;
+    vault::write_vault(vault, &envelope)
 }
 
 fn send_simple(request: BrokerRequest) -> Result<BrokerResponse> {
@@ -895,6 +1255,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         home.path(),
         Vec::new(),
         vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+        None,
         None,
     )
     .is_err());
@@ -1009,7 +1370,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         ],
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
-    let action = || execute("demo", &vault_path, home.path(), Vec::new(), command, None);
+    let action = || {
+        execute(
+            "demo",
+            &vault_path,
+            home.path(),
+            Vec::new(),
+            command,
+            None,
+            None,
+        )
+    };
     let execute_result = with_fake_broker(responses, action)?;
     assert!(execute_result.is_err());
     let responses = vec![
@@ -1026,7 +1397,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         }],
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
-    let action = || execute("demo", &vault_path, home.path(), Vec::new(), command, None);
+    let action = || {
+        execute(
+            "demo",
+            &vault_path,
+            home.path(),
+            Vec::new(),
+            command,
+            None,
+            None,
+        )
+    };
     let execute_result = with_fake_broker(responses, action)?;
     let _ = execute_result?;
     let responses = vec![
@@ -1036,7 +1417,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         vec![BrokerResponse::Ok],
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
-    let action = || execute("demo", &vault_path, home.path(), Vec::new(), command, None);
+    let action = || {
+        execute(
+            "demo",
+            &vault_path,
+            home.path(),
+            Vec::new(),
+            command,
+            None,
+            None,
+        )
+    };
     let execute_result = with_fake_broker(responses, action)?;
     assert!(execute_result.is_err());
 
@@ -1272,6 +1663,7 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 inherited_env: inherited_execution_env(),
+                human_shell_pid: None,
                 agent_proof: None,
             },
             Arc::clone(&state),
@@ -1324,6 +1716,7 @@ mod tests {
                 env_names: access.env.clone(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 inherited_env: inherited_execution_env(),
+                human_shell_pid: None,
                 agent_proof: Some(bad_proof),
             },
             Arc::clone(&state),
@@ -1344,6 +1737,7 @@ mod tests {
                 env_names: access.env.clone(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 inherited_env: inherited_execution_env(),
+                human_shell_pid: None,
                 agent_proof: None,
             },
             Arc::clone(&state),
@@ -1364,6 +1758,7 @@ mod tests {
                 env_names: vec!["MISSING_ENV".to_string()],
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 inherited_env: inherited_execution_env(),
+                human_shell_pid: None,
                 agent_proof: None,
             },
             Arc::clone(&state),
@@ -1390,6 +1785,7 @@ mod tests {
                     "printf '%s\\n' \"$DATABASE_URL\"".to_string(),
                 ],
                 inherited_env: inherited_execution_env(),
+                human_shell_pid: None,
                 agent_proof: Some(proof),
             },
         )

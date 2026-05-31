@@ -113,7 +113,13 @@ pub fn create_mode_unlock(
     ttl: Duration,
     mode_name: &str,
 ) -> Result<UnlockSession> {
-    create_unlock(project, vault, passphrase, ttl, UnlockPurpose::Mode(mode_name.to_string()))
+    create_unlock(
+        project,
+        vault,
+        passphrase,
+        ttl,
+        UnlockPurpose::Mode(mode_name.to_string()),
+    )
 }
 
 pub fn active_run_passphrase(project: &str, vault: &Path) -> Result<Option<String>> {
@@ -310,7 +316,9 @@ fn remove_expired_and_matching(
     let mut removed = Vec::new();
     state.sessions.retain(|session| {
         let should_remove = session.expires_at <= now
-            || (session.project == project && session.vault == vault && session.purpose == *purpose);
+            || (session.project == project
+                && session.vault == vault
+                && session.purpose == *purpose);
         if should_remove {
             if session.purpose == UnlockPurpose::Logs {
                 removed.push(session.key_name.clone());
@@ -445,9 +453,7 @@ mod tests {
         ));
         assert!(create_run_unlock("demo", &vault, "wrong-passphrase", Duration::hours(1)).is_err());
 
-        let key_store_path = crate::logs::ward_home()
-            .join("cache")
-            .join("keystore.json");
+        let key_store_path = crate::logs::ward_home().join("cache").join("keystore.json");
         std::fs::remove_file(&key_store_path).unwrap();
         let unavailable = active_run_lookup("demo", &vault).unwrap();
         assert_eq!(unavailable.reason(), Some("unlock_material_unavailable"));
@@ -489,9 +495,7 @@ mod tests {
         ));
 
         create_run_unlock("demo", &vault, "passphrase", Duration::hours(1)).unwrap();
-        let key_store_path = crate::logs::ward_home()
-            .join("cache")
-            .join("keystore.json");
+        let key_store_path = crate::logs::ward_home().join("cache").join("keystore.json");
         std::fs::remove_file(&key_store_path).unwrap();
         assert!(matches!(
             active_run_signing_key("demo", &vault).unwrap(),
@@ -629,9 +633,7 @@ mod tests {
         assert!(write_state(&unlocks_path(), &UnlockState::default()).is_err());
         std::fs::remove_dir(unlocks_path()).unwrap();
 
-        let key_store_path = crate::logs::ward_home()
-            .join("cache")
-            .join("keystore.json");
+        let key_store_path = crate::logs::ward_home().join("cache").join("keystore.json");
         std::fs::create_dir_all(key_store_path.parent().unwrap()).unwrap();
         std::fs::write(&key_store_path, "{bad-json}").unwrap();
         assert!(create_logs_unlock("demo", &vault, Duration::minutes(15)).is_err());

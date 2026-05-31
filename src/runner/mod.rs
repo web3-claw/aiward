@@ -1,11 +1,16 @@
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     collections::BTreeMap,
     io::{BufRead, BufReader},
     path::PathBuf,
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    },
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -50,6 +55,9 @@ pub struct RunCommandRequest {
     pub command: Vec<String>,
     pub passphrase: String,
     pub inherited_env: BTreeMap<String, String>,
+    pub cancellation: Option<Arc<AtomicBool>>,
+    pub human_shell_pid: Option<u32>,
+    pub child_pid: Option<Arc<AtomicU32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,15 +118,35 @@ pub fn run_command_with_emitter(
         })
         .collect::<Vec<_>>();
 
-    let mut child = Command::new(&request.command[0])
+    let mut command = Command::new(&request.command[0]);
+    command
         .args(&request.command[1..])
         .current_dir(&request.cwd)
         .envs(&request.inherited_env)
         .envs(&scoped_env)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    if request.cancellation.is_some() {
+        // SAFETY: pre_exec runs in the child immediately before exec; setpgid only
+        // moves the child into its own process group so Ward can cleanly stop it.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = command
         .spawn()
         .context(format!("failed to spawn {}", request.command.join(" ")))?;
+    if let Some(child_pid) = &request.child_pid {
+        child_pid.store(child.id(), Ordering::SeqCst);
+    }
 
     let stdout_alerts = child.stdout.take().map(|stdout| {
         let secrets = redaction_candidates.clone();
@@ -150,7 +178,18 @@ pub fn run_command_with_emitter(
         })
     });
 
-    let status = child.wait().context("failed to wait for child process")?;
+    let status = loop {
+        if cancellation_requested(&request) {
+            terminate_child_group(child.id());
+            break child
+                .wait()
+                .context("failed to wait for cancelled child process")?;
+        }
+        if let Some(status) = child.try_wait().context("failed to poll child process")? {
+            break status;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     let mut output_alerts = Vec::new();
 
     if let Some(handle) = stdout_alerts {
@@ -166,6 +205,53 @@ pub fn run_command_with_emitter(
         redaction_alerts: output_alerts.len(),
         output_alerts,
     })
+}
+
+fn cancellation_requested(request: &RunCommandRequest) -> bool {
+    if request
+        .cancellation
+        .as_ref()
+        .is_some_and(|cancelled| cancelled.load(Ordering::SeqCst))
+    {
+        return true;
+    }
+    if let Some(shell_pid) = request.human_shell_pid {
+        return !process_exists(shell_pid);
+    }
+    false
+}
+
+fn process_exists(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(pid, 0) checks process visibility without sending a signal.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+fn terminate_child_group(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pgid = pid as libc::pid_t;
+        // SAFETY: sends SIGTERM to the child process group created by setpgid.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        thread::sleep(Duration::from_millis(100));
+        // SAFETY: best-effort hard stop if the child ignored SIGTERM.
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+    }
 }
 
 fn parse_env(plaintext: &str) -> Result<BTreeMap<String, String>> {
@@ -455,6 +541,9 @@ mod tests {
             command: Vec::new(),
             passphrase: "unused".to_string(),
             inherited_env: std::collections::BTreeMap::new(),
+            cancellation: None,
+            human_shell_pid: None,
+            child_pid: None,
         });
 
         assert!(result.is_err());
@@ -476,6 +565,9 @@ mod tests {
             command: vec!["true".to_string()],
             passphrase: "coverage passphrase".to_string(),
             inherited_env: std::collections::BTreeMap::new(),
+            cancellation: None,
+            human_shell_pid: None,
+            child_pid: None,
         });
 
         assert!(result.is_err());
@@ -501,6 +593,9 @@ mod tests {
             ],
             passphrase: "coverage passphrase".to_string(),
             inherited_env: std::collections::BTreeMap::new(),
+            cancellation: None,
+            human_shell_pid: None,
+            child_pid: None,
         })
         .unwrap();
 

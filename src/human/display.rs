@@ -43,9 +43,7 @@ pub fn print_padlock_closing() {
 }
 
 pub fn format_session_prefix(project: &str, ttl_label: &str) -> String {
-    format!(
-        "\x1b[32mᗝ\x1b[0m  \x1b[1m{project}\x1b[0m · \x1b[36mhuman mode\x1b[0m · {ttl_label}"
-    )
+    format!("\x1b[32mᗝ\x1b[0m  \x1b[1m{project}\x1b[0m · \x1b[36mhuman mode\x1b[0m · {ttl_label}")
 }
 
 pub fn format_human_table(headers: &[&str], rows: &[Vec<String>]) -> String {
@@ -63,7 +61,11 @@ pub fn format_human_table(headers: &[&str], rows: &[Vec<String>]) -> String {
         let _ = write!(out, "  {:<width$}", h, width = widths[i]);
     }
     out.push('\n');
-    let sep: String = widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("");
+    let sep: String = widths
+        .iter()
+        .map(|w| "─".repeat(w + 2))
+        .collect::<Vec<_>>()
+        .join("");
     out.push_str(&format!("  {sep}\n"));
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
@@ -90,7 +92,10 @@ mod tests {
 
     #[test]
     fn table_formats_columns() {
-        let s = format_human_table(&["agent", "cmd"], &[vec!["codex".into(), "pnpm dev".into()]]);
+        let s = format_human_table(
+            &["agent", "cmd"],
+            &[vec!["codex".into(), "pnpm dev".into()]],
+        );
         assert!(s.contains("codex"));
         assert!(s.contains("pnpm dev"));
     }

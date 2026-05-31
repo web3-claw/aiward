@@ -603,8 +603,8 @@ fn sign_grant(
         let signing_key = match unlock::active_run_signing_key(&access.project, vault)? {
             unlock::RunSigningLookup::Available(signing_key) => signing_key,
             unlock::RunSigningLookup::Missing => anyhow::bail!(
-            "signing_key_unavailable: run ward unlock --ttl 8h before creating approval grants"
-        ),
+                "signing_key_unavailable: run ward unlock --ttl 8h before creating approval grants"
+            ),
             unlock::RunSigningLookup::MaterialUnavailable { reason } => {
                 anyhow::bail!("{reason}")
             }
@@ -1173,9 +1173,7 @@ mod tests {
     fn persist_manual_grant_reports_unavailable_signing_material() {
         let _guard = env_lock();
         let (_home, vault) = setup_signing_home();
-        let key_store_path = crate::logs::ward_home()
-            .join("cache")
-            .join("keystore.json");
+        let key_store_path = crate::logs::ward_home().join("cache").join("keystore.json");
         std::fs::remove_file(key_store_path).unwrap();
 
         let error = persist_manual_grant(
