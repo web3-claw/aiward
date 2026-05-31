@@ -4,7 +4,6 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -12,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, fs_util, logs, webui};
+use crate::{broker, fs_util, logs};
 use base64::Engine as _;
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
@@ -146,18 +145,8 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
     broker::ensure_running()?;
     broker::register_human_session(shell_pid, session_token, ttl_seconds)?;
 
-    // Start the web dashboard server. `stop` is flipped to true when the
-    // guardian exits so the server thread shuts down cleanly.
-    let stop = Arc::new(Mutex::new(false));
-    let web_port = webui::start(Arc::clone(&stop)).map(|h| h.port).ok();
-
     // Write the ready marker — `activate_human_mode` polls for this.
-    // Include the web UI port so the parent can print the URL.
-    let ready_content = match web_port {
-        Some(port) => format!("{port}"),
-        None => String::new(),
-    };
-    fs_util::write_private_file(&ready_path, ready_content.as_bytes())?;
+    fs_util::write_private_file(&ready_path, b"")?;
 
     let deadline = Instant::now() + Duration::from_secs(ttl_seconds.max(0) as u64);
 
@@ -197,8 +186,7 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
         }
     }
 
-    // Cleanup — stop web server, deregister session, remove files.
-    *stop.lock().unwrap() = true;
+    // Cleanup — deregister session and remove files.
     let _ = broker::deregister_human_session(shell_pid, session_token);
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&ready_path);
@@ -296,7 +284,7 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
         .spawn()
         .context("failed to spawn human guardian")?;
 
-    // Wait up to 3 seconds for ready-marker (web server adds a little startup time).
+    // Wait up to 3 seconds for ready-marker.
     let ready = ready_marker_path(shell_pid);
     let deadline = Instant::now() + Duration::from_secs(3);
     while !ready.exists() {
@@ -305,11 +293,6 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
-
-    // Read port from ready file (guardian writes it there).
-    let web_port: Option<u16> = std::fs::read_to_string(&ready)
-        .ok()
-        .and_then(|s| s.trim().parse().ok());
 
     display::print_padlock_opening();
 
@@ -320,8 +303,10 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
         display::format_session_prefix(&resolved.name, &ttl_label)
     );
 
-    if let Some(port) = web_port {
-        println!("  ◆ dashboard  →  http://localhost:{port}");
+    if let Ok(instances) = crate::webui::dashboard_diagnostics() {
+        if let Some(instance) = instances.first() {
+            println!("  ◆ dashboard  →  {}", instance.url);
+        }
     }
 
     #[derive(serde::Serialize)]

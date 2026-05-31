@@ -506,11 +506,28 @@ ward edit
 ### `ward doctor`
 
 Inspect current project health including vault, recovery, gitignore, broker,
-grants, and logs.
+dashboard, human mode, grants, and logs.
 
 ```bash
 ward doctor
 ```
+
+### `ward dashboard`
+
+Manage the local browser dashboard or open the terminal log dashboard.
+
+```bash
+ward dashboard start
+ward dashboard start --no-open
+ward dashboard status
+ward dashboard stop --all
+ward dashboard tui
+```
+
+The browser dashboard is a standalone localhost service. It shows registered
+projects, profile env-name policy, runtime status, and encrypted logs grouped
+by project. It never displays or edits secret values. Profile edits only change
+which env names a profile is allowed to request.
 
 ### `ward rotate`
 

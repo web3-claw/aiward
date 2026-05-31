@@ -327,8 +327,18 @@ pub enum Commands {
         #[command(subcommand)]
         command: RecoveryCommand,
     },
-    /// Open the interactive logs dashboard.
-    Dashboard,
+    /// Manage Ward dashboards.
+    Dashboard {
+        #[command(subcommand)]
+        command: Option<DashboardCommand>,
+    },
+    #[command(hide = true, name = "__dashboard-server")]
+    DashboardServer {
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        token: String,
+    },
     #[command(hide = true, name = "__human-guardian")]
     HumanGuardian {
         #[arg(long)]
@@ -358,6 +368,39 @@ pub enum ProjectsCommand {
     Use { project: String },
     /// Remove a project from the global registry.
     Remove { project: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DashboardCommand {
+    /// Start the local browser dashboard.
+    Start {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        no_open: bool,
+        #[arg(long)]
+        foreground: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop standalone browser dashboard instances.
+    Stop {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show standalone browser dashboard status.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open the terminal logs dashboard.
+    Tui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -732,7 +775,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::ShellInit { shell } => shell_init(shell.as_deref()),
         Commands::Rotate { project } => rotate_vault(project.as_deref()),
         Commands::Recovery { command } => recovery_command(command),
-        Commands::Dashboard => crate::dashboard::run_dashboard(),
+        Commands::Dashboard { command } => dashboard_command(command),
+        Commands::DashboardServer { port, token } => crate::webui::serve_standalone(port, token),
         Commands::Human { ttl } => crate::human::activate_human_mode(&ttl),
         Commands::HumanGuardian {
             shell_pid,
@@ -1508,6 +1552,35 @@ fn broker_command(command: BrokerCommand) -> Result<()> {
         BrokerCommand::SocketPath => println!("{}", broker::socket_path().display()),
     }
     Ok(())
+}
+
+fn dashboard_command(command: Option<DashboardCommand>) -> Result<()> {
+    match command.unwrap_or(DashboardCommand::Tui) {
+        DashboardCommand::Start {
+            port,
+            no_open,
+            foreground,
+            json,
+        } => crate::webui::start_dashboard(crate::webui::DashboardStartOptions {
+            port,
+            open_browser: !no_open,
+            foreground,
+            json,
+        }),
+        DashboardCommand::Stop {
+            all,
+            pid,
+            port,
+            json,
+        } => crate::webui::stop_dashboards(crate::webui::DashboardStopOptions {
+            all,
+            pid,
+            port,
+            json,
+        }),
+        DashboardCommand::Status { json } => crate::webui::print_dashboard_status(json),
+        DashboardCommand::Tui => crate::dashboard::run_dashboard(),
+    }
 }
 
 fn worktrees_command(command: WorktreesCommand) -> Result<()> {
@@ -2725,6 +2798,30 @@ fn doctor() -> Result<()> {
             term::warn(&format!("stale runtime dir  {}", term::short_path(dir)));
         }
         term::info("run ward human to clean stale human runtime state");
+    }
+
+    // ── dashboard ───────────────────────────────────────────────────────────
+    term::section("dashboard");
+    match crate::webui::dashboard_diagnostics() {
+        Ok(instances) if instances.is_empty() => {
+            term::ok("no standalone browser dashboards running");
+            term::info("run ward dashboard start to open the browser dashboard");
+        }
+        Ok(instances) => {
+            term::ok(&format!(
+                "{} standalone browser dashboard(s) running",
+                instances.len()
+            ));
+            for instance in instances {
+                term::info(&format!(
+                    "pid={} port={} project={}",
+                    instance.pid,
+                    instance.port,
+                    instance.started_project.as_deref().unwrap_or("-")
+                ));
+            }
+        }
+        Err(e) => term::fail(&format!("dashboard status failed — {e}")),
     }
 
     // ── grants ────────────────────────────────────────────────────────────────
@@ -7580,6 +7677,14 @@ mod tests {
                 "--force",
             ],
             vec!["ward", "logs", "unlock", "--ttl", "15m"],
+            vec!["ward", "dashboard"],
+            vec!["ward", "dashboard", "start", "--port", "7780", "--no-open"],
+            vec!["ward", "dashboard", "start", "--foreground", "--json"],
+            vec!["ward", "dashboard", "stop", "--all", "--json"],
+            vec!["ward", "dashboard", "stop", "--pid", "1234"],
+            vec!["ward", "dashboard", "stop", "--port", "7780"],
+            vec!["ward", "dashboard", "status", "--json"],
+            vec!["ward", "dashboard", "tui"],
             vec!["ward", "edit"],
             vec!["ward", "unlock", "--ttl", "1h"],
             vec!["ward", "lock"],
@@ -7789,9 +7894,34 @@ mod tests {
                     ttl: "15m".to_string(),
                 }
             ),
+            format!(
+                "{:?}",
+                Commands::Dashboard {
+                    command: Some(DashboardCommand::Status { json: true }),
+                }
+            ),
+            format!(
+                "{:?}",
+                DashboardCommand::Start {
+                    port: Some(7777),
+                    no_open: true,
+                    foreground: false,
+                    json: true,
+                }
+            ),
+            format!(
+                "{:?}",
+                DashboardCommand::Stop {
+                    all: true,
+                    pid: None,
+                    port: None,
+                    json: false,
+                }
+            ),
+            format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 23);
+        assert_eq!(commands.len(), 27);
         for value in commands {
             assert!(!value.is_empty());
         }
