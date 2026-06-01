@@ -1396,6 +1396,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                                 project_config.backup_exported = true;
                                 let _ = config::write_project_config(&cwd, &project_config, true);
                                 term::ok(&format!("Backup saved  {}", term::short_path(&out_path)));
+                                #[cfg(not(test))]
                                 let _ = std::process::Command::new("open")
                                     .arg("-R")
                                     .arg(&out_path)
