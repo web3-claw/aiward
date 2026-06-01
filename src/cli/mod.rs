@@ -1156,6 +1156,14 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
+    if should_auto_route_workspace_setup(&options) {
+        if let Some(discovery) = workspace::discover(&cwd)? {
+            if discovery.app_candidates().next().is_some() {
+                return setup_workspace_with_discovery(options, Vec::new(), false, discovery);
+            }
+        }
+    }
+
     let commit_vault = !options.ignore_vault;
     let remove_plaintext = options.remove_plaintext && !options.keep_plaintext;
     let source_exists = options.source.exists();
@@ -1621,17 +1629,30 @@ fn print_workspace_discovery(discovery: &workspace::WorkspaceDiscovery) {
             "package"
         };
         println!(
-            "{app_marker:7} {} project={} env={:?} setup={:?} path={}",
+            "{app_marker:7} {} project={} env={:?} setup={:?} envNames={} path={}",
             package.slug,
             package.project_name,
             package.env_status,
             package.setup_status,
+            package.env_example_keys.len(),
             package.relative_path.display()
         );
     }
 }
 
 fn setup_workspace(options: SetupOptions, apps: Vec<String>, all: bool) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let discovery = workspace::discover(&cwd)?
+        .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
+    setup_workspace_with_discovery(options, apps, all, discovery)
+}
+
+fn setup_workspace_with_discovery(
+    options: SetupOptions,
+    apps: Vec<String>,
+    all: bool,
+    discovery: workspace::WorkspaceDiscovery,
+) -> Result<()> {
     if options.commit_vault && options.ignore_vault {
         anyhow::bail!("choose either --commit-vault or --ignore-vault");
     }
@@ -1639,13 +1660,12 @@ fn setup_workspace(options: SetupOptions, apps: Vec<String>, all: bool) -> Resul
         anyhow::bail!("choose either --remove-plaintext or --keep-plaintext");
     }
 
-    let cwd = env::current_dir()?;
-    let discovery = workspace::discover(&cwd)?
-        .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
-    let selected = discovery.selected_apps(&apps, all)?;
+    term::header(&format!("{} workspace", discovery.workspace_name));
+    print_workspace_discovery(&discovery);
+    term::blank();
+
+    let selected = selected_workspace_apps(&discovery, &apps, all, options.yes)?;
     if selected.is_empty() {
-        print_workspace_discovery(&discovery);
-        term::blank();
         term::info("Run `ward setup --workspace --all` or `ward setup --workspace --app <name>` to configure app projects.");
         return Ok(());
     }
@@ -1701,6 +1721,56 @@ fn setup_workspace(options: SetupOptions, apps: Vec<String>, all: bool) -> Resul
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
+}
+
+fn should_auto_route_workspace_setup(options: &SetupOptions) -> bool {
+    options.source == PathBuf::from(".env")
+        && options.vault == PathBuf::from(config::DEFAULT_VAULT_FILE)
+        && !options.commit_vault
+        && !options.ignore_vault
+        && !options.remove_plaintext
+        && !options.keep_plaintext
+}
+
+fn selected_workspace_apps<'a>(
+    discovery: &'a workspace::WorkspaceDiscovery,
+    apps: &[String],
+    all: bool,
+    yes: bool,
+) -> Result<Vec<&'a workspace::WorkspacePackage>> {
+    if all || !apps.is_empty() {
+        return discovery.selected_apps(apps, all);
+    }
+
+    let setup_capable = discovery
+        .app_candidates()
+        .filter(|package| package.can_setup())
+        .collect::<Vec<_>>();
+    if setup_capable.is_empty() {
+        return Ok(Vec::new());
+    }
+    if yes {
+        return Ok(setup_capable);
+    }
+
+    #[cfg(coverage)]
+    {
+        return Ok(setup_capable);
+    }
+    #[cfg(not(coverage))]
+    {
+        let configure = inquire::Confirm::new(
+            "Workspace apps with .env files were detected. Configure them now?",
+        )
+        .with_default(true)
+        .prompt()
+        .unwrap_or(false);
+        if configure {
+            Ok(setup_capable)
+        } else {
+            Ok(Vec::new())
+        }
+    }
 }
 
 fn workspace_setup_status_label(status: &workspace::WorkspaceSetupStatus) -> &'static str {

@@ -505,6 +505,31 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
 }
 
 #[test]
+fn setup_yes_auto_detects_workspace_apps_from_monorepo_root() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cms-core:core-workbench"))
+        .stdout(predicate::str::contains("cms-core:creativestudio"))
+        .stdout(predicate::str::contains("cms-core:ambienta"));
+
+    assert!(!root.path().join(".ward.json").exists());
+    assert!(!root.path().join("apps/ambienta/.ward.json").exists());
+    assert!(root.path().join("apps/core-workbench/.ward.json").exists());
+    assert!(root.path().join("apps/creativestudio/.ward.json").exists());
+}
+
+#[test]
 fn rotate_moves_active_session_vault_to_derived_path_and_keeps_env_available() {
     let fixture = TestProject::new();
     fixture.setup_yes();
