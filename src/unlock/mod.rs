@@ -158,6 +158,10 @@ pub fn active_run_lookup(project: &str, vault: &Path) -> Result<RunUnlockLookup>
     }
 }
 
+pub fn active_run_session_metadata(project: &str, vault: &Path) -> Result<Option<UnlockSession>> {
+    active_session(project, vault, UnlockPurpose::Run)
+}
+
 pub fn active_run_signing_key(project: &str, vault: &Path) -> Result<RunSigningLookup> {
     let Some(session) = active_session(project, vault, UnlockPurpose::Run)? else {
         return Ok(RunSigningLookup::Missing);
@@ -216,19 +220,27 @@ pub fn clear_all_unlocks() -> Result<usize> {
     Ok(state.sessions.len())
 }
 
+pub fn clear_run_unlocks() -> Result<usize> {
+    clear_unlocks_matching(|session| session.purpose == UnlockPurpose::Run)
+}
+
 pub fn clear_project_unlocks(project: &str) -> Result<usize> {
+    clear_unlocks_matching(|session| session.project == project)
+}
+
+fn clear_unlocks_matching(mut should_remove: impl FnMut(&UnlockSession) -> bool) -> Result<usize> {
     let path = unlocks_path();
     let mut state = load_state(&path)?;
     let before = state.sessions.len();
     let mut removed_keys = Vec::new();
     state.sessions.retain(|session| {
-        let should_remove = session.project == project;
-        if should_remove {
+        let remove = should_remove(session);
+        if remove {
             if session.purpose == UnlockPurpose::Logs {
                 removed_keys.push(session.key_name.clone());
             }
         }
-        !should_remove
+        !remove
     });
     for key_name in removed_keys {
         key_store::delete_secret(&key_name)?;

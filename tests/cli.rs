@@ -353,6 +353,60 @@ fn setup_yes_creates_profiles_vault_registry_instructions_and_gitignore() {
 }
 
 #[test]
+fn unlock_verify_only_and_broker_status_report_active_session() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+
+    let output = fixture
+        .command()
+        .args(["broker", "status"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(status["running"], true);
+    assert_eq!(status["version"], env!("CARGO_PKG_VERSION"));
+    assert!(status["pid"].as_u64().is_some());
+    assert!(status["ppid"].as_u64().is_some());
+    assert!(status["startedAt"].as_str().is_some());
+    assert!(status["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|session| session["project"] == "demo"));
+
+    fixture
+        .command()
+        .args(["unlock", "--verify-only"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Broker session active until"));
+}
+
+#[test]
+fn doctor_reports_stale_local_run_unlock_when_broker_session_is_missing() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+
+    fixture
+        .command()
+        .args(["broker", "stop"])
+        .assert()
+        .success();
+
+    fixture
+        .command()
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "stale local unlock metadata without an active session",
+        ));
+}
+
+#[test]
 fn setup_profiles_only_include_vault_present_database_key() {
     let fixture = TestProject::new();
     std::fs::write(
@@ -1993,7 +2047,7 @@ fn unreadable_unlock_material_returns_json_reason_and_doctor_warning() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("without an active session"));
+        .stderr(predicate::str::contains("no active session"));
 
     std::fs::write(
         fixture.ward_home.path().join("sessions/unlocks.json"),
@@ -2005,7 +2059,9 @@ fn unreadable_unlock_material_returns_json_reason_and_doctor_warning() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains("without an active session"));
+        .stderr(predicate::str::contains(
+            "local unlock metadata unreadable without an active session",
+        ));
 }
 
 #[test]
@@ -2376,7 +2432,7 @@ fn doctor_reports_active_unlock_with_local_log_key_storage() {
         .arg("doctor")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains(
             "Active broker unlock session is available",
         ));
 }
@@ -3921,6 +3977,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Unlock {
             ttl: "1h".to_string(),
             mode: None,
+            verify_only: false,
         },
     })
     .unwrap();
@@ -3999,6 +4056,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Unlock {
             ttl: "1h".to_string(),
             mode: None,
+            verify_only: false,
         },
     })
     .unwrap();

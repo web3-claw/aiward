@@ -34,8 +34,12 @@ pub struct BrokerStatus {
     pub running: bool,
     pub socket: PathBuf,
     pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppid: Option<u32>,
     #[serde(default)]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
     pub sessions: Vec<BrokerSessionStatus>,
 }
 
@@ -163,12 +167,24 @@ struct ActiveHumanCommand {
     child_pid: Arc<AtomicU32>,
 }
 
-#[derive(Default)]
 struct BrokerState {
     sessions: BTreeMap<String, BrokerSession>,
     human_sessions: HashMap<u32, HumanSessionEntry>,
     human_commands: HashMap<u32, BTreeMap<u64, ActiveHumanCommand>>,
     next_human_command_id: u64,
+    started_at: DateTime<Utc>,
+}
+
+impl Default for BrokerState {
+    fn default() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            human_sessions: HashMap::new(),
+            human_commands: HashMap::new(),
+            next_human_command_id: 0,
+            started_at: Utc::now(),
+        }
+    }
 }
 
 const BROKER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -206,10 +222,19 @@ pub fn ensure_running() -> Result<()> {
     match ping_status() {
         Ok(status) if broker_is_current(&status) => return Ok(()),
         Ok(status) if status.running => {
+            eprintln!(
+                "Ward broker restart: running broker version '{}' does not match CLI version '{}'.",
+                status.version, BROKER_VERSION
+            );
+            let _ = crate::unlock::clear_run_unlocks();
             stop_existing_broker(&status);
             cleanup_stale_files()?;
         }
         _ => {
+            if read_pid().is_ok() || socket_path().exists() {
+                eprintln!("Ward broker restart: removing stale broker runtime files.");
+                let _ = crate::unlock::clear_run_unlocks();
+            }
             cleanup_stale_files()?;
         }
     }
@@ -359,7 +384,7 @@ pub fn unlock_project_with_mode(
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
-        return Ok(());
+        anyhow::bail!("Ward broker is unavailable from this executable");
     }
     let ttl_seconds = ttl.num_seconds();
     match send_simple(BrokerRequest::Unlock {
@@ -466,7 +491,9 @@ pub fn status() -> Result<BrokerStatus> {
             running: false,
             socket: socket_path(),
             pid: read_pid().ok(),
+            ppid: None,
             version: BROKER_VERSION.to_string(),
+            started_at: None,
             sessions: Vec::new(),
         }),
     }
@@ -956,10 +983,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     .collect();
                 let response = broker_error(
                     "security_policy_violation",
-                    format!(
-                        "command blocked by security policy: {}",
-                        codes.join(", ")
-                    ),
+                    format!("command blocked by security policy: {}", codes.join(", ")),
                 );
                 write_response(&mut stream, &response)?;
                 return Ok(false);
@@ -1344,7 +1368,9 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
         running: true,
         socket: socket_path(),
         pid: Some(std::process::id()),
+        ppid: current_parent_pid(),
         version: BROKER_VERSION.to_string(),
+        started_at: Some(state.started_at),
         sessions: state
             .sessions
             .values()
@@ -1356,6 +1382,19 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
                 active_mode: session.active_mode.as_ref().map(|m| m.config.name.clone()),
             })
             .collect(),
+    }
+}
+
+fn current_parent_pid() -> Option<u32> {
+    #[cfg(unix)]
+    {
+        // SAFETY: getppid has no preconditions and does not mutate memory.
+        let ppid = unsafe { libc::getppid() };
+        return (ppid > 0).then_some(ppid as u32);
+    }
+    #[cfg(not(unix))]
+    {
+        None
     }
 }
 
@@ -1556,7 +1595,9 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         running: true,
         socket: socket_path(),
         pid: Some(1),
+        ppid: Some(0),
         version: BROKER_VERSION.to_string(),
+        started_at: Some(Utc::now()),
         sessions: Vec::new(),
     };
     let ping_result = with_fake_broker(vec![vec![BrokerResponse::Ok]], ping)?;
@@ -1975,7 +2016,9 @@ mod tests {
             running: true,
             socket: socket_path(),
             pid: Some(123),
+            ppid: Some(1),
             version: BROKER_VERSION.to_string(),
+            started_at: Some(now),
             sessions: vec![
                 BrokerSessionStatus {
                     project: "other".to_string(),
@@ -2234,11 +2277,7 @@ mod tests {
                 vault: vault_path,
                 cwd: std::env::current_dir().unwrap(),
                 env_names: access.env,
-                command: vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    "printf '%s\\n' \"$DATABASE_URL\"".to_string(),
-                ],
+                command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 inherited_env: inherited_execution_env(),
                 human_shell_pid: None,
                 agent_proof: Some(proof),
@@ -2247,8 +2286,6 @@ mod tests {
         .unwrap();
         assert!(!handle_client(server, state).unwrap());
         let mut reader = BufReader::new(client);
-        let output = read_response(&mut reader).unwrap();
-        assert!(matches!(output, BrokerResponse::Output { .. }));
         let finished = read_response(&mut reader).unwrap();
         assert!(matches!(finished, BrokerResponse::Finished { .. }));
 

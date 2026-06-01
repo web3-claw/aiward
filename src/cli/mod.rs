@@ -293,6 +293,9 @@ pub enum Commands {
         /// Activate a named session mode after unlocking (must be pushed first via `ward modes push`).
         #[arg(long)]
         mode: Option<String>,
+        /// Verify that the broker currently has an active session for this project.
+        #[arg(long)]
+        verify_only: bool,
     },
     /// Manage session mode permission envelopes.
     Modes {
@@ -792,7 +795,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Workspace { command } => workspace_command(command),
         Commands::Logs { command, kind } => logs(command, kind),
         Commands::Edit => edit(),
-        Commands::Unlock { ttl, mode } => unlock_vault(&ttl, mode.as_deref()),
+        Commands::Unlock {
+            ttl,
+            mode,
+            verify_only,
+        } => unlock_vault(&ttl, mode.as_deref(), verify_only),
         Commands::Modes { command } => modes_command(command),
         Commands::Lock => lock(),
         Commands::Teardown {
@@ -2791,16 +2798,23 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
             Err(broker_err) => {
                 // If an active unlock session exists but the broker isn't running,
                 // the vault may be session-encrypted. Direct decryption won't work.
-                let has_session = unlock::active_run_lookup(&resolved.name, &resolved.vault)
-                    .map(|r| !matches!(r, unlock::RunUnlockLookup::Missing))
-                    .unwrap_or(false);
-                if has_session {
-                    anyhow::bail!(
-                        "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
-                        broker_err
-                    );
-                }
-                let passphrase = vault::read_existing_passphrase()?;
+                let fallback_passphrase = match unlock::active_run_lookup(
+                    &resolved.name,
+                    &resolved.vault,
+                )? {
+                    unlock::RunUnlockLookup::Available(passphrase) => Some(passphrase),
+                    unlock::RunUnlockLookup::MaterialUnavailable { .. } => {
+                        anyhow::bail!(
+                                "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
+                                broker_err
+                            );
+                    }
+                    unlock::RunUnlockLookup::Missing => None,
+                };
+                let passphrase = match fallback_passphrase {
+                    Some(passphrase) => passphrase,
+                    None => vault::read_existing_passphrase()?,
+                };
                 runner::run_command(RunCommandRequest {
                     cwd: cwd.clone(),
                     vault: resolved.vault.clone(),
@@ -2987,17 +3001,29 @@ fn doctor() -> Result<()> {
             }
             match broker::status() {
                 Ok(status) if status.running => {
+                    term::info(&format!("socket  {}", term::short_path(&status.socket)));
+                    term::info(&format!("version  {}", status.version));
+                    if let Some(pid) = status.pid {
+                        match status.ppid {
+                            Some(ppid) => term::info(&format!("pid={pid} ppid={ppid}")),
+                            None => term::info(&format!("pid={pid}")),
+                        }
+                    }
+                    if let Some(started_at) = status.started_at {
+                        term::info(&format!("started  {}", started_at.to_rfc3339()));
+                    }
+                    term::info(&format!("sessions  {}", status.sessions.len()));
                     let active = status
                         .sessions
                         .iter()
-                        .any(|s| s.project == project.name && s.vault == project.vault);
+                        .any(|s| s.project == project.name && same_path(&s.vault, &project.vault));
                     if active {
-                        term::ok("session active — secrets unlocked");
+                        term::ok("Active broker unlock session is available");
                     } else {
-                        term::warn("no active session — run ward unlock --ttl 8h");
+                        warn_missing_broker_session(&project.name, &project.vault);
                     }
                 }
-                Ok(_) => term::warn("broker not running — run ward unlock --ttl 8h"),
+                Ok(_) => warn_missing_broker_session(&project.name, &project.vault),
                 Err(e) => term::fail(&format!("broker status failed — {e}")),
             }
         }
@@ -3268,20 +3294,43 @@ pub(crate) fn create_run_unlock_session(
 
     // Send unlock to broker first. The broker handles both passphrase-encrypted and
     // session-encrypted vaults (restoring from the existing session before re-decrypting).
-    // Fall back to direct decrypt only if the broker is unavailable (e.g. unsupported platform).
-    let broker_result = broker::unlock_project_with_mode(
+    broker::unlock_project_with_mode(
         project,
         vault_path,
         passphrase,
         ttl,
         mode.map(str::to_string),
-    );
+    )
+    .map_err(|error| {
+        let error_message = error.to_string();
+        let event = VaultUnlockEvent {
+            event_type: "vault.unlock",
+            status: "failure",
+            project,
+            vault: vault_path,
+            error: Some(&error_message),
+            expires_at: None,
+        };
+        let _ = audit_logs::append_event(LogKind::Sessions, event);
+        error
+    })?;
 
-    let validated = match broker_result {
-        Ok(()) => true,
-        Err(error) if broker_unavailable_error(&error) => {
-            // Broker unavailable — validate passphrase directly against the vault file.
-            vault::decrypt_vault_file(vault_path, passphrase).is_ok()
+    #[cfg(not(test))]
+    let broker_expires_at = match broker::active_session_expiry(project, vault_path) {
+        Ok(Some(expires_at)) => expires_at,
+        Ok(None) => {
+            let error_message =
+                "broker unlock did not create an active session; run ward unlock again".to_string();
+            let event = VaultUnlockEvent {
+                event_type: "vault.unlock",
+                status: "failure",
+                project,
+                vault: vault_path,
+                error: Some(&error_message),
+                expires_at: None,
+            };
+            audit_logs::append_event(LogKind::Sessions, event)?;
+            anyhow::bail!("{error_message}");
         }
         Err(error) => {
             let error_message = error.to_string();
@@ -3297,48 +3346,47 @@ pub(crate) fn create_run_unlock_session(
             anyhow::bail!("{error_message}");
         }
     };
+    #[cfg(test)]
+    let broker_expires_at = chrono::Utc::now() + ttl;
 
-    if validated {
-        let session = if let Some(mode_name) = mode {
-            unlock::create_mode_unlock(project, vault_path, passphrase, ttl, mode_name)?
-        } else {
-            unlock::create_run_unlock(project, vault_path, passphrase, ttl)?
-        };
-        let event = VaultUnlockEvent {
-            event_type: "vault.unlock",
-            status: "success",
-            project,
-            vault: vault_path,
-            error: None,
-            expires_at: Some(session.expires_at.to_rfc3339()),
-        };
-        audit_logs::append_event(LogKind::Sessions, event)?;
-        Ok(session)
+    let mut session = if let Some(mode_name) = mode {
+        unlock::create_mode_unlock(project, vault_path, passphrase, ttl, mode_name)?
     } else {
-        let error_message = "failed to decrypt vault; passphrase may be incorrect".to_string();
-        let event = VaultUnlockEvent {
-            event_type: "vault.unlock",
-            status: "failure",
-            project,
-            vault: vault_path,
-            error: Some(&error_message),
-            expires_at: None,
-        };
-        audit_logs::append_event(LogKind::Sessions, event)?;
-        anyhow::bail!("{error_message}")
+        unlock::create_run_unlock(project, vault_path, passphrase, ttl)?
+    };
+    if broker_expires_at < session.expires_at {
+        session.expires_at = broker_expires_at;
     }
+    let event = VaultUnlockEvent {
+        event_type: "vault.unlock",
+        status: "success",
+        project,
+        vault: vault_path,
+        error: None,
+        expires_at: Some(session.expires_at.to_rfc3339()),
+    };
+    audit_logs::append_event(LogKind::Sessions, event)?;
+    Ok(session)
 }
 
-fn broker_unavailable_error(error: &anyhow::Error) -> bool {
-    let message = error.to_string();
-    message.contains("Ward broker is unavailable")
-        || message.contains("failed to connect to Ward broker")
-        || message.contains("failed to start Ward broker")
-        || message.contains("Ward broker did not become ready")
-}
-
-fn unlock_vault(ttl: &str, mode: Option<&str>) -> Result<()> {
+fn unlock_vault(ttl: &str, mode: Option<&str>, verify_only: bool) -> Result<()> {
     let cwd = env::current_dir()?;
+    if verify_only {
+        if mode.is_some() {
+            anyhow::bail!("--verify-only cannot be combined with --mode");
+        }
+        let resolved = registry::resolve_project(None, &cwd)?;
+        match broker::active_session_expiry(&resolved.name, &resolved.vault)? {
+            Some(expires_at) => {
+                println!("Broker session active until {}.", expires_at.to_rfc3339());
+                return Ok(());
+            }
+            None => anyhow::bail!(
+                "broker has no active session for {}; run ward unlock --ttl 8h",
+                resolved.name
+            ),
+        }
+    }
     let passphrase = vault::read_existing_passphrase()?;
     let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
     registry::update_project_vault(
@@ -5018,7 +5066,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     };
     run(critical_run)?;
     let grant_source = approvals::ApprovalSource::ManualAllow;
-    unlock_vault("1h", None)?;
+    unlock_vault("1h", None, false)?;
     let receipt_context = Some(grants::GrantReceiptContext::synthetic(false));
     let scope = ApprovalScope::Always;
     let vault = &resolved_main.vault;
@@ -5186,7 +5234,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         Some(grants::GrantReceiptContext::synthetic(false)),
     )
     .is_err());
-    unlock_vault("1h", None)?;
+    unlock_vault("1h", None, false)?;
     let verify_logs = Some(LogsCommand::Verify {
         kind: Some(LogKind::Requests),
         full: true,
@@ -5267,6 +5315,28 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     env::remove_var("WARD_UNSAFE_TEST_KEYRING");
     env::remove_var("WARD_UNSAFE_TEST_PASSPHRASE");
     Ok(())
+}
+
+fn warn_missing_broker_session(project: &str, vault: &Path) {
+    match unlock::active_run_session_metadata(project, vault) {
+        Ok(Some(_)) => term::warn(
+            "stale local unlock metadata without an active session — run ward unlock again",
+        ),
+        Ok(None) => term::warn("no active session — run ward unlock --ttl 8h"),
+        Err(e) => term::warn(&format!(
+            "local unlock metadata unreadable without an active session — run ward unlock again ({e})"
+        )),
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn likely_secret_env_files(cwd: &Path) -> Result<Vec<PathBuf>> {
@@ -6191,7 +6261,7 @@ mod tests {
             .command = "sh -c true".to_string();
         config::write_project_config(project.path(), &project_config, true).unwrap();
 
-        unlock_vault("1h", None).unwrap();
+        unlock_vault("1h", None, false).unwrap();
         let agent_context = prepare_git_context(project.path(), "codex", Some("feature/dispatch"));
 
         dispatch(Cli {
@@ -6515,7 +6585,7 @@ mod tests {
         migrate_profile.env = vec!["DATABASE_URL".to_string(), "PAYLOAD_SECRET".to_string()];
         migrate_profile.default_scope = ApprovalScope::Always;
         config::write_project_config(project.path(), &project_config, true).unwrap();
-        unlock_vault("1h", None).unwrap();
+        unlock_vault("1h", None, false).unwrap();
         let agent_context = prepare_git_context(project.path(), "codex", Some("feature/dispatch"));
 
         assert!(request(
@@ -6666,6 +6736,7 @@ mod tests {
             command: Commands::Unlock {
                 ttl: "1h".to_string(),
                 mode: None,
+                verify_only: false,
             },
         })
         .unwrap();
@@ -6890,7 +6961,7 @@ mod tests {
         import(".env".into(), None).unwrap();
         std::fs::remove_file(project.path().join(".env")).unwrap();
         register("demo".to_string(), None, None).unwrap();
-        unlock_vault("1h", None).unwrap();
+        unlock_vault("1h", None, false).unwrap();
         ensure_logs_passphrase().unwrap();
         ensure_logs_passphrase().unwrap();
         request(
@@ -7088,7 +7159,7 @@ mod tests {
         )
         .is_err());
         std::env::set_var("WARD_UNSAFE_TEST_PASSPHRASE", "wrong passphrase");
-        assert!(unlock_vault("1h", None).is_err());
+        assert!(unlock_vault("1h", None, false).is_err());
         std::env::set_current_dir(old_cwd).unwrap();
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         std::env::remove_var("WARD_HOME");
@@ -8154,6 +8225,7 @@ mod tests {
                 Commands::Unlock {
                     ttl: "1h".to_string(),
                     mode: None,
+                    verify_only: false,
                 }
             ),
             format!("{:?}", Commands::Lock),
