@@ -12,6 +12,8 @@ use std::{
 };
 #[cfg(not(test))]
 use std::{
+    fs,
+    os::unix::io::AsRawFd,
     process::{Command, Stdio},
     time::Instant,
 };
@@ -19,10 +21,13 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
+use sha2::{Digest, Sha256};
 
 use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
+    approvals::{ApprovalScope, ApprovalSource},
     config, detection, env_file, fs_util, logs, modes, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     vault,
@@ -63,6 +68,81 @@ pub struct BrokerProjectSetupStatus {
     pub registered: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecuteAuthorizationPayload {
+    pub project: String,
+    pub vault: PathBuf,
+    pub cwd: PathBuf,
+    pub env_names: Vec<String>,
+    pub command: Vec<String>,
+    pub agent: Option<String>,
+    pub worktree: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub git_remote: Option<String>,
+    pub commit: Option<String>,
+    pub action: Option<String>,
+    pub grant_id: Option<uuid::Uuid>,
+    pub approval_receipt_hash: Option<String>,
+    pub approval_scope: ApprovalScope,
+    pub approval_source: ApprovalSource,
+    pub expires_at: DateTime<Utc>,
+    pub nonce: String,
+}
+
+impl ExecuteAuthorizationPayload {
+    pub fn new(
+        project: String,
+        vault: PathBuf,
+        cwd: PathBuf,
+        env_names: Vec<String>,
+        command: Vec<String>,
+        approval_scope: ApprovalScope,
+        approval_source: ApprovalSource,
+    ) -> Self {
+        Self {
+            project,
+            vault,
+            cwd,
+            env_names,
+            command,
+            agent: None,
+            worktree: None,
+            branch: None,
+            git_remote: None,
+            commit: None,
+            action: None,
+            grant_id: None,
+            approval_receipt_hash: None,
+            approval_scope,
+            approval_source,
+            expires_at: Utc::now() + Duration::seconds(60),
+            nonce: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ExecuteAuthorization {
+    Agent {
+        proof: AgentProof,
+    },
+    Human {
+        shell_pid: u32,
+    },
+    Internal {
+        payload: ExecuteAuthorizationPayload,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ListKeysAuthorization {
+    Human { shell_pid: u32 },
+    Internal { purpose: String },
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BrokerRequest {
@@ -98,12 +178,12 @@ enum BrokerRequest {
         command: Vec<String>,
         inherited_env: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        human_shell_pid: Option<u32>,
-        agent_proof: Option<AgentProof>,
+        authorization: Option<ExecuteAuthorization>,
     },
     ListKeys {
         project: String,
         vault: PathBuf,
+        authorization: ListKeysAuthorization,
     },
     SetupProject {
         source_project: String,
@@ -171,6 +251,7 @@ struct BrokerState {
     sessions: BTreeMap<String, BrokerSession>,
     human_sessions: HashMap<u32, HumanSessionEntry>,
     human_commands: HashMap<u32, BTreeMap<u64, ActiveHumanCommand>>,
+    execute_nonces: HashMap<String, DateTime<Utc>>,
     next_human_command_id: u64,
     started_at: DateTime<Utc>,
 }
@@ -181,6 +262,7 @@ impl Default for BrokerState {
             sessions: BTreeMap::new(),
             human_sessions: HashMap::new(),
             human_commands: HashMap::new(),
+            execute_nonces: HashMap::new(),
             next_human_command_id: 0,
             started_at: Utc::now(),
         }
@@ -210,6 +292,20 @@ pub fn socket_path() -> PathBuf {
 
 pub fn pid_path() -> PathBuf {
     run_dir().join("broker.pid")
+}
+
+pub fn peer_auth_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos LOCAL_PEERPID"
+    } else if cfg!(target_os = "linux") {
+        "linux SO_PEERCRED"
+    } else {
+        "unsupported"
+    }
+}
+
+pub fn privileged_rpc_peer_auth_supported() -> bool {
+    cfg!(any(target_os = "macos", target_os = "linux"))
 }
 
 #[cfg(test)]
@@ -437,8 +533,7 @@ pub fn execute(
     cwd: &Path,
     env_names: Vec<String>,
     command: Vec<String>,
-    human_shell_pid: Option<u32>,
-    agent_proof: Option<AgentProof>,
+    authorization: ExecuteAuthorization,
 ) -> Result<RunCommandOutcome> {
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
@@ -454,8 +549,7 @@ pub fn execute(
         env_names,
         command,
         inherited_env,
-        human_shell_pid,
-        agent_proof,
+        authorization: Some(authorization),
     };
     write_request(&mut stream, &request)?;
     let mut reader = BufReader::new(stream);
@@ -573,12 +667,20 @@ pub fn setup_project_with_active_passphrase(
 }
 
 #[cfg(test)]
-pub fn list_vault_keys(_project: &str, _vault: &Path) -> Result<Vec<String>> {
+pub fn list_vault_keys_for_human(
+    _project: &str,
+    _vault: &Path,
+    _shell_pid: u32,
+) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
 #[cfg(not(test))]
-pub fn list_vault_keys(project: &str, vault: &Path) -> Result<Vec<String>> {
+pub fn list_vault_keys_for_human(
+    project: &str,
+    vault: &Path,
+    shell_pid: u32,
+) -> Result<Vec<String>> {
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
     if !broker_process_supported(&exe) {
@@ -587,6 +689,7 @@ pub fn list_vault_keys(project: &str, vault: &Path) -> Result<Vec<String>> {
     match send_simple(BrokerRequest::ListKeys {
         project: project.to_string(),
         vault: vault.to_path_buf(),
+        authorization: ListKeysAuthorization::Human { shell_pid },
     })? {
         BrokerResponse::Keys { names } => Ok(names),
         BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
@@ -611,6 +714,9 @@ pub fn list_vault_keys_from_active_session(project: &str, vault: &Path) -> Resul
     match send_simple(BrokerRequest::ListKeys {
         project: project.to_string(),
         vault: vault.to_path_buf(),
+        authorization: ListKeysAuthorization::Internal {
+            purpose: "dashboard".to_string(),
+        },
     })? {
         BrokerResponse::Keys { names } => Ok(names),
         BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
@@ -685,7 +791,11 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
         let mut reader = BufReader::new(stream.try_clone()?);
         read_request(&mut reader)?
     };
-    cleanup_inactive_human_sessions(&mut state.lock().expect("broker state poisoned"));
+    {
+        let mut broker_state = state.lock().expect("broker state poisoned");
+        cleanup_inactive_human_sessions(&mut broker_state);
+        cleanup_expired_execute_nonces(&mut broker_state);
+    }
     match request {
         BrokerRequest::Ping => {
             let status = status_from_state(&state.lock().expect("broker state poisoned"));
@@ -852,6 +962,16 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             vault,
             payload,
         } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            if let Err(message) = validate_signing_payload(&project, &payload) {
+                let response = broker_error("signing_payload_invalid", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
             let result = {
                 let state = state.lock().expect("broker state poisoned");
                 active_session(&state, &project, &vault)
@@ -911,29 +1031,34 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             env_names,
             command,
             inherited_env,
-            human_shell_pid,
-            agent_proof,
+            authorization,
         } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
             let cancellation = Arc::new(AtomicBool::new(false));
             let child_pid = Arc::new(AtomicU32::new(0));
-            if let Some(shell_pid) = human_shell_pid {
+            let human_shell_pid = {
                 let mut broker_state = state.lock().expect("broker state poisoned");
-                cleanup_inactive_human_sessions(&mut broker_state);
-                if let Err(message) = validate_human_session(&broker_state, shell_pid) {
-                    let response = broker_error("human_session_required", message);
-                    write_response(&mut stream, &response)?;
-                    return Ok(false);
+                match validate_execute_authorization(
+                    &mut broker_state,
+                    &project,
+                    &vault,
+                    &cwd,
+                    &env_names,
+                    &command,
+                    authorization.as_ref(),
+                ) {
+                    Ok(shell_pid) => shell_pid,
+                    Err((reason, message)) => {
+                        let response = broker_error(reason, message);
+                        write_response(&mut stream, &response)?;
+                        return Ok(false);
+                    }
                 }
-            }
-
-            if let Some(proof) = &agent_proof {
-                if !agents::verify_proof(&project, proof)? {
-                    let response =
-                        broker_error("agent_proof_invalid", "agent proof verification failed");
-                    write_response(&mut stream, &response)?;
-                    return Ok(false);
-                }
-            }
+            };
             let passphrase = {
                 let state = state.lock().expect("broker state poisoned");
                 active_session(&state, &project, &vault).map(|session| {
@@ -1078,7 +1203,22 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 }
             }
         }
-        BrokerRequest::ListKeys { project, vault } => {
+        BrokerRequest::ListKeys {
+            project,
+            vault,
+            authorization,
+        } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            if let Err((reason, message)) = validate_list_keys_authorization(&state, &authorization)
+            {
+                let response = broker_error(reason, message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
             let key_result = {
                 let state = state.lock().expect("broker state poisoned");
                 active_session(&state, &project, &vault).and_then(|session| {
@@ -1114,6 +1254,11 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             target_path,
             project,
         } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
             let (passphrase, expires_at) = {
                 let state = state.lock().expect("broker state poisoned");
                 match active_session(&state, &source_project, &source_vault) {
@@ -1307,6 +1452,287 @@ fn validate_human_session(state: &BrokerState, shell_pid: u32) -> std::result::R
         ));
     }
     Ok(())
+}
+
+fn validate_execute_authorization(
+    state: &mut BrokerState,
+    project: &str,
+    vault: &Path,
+    cwd: &Path,
+    env_names: &[String],
+    command: &[String],
+    authorization: Option<&ExecuteAuthorization>,
+) -> std::result::Result<Option<u32>, (String, String)> {
+    let Some(authorization) = authorization else {
+        return Err((
+            "execute_authorization_required".to_string(),
+            "execution authorization is required".to_string(),
+        ));
+    };
+    match authorization {
+        ExecuteAuthorization::Human { shell_pid } => {
+            cleanup_inactive_human_sessions(state);
+            validate_human_session(state, *shell_pid)
+                .map_err(|message| ("human_session_required".to_string(), message))?;
+            Ok(Some(*shell_pid))
+        }
+        ExecuteAuthorization::Agent { proof } => {
+            let valid = agents::verify_proof(project, proof).map_err(|error| {
+                (
+                    "agent_proof_invalid".to_string(),
+                    format!("agent proof verification failed: {error}"),
+                )
+            })?;
+            if !valid {
+                return Err((
+                    "agent_proof_invalid".to_string(),
+                    "agent proof verification failed".to_string(),
+                ));
+            }
+            let payload = serde_json::from_str::<ExecuteAuthorizationPayload>(&proof.payload)
+                .map_err(|error| {
+                    (
+                        "execute_authorization_invalid".to_string(),
+                        format!(
+                            "agent proof payload is not valid execution authorization: {error}"
+                        ),
+                    )
+                })?;
+            if payload.agent.as_deref() != Some(proof.agent_name.as_str())
+                || payload.worktree.is_none()
+                || payload.branch.is_none()
+                || payload.git_remote.is_none()
+                || payload.commit.is_none()
+            {
+                return Err((
+                    "execute_authorization_mismatch".to_string(),
+                    "agent execution authorization is missing verified context".to_string(),
+                ));
+            }
+            validate_execute_payload(state, project, vault, cwd, env_names, command, &payload)?;
+            Ok(None)
+        }
+        ExecuteAuthorization::Internal { payload } => {
+            validate_execute_payload(state, project, vault, cwd, env_names, command, payload)?;
+            Ok(None)
+        }
+    }
+}
+
+fn validate_execute_payload(
+    state: &mut BrokerState,
+    project: &str,
+    vault: &Path,
+    cwd: &Path,
+    env_names: &[String],
+    command: &[String],
+    payload: &ExecuteAuthorizationPayload,
+) -> std::result::Result<(), (String, String)> {
+    if payload.expires_at <= Utc::now() {
+        return Err((
+            "execute_authorization_expired".to_string(),
+            "execution authorization expired".to_string(),
+        ));
+    }
+    if payload.project != project
+        || !same_vault_path(&payload.vault, vault)
+        || !same_vault_path(&payload.cwd, cwd)
+        || payload.env_names != env_names
+        || payload.command != command
+    {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "execution authorization does not match requested command/env scope".to_string(),
+        ));
+    }
+    if payload.nonce.trim().is_empty() {
+        return Err((
+            "execute_authorization_invalid".to_string(),
+            "execution authorization nonce is empty".to_string(),
+        ));
+    }
+    let nonce_key = format!("{}:{}", payload.project, payload.nonce);
+    if state.execute_nonces.contains_key(&nonce_key) {
+        return Err((
+            "execute_authorization_replayed".to_string(),
+            "execution authorization nonce was already used".to_string(),
+        ));
+    }
+    state.execute_nonces.insert(nonce_key, payload.expires_at);
+    Ok(())
+}
+
+fn validate_list_keys_authorization(
+    state: &Arc<Mutex<BrokerState>>,
+    authorization: &ListKeysAuthorization,
+) -> std::result::Result<(), (String, String)> {
+    match authorization {
+        ListKeysAuthorization::Human { shell_pid } => {
+            let mut state = state.lock().expect("broker state poisoned");
+            cleanup_inactive_human_sessions(&mut state);
+            validate_human_session(&state, *shell_pid)
+                .map_err(|message| ("human_session_required".to_string(), message))
+        }
+        ListKeysAuthorization::Internal { purpose } => {
+            if purpose.trim().is_empty() {
+                Err((
+                    "list_keys_authorization_required".to_string(),
+                    "list keys authorization purpose is required".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+fn validate_signing_payload(
+    project: &str,
+    payload: &ApprovalReceiptPayload,
+) -> std::result::Result<(), String> {
+    if payload.schema_version != 1 {
+        return Err("unsupported approval receipt payload schema".to_string());
+    }
+    if payload.project != project {
+        return Err("approval receipt project does not match broker request".to_string());
+    }
+    if payload.command_hash.trim().is_empty() {
+        return Err("approval receipt command hash is required".to_string());
+    }
+    if payload.approved_env.is_empty() && payload.requested_env.is_empty() {
+        return Err("approval receipt env scope is required".to_string());
+    }
+    Ok(())
+}
+
+fn cleanup_expired_execute_nonces(state: &mut BrokerState) {
+    let now = Utc::now();
+    state
+        .execute_nonces
+        .retain(|_, expires_at| *expires_at > now);
+}
+
+#[cfg(test)]
+static TEST_TRUSTED_CLIENT_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+#[cfg(test)]
+fn require_trusted_client(_stream: &UnixStream) -> std::result::Result<(), String> {
+    if TEST_TRUSTED_CLIENT_ALLOWED.load(Ordering::SeqCst) {
+        Ok(())
+    } else {
+        Err("broker client process is not trusted".to_string())
+    }
+}
+
+#[cfg(not(test))]
+fn require_trusted_client(stream: &UnixStream) -> std::result::Result<(), String> {
+    let peer_pid = peer_pid(stream).map_err(|error| error.to_string())?;
+    let peer_path = peer_executable_path(peer_pid).map_err(|error| error.to_string())?;
+    let current_path = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve broker executable: {error}"))?;
+    let peer_path = peer_path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize peer executable: {error}"))?;
+    let current_path = current_path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize broker executable: {error}"))?;
+    if peer_path != current_path {
+        return Err(format!(
+            "broker client executable mismatch: {}",
+            peer_path.display()
+        ));
+    }
+    let peer_hash = executable_hash(&peer_path)
+        .map_err(|error| format!("failed to hash peer executable: {error}"))?;
+    let current_hash = executable_hash(&current_path)
+        .map_err(|error| format!("failed to hash broker executable: {error}"))?;
+    if peer_hash != current_hash {
+        return Err("broker client executable hash mismatch".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    let fd = stream.as_raw_fd();
+    let mut credentials = std::mem::MaybeUninit::<libc::ucred>::uninit();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: getsockopt writes a libc::ucred into the provided buffer for a valid Unix socket fd.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            credentials.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read peer credentials");
+    }
+    // SAFETY: getsockopt succeeded and initialized the credentials buffer.
+    let credentials = unsafe { credentials.assume_init() };
+    u32::try_from(credentials.pid).context("peer pid is invalid")
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    let fd = stream.as_raw_fd();
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: getsockopt writes a pid_t into the provided buffer for a valid Unix socket fd.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to read peer pid");
+    }
+    u32::try_from(pid).context("peer pid is invalid")
+}
+
+#[cfg(all(not(test), not(any(target_os = "linux", target_os = "macos"))))]
+fn peer_pid(_stream: &UnixStream) -> Result<u32> {
+    anyhow::bail!("broker peer authentication is unsupported on this platform")
+}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn peer_executable_path(pid: u32) -> Result<PathBuf> {
+    fs::read_link(format!("/proc/{pid}/exe")).context("failed to resolve peer executable")
+}
+
+#[cfg(all(not(test), target_os = "macos"))]
+fn peer_executable_path(pid: u32) -> Result<PathBuf> {
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most the provided buffer length for the target pid.
+    let len = unsafe {
+        libc::proc_pidpath(
+            i32::try_from(pid).context("peer pid is too large")?,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+        )
+    };
+    if len <= 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to resolve peer executable");
+    }
+    buffer.truncate(len as usize);
+    Ok(PathBuf::from(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+#[cfg(all(not(test), not(any(target_os = "linux", target_os = "macos"))))]
+fn peer_executable_path(_pid: u32) -> Result<PathBuf> {
+    anyhow::bail!("broker peer authentication is unsupported on this platform")
+}
+
+#[cfg(not(test))]
+fn executable_hash(path: &Path) -> Result<Vec<u8>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(Sha256::digest(bytes).to_vec())
 }
 
 fn register_human_command(
@@ -1609,8 +2035,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         home.path(),
         Vec::new(),
         vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
-        None,
-        None,
+        ExecuteAuthorization::Internal {
+            payload: ExecuteAuthorizationPayload::new(
+                "demo".to_string(),
+                home.path().join(".env.vault"),
+                home.path().to_path_buf(),
+                Vec::new(),
+                vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                ApprovalScope::Once,
+                ApprovalSource::ManualAllow,
+            ),
+        },
     )
     .is_err());
     assert!(wait_until_ready(StdDuration::from_millis(0)).is_err());
@@ -1727,6 +2162,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         ],
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+    let authorization = ExecuteAuthorization::Internal {
+        payload: ExecuteAuthorizationPayload::new(
+            "demo".to_string(),
+            vault_path.clone(),
+            home.path().to_path_buf(),
+            Vec::new(),
+            command.clone(),
+            ApprovalScope::Once,
+            ApprovalSource::ManualAllow,
+        ),
+    };
     let action = || {
         execute(
             "demo",
@@ -1734,8 +2180,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
             home.path(),
             Vec::new(),
             command,
-            None,
-            None,
+            authorization,
         )
     };
     let execute_result = with_fake_broker(responses, action)?;
@@ -1754,6 +2199,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         }],
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+    let authorization = ExecuteAuthorization::Internal {
+        payload: ExecuteAuthorizationPayload::new(
+            "demo".to_string(),
+            vault_path.clone(),
+            home.path().to_path_buf(),
+            Vec::new(),
+            command.clone(),
+            ApprovalScope::Once,
+            ApprovalSource::ManualAllow,
+        ),
+    };
     let action = || {
         execute(
             "demo",
@@ -1761,8 +2217,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
             home.path(),
             Vec::new(),
             command,
-            None,
-            None,
+            authorization,
         )
     };
     let execute_result = with_fake_broker(responses, action)?;
@@ -1774,6 +2229,17 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         vec![BrokerResponse::Ok],
     ];
     let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+    let authorization = ExecuteAuthorization::Internal {
+        payload: ExecuteAuthorizationPayload::new(
+            "demo".to_string(),
+            vault_path.clone(),
+            home.path().to_path_buf(),
+            Vec::new(),
+            command.clone(),
+            ApprovalScope::Once,
+            ApprovalSource::ManualAllow,
+        ),
+    };
     let action = || {
         execute(
             "demo",
@@ -1781,8 +2247,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
             home.path(),
             Vec::new(),
             command,
-            None,
-            None,
+            authorization,
         )
     };
     let execute_result = with_fake_broker(responses, action)?;
@@ -1835,6 +2300,68 @@ mod tests {
         let mut reader = BufReader::new(client);
         let response = read_response(&mut reader).unwrap();
         (stop, response)
+    }
+
+    struct TrustedClientGuard(bool);
+
+    impl Drop for TrustedClientGuard {
+        fn drop(&mut self) {
+            TEST_TRUSTED_CLIENT_ALLOWED.store(self.0, Ordering::SeqCst);
+        }
+    }
+
+    fn set_trusted_client_allowed(allowed: bool) -> TrustedClientGuard {
+        let previous = TEST_TRUSTED_CLIENT_ALLOWED.swap(allowed, Ordering::SeqCst);
+        TrustedClientGuard(previous)
+    }
+
+    fn test_execute_payload(
+        project: &str,
+        vault: &Path,
+        cwd: &Path,
+        env_names: Vec<String>,
+        command: Vec<String>,
+    ) -> ExecuteAuthorizationPayload {
+        ExecuteAuthorizationPayload::new(
+            project.to_string(),
+            vault.to_path_buf(),
+            cwd.to_path_buf(),
+            env_names,
+            command,
+            ApprovalScope::Once,
+            ApprovalSource::ManualAllow,
+        )
+    }
+
+    fn internal_authorization(
+        project: &str,
+        vault: &Path,
+        cwd: &Path,
+        env_names: Vec<String>,
+        command: Vec<String>,
+    ) -> ExecuteAuthorization {
+        ExecuteAuthorization::Internal {
+            payload: test_execute_payload(project, vault, cwd, env_names, command),
+        }
+    }
+
+    fn agent_authorization(
+        project: &str,
+        vault: &Path,
+        cwd: &Path,
+        env_names: Vec<String>,
+        command: Vec<String>,
+        agent: &str,
+    ) -> ExecuteAuthorization {
+        let mut payload = test_execute_payload(project, vault, cwd, env_names, command);
+        payload.agent = Some(agent.to_string());
+        payload.worktree = Some(cwd.to_path_buf());
+        payload.branch = Some("main".to_string());
+        payload.git_remote = Some(String::new());
+        payload.commit = Some("abc123".to_string());
+        let proof_payload = serde_json::to_string(&payload).unwrap();
+        let proof = agents::sign_payload(project, agent, &proof_payload).unwrap();
+        ExecuteAuthorization::Agent { proof }
     }
 
     fn test_vault(passphrase: &str) -> (tempfile::TempDir, PathBuf) {
@@ -2132,6 +2659,8 @@ mod tests {
             status_from_state(&state.lock().unwrap()).sessions[0].project,
             "demo"
         );
+        let cwd = std::env::current_dir().unwrap();
+        let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
 
         let (_, response) = broker_pair(
             BrokerRequest::Sign {
@@ -2181,12 +2710,17 @@ mod tests {
             BrokerRequest::Execute {
                 project: "expired".to_string(),
                 vault: vault_path.clone(),
-                cwd: std::env::current_dir().unwrap(),
+                cwd: cwd.clone(),
                 env_names: vec!["DATABASE_URL".to_string()],
-                command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                command: command.clone(),
                 inherited_env: inherited_execution_env(),
-                human_shell_pid: None,
-                agent_proof: None,
+                authorization: Some(internal_authorization(
+                    "expired",
+                    &vault_path,
+                    &cwd,
+                    vec!["DATABASE_URL".to_string()],
+                    command.clone(),
+                )),
             },
             Arc::clone(&state),
         );
@@ -2227,19 +2761,17 @@ mod tests {
         );
         assert!(matches!(response, BrokerResponse::Signed { .. }));
 
-        let proof = agents::sign_payload("demo", "codex", "payload").unwrap();
-        let mut bad_proof = proof.clone();
-        bad_proof.payload = "tampered".to_string();
         let (_, response) = broker_pair(
             BrokerRequest::Execute {
                 project: "demo".to_string(),
                 vault: vault_path.clone(),
-                cwd: std::env::current_dir().unwrap(),
+                cwd: cwd.clone(),
                 env_names: access.env.clone(),
-                command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                command: command.clone(),
                 inherited_env: inherited_execution_env(),
-                human_shell_pid: None,
-                agent_proof: Some(bad_proof),
+                authorization: Some(ExecuteAuthorization::Agent {
+                    proof: agents::sign_payload("demo", "codex", "tampered").unwrap(),
+                }),
             },
             Arc::clone(&state),
         );
@@ -2248,19 +2780,24 @@ mod tests {
             BrokerResponse::Error {
                 reason,
                 ..
-            } if reason == "agent_proof_invalid"
+            } if reason == "execute_authorization_invalid"
         ));
 
         let (_, response) = broker_pair(
             BrokerRequest::Execute {
                 project: "other".to_string(),
                 vault: vault_path.clone(),
-                cwd: std::env::current_dir().unwrap(),
+                cwd: cwd.clone(),
                 env_names: access.env.clone(),
-                command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                command: command.clone(),
                 inherited_env: inherited_execution_env(),
-                human_shell_pid: None,
-                agent_proof: None,
+                authorization: Some(internal_authorization(
+                    "other",
+                    &vault_path,
+                    &cwd,
+                    access.env.clone(),
+                    command.clone(),
+                )),
             },
             Arc::clone(&state),
         );
@@ -2276,12 +2813,17 @@ mod tests {
             BrokerRequest::Execute {
                 project: "demo".to_string(),
                 vault: vault_path.clone(),
-                cwd: std::env::current_dir().unwrap(),
+                cwd: cwd.clone(),
                 env_names: vec!["MISSING_ENV".to_string()],
-                command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                command: command.clone(),
                 inherited_env: inherited_execution_env(),
-                human_shell_pid: None,
-                agent_proof: None,
+                authorization: Some(internal_authorization(
+                    "demo",
+                    &vault_path,
+                    &cwd,
+                    vec!["MISSING_ENV".to_string()],
+                    command.clone(),
+                )),
             },
             Arc::clone(&state),
         );
@@ -2298,13 +2840,19 @@ mod tests {
             &mut client,
             &BrokerRequest::Execute {
                 project: "demo".to_string(),
-                vault: vault_path,
-                cwd: std::env::current_dir().unwrap(),
-                env_names: access.env,
-                command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: access.env.clone(),
+                command: command.clone(),
                 inherited_env: inherited_execution_env(),
-                human_shell_pid: None,
-                agent_proof: Some(proof),
+                authorization: Some(agent_authorization(
+                    "demo",
+                    &vault_path,
+                    &cwd,
+                    access.env,
+                    command,
+                    "codex",
+                )),
             },
         )
         .unwrap();
@@ -2312,6 +2860,203 @@ mod tests {
         let mut reader = BufReader::new(client);
         let finished = read_response(&mut reader).unwrap();
         assert!(matches!(finished, BrokerResponse::Finished { .. }));
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn privileged_broker_requests_require_trusted_client_and_bound_authorization() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let passphrase = "coverage passphrase";
+        let (_vault_dir, vault_path) = test_vault(passphrase);
+        let state = Arc::new(Mutex::new(BrokerState::default()));
+        let cwd = std::env::current_dir().unwrap();
+        let command = vec!["sh".to_string(), "-c".to_string(), "true".to_string()];
+        let env_names = vec!["DATABASE_URL".to_string()];
+
+        let (_, response) = broker_pair(
+            BrokerRequest::Unlock {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                passphrase: passphrase.to_string(),
+                ttl_seconds: 60,
+                mode: None,
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(response, BrokerResponse::Ok));
+
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: env_names.clone(),
+                command: command.clone(),
+                inherited_env: inherited_execution_env(),
+                authorization: None,
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "execute_authorization_required"
+        ));
+
+        let mut mismatched_payload = test_execute_payload(
+            "demo",
+            &vault_path,
+            &cwd,
+            vec!["CRON_SECRET".to_string()],
+            command.clone(),
+        );
+        mismatched_payload.agent = Some("codex".to_string());
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: env_names.clone(),
+                command: command.clone(),
+                inherited_env: inherited_execution_env(),
+                authorization: Some(ExecuteAuthorization::Internal {
+                    payload: mismatched_payload,
+                }),
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "execute_authorization_mismatch"
+        ));
+
+        let replay_authorization = internal_authorization(
+            "demo",
+            &vault_path,
+            &cwd,
+            env_names.clone(),
+            command.clone(),
+        );
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: env_names.clone(),
+                command: command.clone(),
+                inherited_env: inherited_execution_env(),
+                authorization: Some(replay_authorization.clone()),
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(response, BrokerResponse::Finished { .. }));
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: env_names.clone(),
+                command: command.clone(),
+                inherited_env: inherited_execution_env(),
+                authorization: Some(replay_authorization),
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "execute_authorization_replayed"
+        ));
+
+        let _guard = set_trusted_client_allowed(false);
+        let (_, response) = broker_pair(
+            BrokerRequest::ListKeys {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                authorization: ListKeysAuthorization::Internal {
+                    purpose: "test".to_string(),
+                },
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "broker_client_untrusted"
+        ));
+
+        let access = AccessRequest {
+            project: "demo".to_string(),
+            agent: Some("codex".to_string()),
+            branch: Some("main".to_string()),
+            action: Some("Coverage sign".to_string()),
+            command: "sh -c true".to_string(),
+            env: env_names.clone(),
+        };
+        let sign_payload = approval_receipts::build_payload(
+            &access,
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            &env_names,
+            ApprovalScope::Session,
+            None,
+            false,
+            Utc::now(),
+            String::new(),
+        );
+        let (_, response) = broker_pair(
+            BrokerRequest::Sign {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                payload: sign_payload,
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "broker_client_untrusted"
+        ));
+
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path,
+                cwd,
+                env_names: env_names.clone(),
+                command: command.clone(),
+                inherited_env: inherited_execution_env(),
+                authorization: Some(internal_authorization(
+                    "demo",
+                    Path::new(".env.vault"),
+                    Path::new("."),
+                    env_names,
+                    command,
+                )),
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "broker_client_untrusted"
+        ));
 
         std::env::remove_var("WARD_HOME");
     }

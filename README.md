@@ -215,13 +215,14 @@ Within that boundary, ward gives you hard guarantees:
 
 - **Vault rotation can move the vault to a derived filename.** The default vault file is `.env.vault`; `ward rotate` moves it to a passphrase-derived hidden filename and updates the registry and locked `.env` marker.
 - **Session encryption.** While an unlock session is active, the vault on disk is re-encrypted with a random ephemeral key held only in broker memory. Your passphrase-encrypted form does not exist on disk during an active session.
+- **Authenticated broker operations.** Session-backed broker calls that execute commands, enumerate vault keys, sign approvals, or set up new projects require a trusted Ward client process and request authorization bound to the exact operation. Raw socket clients cannot bypass Ward policy just because a session is unlocked.
 - **Recovery key.** A recovery key is stored locally and encrypted with the same vault passphrase. If a session is interrupted and the broker can't restore the vault automatically, ward can use the recovery file plus your passphrase to restore access. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct passphrase.
 - **Secrets are never written to disk in plaintext** during normal operation.
 - **Every secret injection is logged** with the requesting identity and scope.
 - **Approval grants are signed** — editing them invalidates them.
 - **Audit logs are hash-chained** — tampering is detectable.
 
-Ward operates at the workflow layer, not the OS level. The protection is effective as long as secret-bearing commands run through ward — agents cannot access secrets outside their approved scope, and every injection is logged and attributable.
+Ward operates at the workflow layer, not the OS level. The protection is effective as long as secret-bearing commands run through ward — agents cannot access secrets outside their approved scope, and every injection is logged and attributable. Ward is not a sandbox for arbitrary same-user malware, and agents should not be run inside human-mode terminals if you want agent-mode scoping guarantees.
 
 ---
 

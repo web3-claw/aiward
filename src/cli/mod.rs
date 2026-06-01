@@ -2626,9 +2626,14 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         }
         // Inject all vault keys automatically when no --env was specified.
         if options.env_names.is_empty() && options.profile.is_none() {
-            options.env_names = broker::list_vault_keys(&resolved.name, &resolved.vault).context(
-                "human mode requires an active broker session; run `ward human` or `ward unlock --ttl 8h`",
-            )?;
+            options.env_names = broker::list_vault_keys_for_human(
+                &resolved.name,
+                &resolved.vault,
+                crate::human::current_shell_pid(),
+            )
+            .context(
+                    "human mode requires an active broker session; run `ward human` or `ward unlock --ttl 8h`",
+                )?;
         }
     }
     let resolved_profile = resolve_run_profile(
@@ -2753,21 +2758,41 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
 
     consume_once_grant_if_reused(&decision)?;
 
+    let command_args = resolved_profile.command_args.clone();
+    let mut execute_payload = broker::ExecuteAuthorizationPayload::new(
+        resolved.name.clone(),
+        resolved.vault.clone(),
+        cwd.clone(),
+        decision.approved_env.clone(),
+        command_args.clone(),
+        decision.scope,
+        decision.source,
+    );
+    execute_payload.agent = access.agent.clone();
+    execute_payload.branch = access.branch.clone();
+    execute_payload.action = access.action.clone();
+    execute_payload.grant_id = grant_id;
+    execute_payload.approval_receipt_hash = approval_receipt_hash.clone();
+    if let Some(context) = verified_context.as_ref() {
+        execute_payload.worktree = Some(context.worktree.clone());
+        execute_payload.git_remote = Some(context.git_remote.clone());
+        execute_payload.commit = Some(context.commit.clone());
+    }
+
     let outcome = if options.no_prompt {
         let context = verified_context
             .as_ref()
             .expect("verified in no-prompt mode");
         let proof_payload =
-            serde_json::to_string(context).expect("verified context should serialize");
+            serde_json::to_string(&execute_payload).expect("execution payload should serialize");
         let proof = agents::sign_payload(&resolved.name, &context.agent, &proof_payload)?;
         match broker::execute(
             &resolved.name,
             &resolved.vault,
             &cwd,
             decision.approved_env.clone(),
-            resolved_profile.command_args,
-            None,
-            Some(proof),
+            command_args,
+            broker::ExecuteAuthorization::Agent { proof },
         ) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -2786,16 +2811,22 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
             &resolved.vault,
             &cwd,
             decision.approved_env.clone(),
-            resolved_profile.command_args.clone(),
+            command_args.clone(),
             if human_terminal {
-                Some(crate::human::current_shell_pid())
+                broker::ExecuteAuthorization::Human {
+                    shell_pid: crate::human::current_shell_pid(),
+                }
             } else {
-                None
+                broker::ExecuteAuthorization::Internal {
+                    payload: execute_payload,
+                }
             },
-            None,
         ) {
             Ok(outcome) => outcome,
             Err(broker_err) => {
+                if broker_execution_rejection_is_authoritative(&broker_err) {
+                    anyhow::bail!("broker rejected execution: {broker_err}");
+                }
                 // If an active unlock session exists but the broker isn't running,
                 // the vault may be session-encrypted. Direct decryption won't work.
                 let fallback_passphrase = match unlock::active_run_lookup(
@@ -2819,7 +2850,7 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
                     cwd: cwd.clone(),
                     vault: resolved.vault.clone(),
                     env_names: decision.approved_env.clone(),
-                    command: resolved_profile.command_args,
+                    command: command_args,
                     passphrase,
                     inherited_env: std::env::vars().collect(),
                     cancellation: None,
@@ -3003,6 +3034,14 @@ fn doctor() -> Result<()> {
                 Ok(status) if status.running => {
                     term::info(&format!("socket  {}", term::short_path(&status.socket)));
                     term::info(&format!("version  {}", status.version));
+                    if broker::privileged_rpc_peer_auth_supported() {
+                        term::ok(&format!(
+                            "privileged RPC peer auth  {}",
+                            broker::peer_auth_platform()
+                        ));
+                    } else {
+                        term::warn("privileged RPC peer auth unsupported — privileged broker calls fail closed");
+                    }
                     if let Some(pid) = status.pid {
                         match status.ppid {
                             Some(ppid) => term::info(&format!("pid={pid} ppid={ppid}")),
@@ -4634,6 +4673,26 @@ fn broker_vault_key_missing_envs(error: &anyhow::Error) -> Option<Vec<String>> {
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .collect(),
+    )
+}
+
+fn broker_execution_rejection_is_authoritative(error: &anyhow::Error) -> bool {
+    let Some(broker_error) = error.downcast_ref::<broker::BrokerError>() else {
+        return false;
+    };
+    matches!(
+        broker_error.reason(),
+        "agent_proof_invalid"
+            | "broker_client_untrusted"
+            | "execute_authorization_expired"
+            | "execute_authorization_invalid"
+            | "execute_authorization_mismatch"
+            | "execute_authorization_replayed"
+            | "execute_authorization_required"
+            | "human_session_required"
+            | "mode_confirmation_required"
+            | "mode_env_violation"
+            | "security_policy_violation"
     )
 }
 
