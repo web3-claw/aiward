@@ -46,12 +46,26 @@ NEXT_PUBLIC_API_URL=http://localhost:3000
 Run setup from the target project:
 
 ```bash
-ward init --project my-project
+ward setup --project my-project
 ```
 
-`ward init` is the recommended human entry point. When `.env` or
-`.env.vault` exists, it runs the full guided setup flow. `ward setup --yes`
-remains available for scripts.
+`ward setup` is the recommended human entry point. `ward init` remains
+available for bare config creation and delegates to setup when `.env` or
+`.env.vault` exists. `ward setup --yes` remains available for scripts.
+
+For monorepos and Turborepos, run Ward from the workspace root:
+
+```bash
+ward workspace discover
+ward setup
+```
+
+Ward detects app folders from `pnpm-workspace.yaml`, `package.json`
+`workspaces`, and `turbo.json`. Each app with a real `.env` can become a child
+project with its own `.ward.json`, vault, profiles, registry entry, dashboard
+row, and logs. Apps with only `.env.example` are reported as `needsEnv`; Ward
+uses those example files for env-name awareness but does not create an empty
+vault until real local env values exist.
 
 The setup flow:
 

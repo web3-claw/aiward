@@ -191,6 +191,25 @@ Registry data lives in:
 ~/.ward/registry.json
 ```
 
+### Monorepo and Turborepo Workspaces
+
+Ward detects workspace apps from `pnpm-workspace.yaml`, `package.json`
+`workspaces`, and `turbo.json`. From a workspace root, Ward can show every
+detected app/package and configure app folders as child Ward projects with
+their own `.ward.json`, vault, profiles, registry entry, and logs.
+
+Child project names use `<workspace>:<app>`, for example:
+
+```txt
+cms-core:core-workbench
+cms-core:creativestudio
+```
+
+Workspace discovery never reads plaintext secret values. It reads package
+metadata, env file presence, and env names from `.env.example`. Apps with a
+real `.env` can be configured immediately. Apps with only `.env.example` are
+reported as `needsEnv` until real local env values exist.
+
 ### Profiles
 
 Profiles live in `.ward.json` and provide short safe commands such as:
@@ -365,14 +384,15 @@ encrypted alert count
 
 ```bash
 cargo install aiward
-ward init --project my-project
-ward recovery create
+ward setup
 ward recovery export
 ward doctor
 ```
 
-`ward init` creates the initial run unlock session by default. The initial
-session-encrypted vault is ready immediately after setup.
+`ward setup` imports `.env`, creates profile policy, creates the recovery key,
+offers a backup export, registers the project, and creates the initial run
+unlock session by default. The initial session-encrypted vault is ready
+immediately after setup.
 
 ---
 
@@ -384,6 +404,8 @@ Initialize, import, register, and create profile-based onboarding in one flow.
 
 ```bash
 ward setup --yes --project my-project
+ward setup --workspace --all
+ward setup --workspace --app core-workbench
 ```
 
 Options:
@@ -399,7 +421,16 @@ Options:
 --remove-plaintext    deprecated; remove source after import
 --unlock-ttl <ttl>    initial run unlock TTL, default 8h
 --no-unlock           skip initial run unlock creation
+--workspace           force workspace/monorepo setup from this root
+--app <name>          configure one detected workspace app
+--all                 configure all detected workspace apps with .env files
 ```
+
+With default inputs, `ward setup` auto-detects monorepos and Turborepos and
+routes to workspace setup when app folders are found. It prints detected apps,
+their env-file status, setup status, and `.env.example` env-name count. Apps
+without a plaintext `.env` are skipped instead of creating empty unusable
+vaults.
 
 ### `ward rotate`
 
@@ -534,12 +565,44 @@ profile name, command, action, default scope, and env names only. Adding a
 project from the dashboard requires an active unlock/human session; Ward reuses
 that broker-held passphrase for setup without sending it to the browser.
 
-### `ward rotate`
+### `ward workspace discover`
 
-Rotate vault to a new derived filename with a fresh nonce.
+Discover apps and packages in the current monorepo workspace.
 
 ```bash
-ward rotate
+ward workspace discover
+ward workspace discover --json
+```
+
+Discovery reports package name, slug, suggested child project name, relative
+path, app/package classification, env-file status, setup status, `.env.example`
+env names, and package scripts. It does not display plaintext secret values.
+
+### `ward human` and `ward shell-init`
+
+Activate human mode for the current terminal and print shell integration code.
+
+```bash
+ward human
+ward human --ttl 8h
+eval "$(ward shell-init)"
+```
+
+When human mode is active, wrapped commands in a Ward project route through
+`ward run -- <command>` and receive all vault keys for that human terminal.
+If the same wrapped command runs inside a Ward project without an active
+guardian for that terminal, the wrapper exits before starting the child command.
+
+### `ward modes list / push / status`
+
+Manage optional session mode envelopes.
+
+```bash
+ward modes list
+ward modes push
+ward modes push --global
+ward modes push --project my-project
+ward modes status
 ```
 
 ### `ward env list / set / unset / unlock / lock / export`
@@ -584,6 +647,7 @@ ward grants prune
 
 ```bash
 ward logs view executions
+ward logs unlock --ttl 15m
 ward logs verify
 ward logs verify --full
 ward logs export executions --output executions.jsonl

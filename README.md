@@ -43,9 +43,22 @@ Ward will walk you through:
 - Encrypting your `.env`
 - Creating a vault passphrase
 - Creating a recovery key with the same passphrase
+- Detecting workspace apps when the project is a monorepo
 - Wiring up your shell
 
 Your plaintext `.env` is replaced with a locked marker file — secrets live in the encrypted vault from this point on.
+
+For monorepos and Turborepos, run setup from the workspace root. Ward detects
+workspace apps from `pnpm-workspace.yaml`, `package.json` workspaces, and
+`turbo.json`, then configures each app that has its own `.env` as a child
+project. Apps with only `.env.example` are shown as `needsEnv` until a real
+`.env` is available.
+
+```bash
+ward workspace discover --json
+ward setup --workspace --app core-workbench
+ward setup --workspace --all
+```
 
 ---
 
@@ -59,7 +72,7 @@ Human mode turns your current terminal into a ward-protected session. Once activ
 ward human
 ```
 
-Ward spawns a guardian tied to your terminal. When you run `pnpm dev`, `node`, or any other command that needs secrets, ward intercepts it, injects the approved env vars, and lets the process run.
+Ward spawns a guardian tied to your terminal. When you run `pnpm dev`, `node`, or any other command that needs secrets, ward intercepts it, injects the approved env vars, and lets the process run. Inside a Ward project, wrapped commands fail closed if human mode is not active for that terminal, so a dev server does not silently start without secrets.
 
 **Shell integration** (add to `~/.zshrc` for automatic loading):
 
@@ -134,13 +147,31 @@ ward env export --output .env.plain  # write plaintext for manual use
 
 ---
 
+## Dashboard
+
+The browser dashboard is a standalone localhost service for inspecting local
+Ward projects, profile env-name policies, runtime state, and encrypted logs.
+
+```bash
+ward dashboard start
+ward dashboard status
+ward dashboard stop --all
+ward dashboard tui
+```
+
+The dashboard never displays or edits secret values. It can add/register
+projects and edit profile policies by env name only. Monorepo app projects
+appear alongside regular projects once detected or configured.
+
+---
+
 ## Audit logs
 
 Every secret-bearing execution is logged locally, encrypted, and hash-chained:
 
 ```bash
 ward logs view executions   # see what ran
-ward logs view grants       # see what was approved
+ward logs view approvals    # see what was approved
 ward logs verify            # verify log integrity
 ```
 

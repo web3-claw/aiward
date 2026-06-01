@@ -286,6 +286,7 @@ pub enum Commands {
     /// Safely edit the encrypted env vault.
     Edit,
     /// Create a short-lived run unlock session.
+    #[command(visible_alias = "resume")]
     Unlock {
         #[arg(long, default_value = "8h")]
         ttl: String,

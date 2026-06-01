@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
-    config, env_file, fs_util, logs, modes, recovery, registry,
+    config, detection, env_file, fs_util, logs, modes, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     vault,
 };
@@ -610,6 +610,8 @@ pub fn serve() -> Result<()> {
     cleanup_stale_files()?;
     fs_util::ensure_private_dir(&run_dir())?;
     let listener = UnixListener::bind(socket_path()).context("failed to bind Ward broker")?;
+    fs_util::set_private_file_permissions(&socket_path())
+        .context("failed to restrict broker socket permissions")?;
     fs_util::write_private_file(&pid_path(), std::process::id().to_string().as_bytes())?;
     let state = Arc::new(Mutex::new(BrokerState::default()));
     install_shutdown_handler(Arc::clone(&state));
@@ -939,6 +941,28 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     write_response(&mut stream, &response)?;
                     return Ok(false);
                 }
+            }
+
+            // Block commands with critical security findings regardless of caller.
+            // Policy prompts live in the CLI but this last-resort check runs in the broker
+            // so that raw-socket callers cannot bypass exfiltration detection.
+            let cmd_str = command.join(" ");
+            let security_findings = detection::preflight_findings(&cmd_str, &env_names, None);
+            if detection::has_critical_findings(&security_findings) {
+                let codes: Vec<&str> = security_findings
+                    .iter()
+                    .filter(|f| f.severity == detection::Severity::Critical)
+                    .map(|f| f.code.as_str())
+                    .collect();
+                let response = broker_error(
+                    "security_policy_violation",
+                    format!(
+                        "command blocked by security policy: {}",
+                        codes.join(", ")
+                    ),
+                );
+                write_response(&mut stream, &response)?;
+                return Ok(false);
             }
 
             let output = Arc::new(Mutex::new(stream.try_clone()?));

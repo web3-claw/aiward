@@ -44,7 +44,7 @@ Ward is not a shell monitor. It protects the explicit Ward path.
 ```mermaid
 flowchart TD
     A["Start with project .env"] --> B["cargo install aiward"]
-    B --> C["ward init --project my-app"]
+    B --> C["ward setup --project my-app"]
     C --> D["Create .ward.json"]
     C --> E["Encrypt .env into .env.vault"]
     C --> F["Create .env.example"]
@@ -52,15 +52,17 @@ flowchart TD
     C --> H["Generate AGENTS.md or CLAUDE.md"]
     C --> I["Replace .env with locked marker"]
     C --> J["Create initial run unlock session"]
+    C --> M["Create recovery key"]
     I --> K["ward doctor"]
     J --> K
+    M --> K
     K --> L["Ready for agent-safe local development"]
 
     classDef command fill:#dbeafe,stroke:#1d4ed8,color:#111827;
     classDef file fill:#fef3c7,stroke:#b45309,color:#111827;
     classDef done fill:#dcfce7,stroke:#15803d,color:#111827;
     class B,C,J,K command;
-    class D,E,F,G,H,I file;
+    class D,E,F,G,H,I,M file;
     class L done;
 ```
 
@@ -68,7 +70,7 @@ Command version:
 
 ```bash
 cargo install aiward
-ward init --project my-app
+ward setup --project my-app
 ward doctor
 ```
 
@@ -356,7 +358,11 @@ OS user.
 | Goal | Command |
 | --- | --- |
 | Install | `cargo install aiward` |
-| One-command onboarding | `ward init --project my-app` |
+| One-command onboarding | `ward setup --project my-app` |
+| Discover monorepo apps | `ward workspace discover` |
+| Configure all workspace apps with `.env` | `ward setup --workspace --all` |
+| Start human mode | `ward human` |
+| Start browser dashboard | `ward dashboard start` |
 | Check project safety | `ward doctor` |
 | Refresh vault unlock for runs | `ward unlock --ttl 8h` |
 | Lock session grants and unlocks | `ward lock` |
@@ -377,6 +383,7 @@ OS user.
 | Show log paths | `ward logs` |
 | View encrypted logs | `ward logs view executions` |
 | Verify log chain | `ward logs verify` |
+| Export recovery backup | `ward recovery export` |
 | Remove Ward from project | `ward teardown --yes` |
 
 ## Short Talk Track

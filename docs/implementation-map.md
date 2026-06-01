@@ -37,6 +37,7 @@ src/
   anomaly/      Passive grant-use anomaly alerts
   dashboard/    Terminal log dashboard
   webui/        Standalone browser dashboard lifecycle, APIs, profile policy, setup UI
+  workspace/    Monorepo/turborepo discovery and child app project classification
   logs/         Encrypted hash-chained audit logging, recovery_dir path
   git_context/  Safe git identity and repository metadata
 ```
@@ -76,6 +77,8 @@ src/
 | Broker | `execute` | Ask the broker to run approved commands with scoped env injection and redacted output streaming. |
 | Context | `verify_no_prompt_context` | Verify agent-provided worktree, branch, remote, commit, and canonical path before no-prompt execution. |
 | Worktrees | `evaluate_worktree` | Auto-bind only trusted verified worktrees or create pending worktree approvals. |
+| Workspace | `discover` | Detect workspace apps/packages from pnpm workspaces, package workspaces, and turbo metadata without reading secret values. |
+| Workspace | `selected_apps` | Resolve `--app`/`--all` selections to setup-capable child app projects. |
 | Agents | `ensure_agent` | Create or load per-project agent identity records. |
 | Detection | `preflight_findings` | Flag suspicious requested env/command/action combinations, including critical secret-exfiltration patterns. |
 | Anomaly | `detect_grant_anomalies` | Emit warning-only grant frequency, outside-hours, and branch-spread alerts. |
@@ -88,7 +91,7 @@ src/
 ### 1. Small onboarding setup
 
 ```txt
-User runs ward init
+User runs ward setup, or ward init in a project that already has .env/.env.vault
   -> create .ward.json with random vault_nonce and storage_mode
   -> generate dev and migrate profiles with vault-present exact env names
   -> import .env into the configured vault path, or create an empty vault
@@ -117,6 +120,25 @@ User runs ward recovery restore
 ```
 
 `ward setup --yes` runs the same recommended flow for scripts.
+
+### 1b. Monorepo and Turborepo setup
+
+```txt
+User runs ward setup from a workspace root
+  -> detect pnpm-workspace.yaml, package.json workspaces, or turbo.json
+  -> list app/package candidates and env-name counts from .env.example
+  -> classify apps with .env as setup-capable
+  -> skip .env.example-only apps as needsEnv
+  -> for each selected app, create child project <workspace>:<app>
+  -> run the normal setup/import/lock/register flow in the app directory
+  -> app-local profiles use app commands such as pnpm dev
+  -> dashboard and logs show each configured child app as a separate project
+
+User runs ward workspace discover --json
+  -> return workspace root, package manager, turborepo flag, package metadata,
+     suggested project names, env-file status, setup status, and env example names
+  -> never return plaintext secret values
+```
 
 ### 2. Import existing .env
 
@@ -288,9 +310,8 @@ User runs ward teardown --yes
 `ward teardown --yes --restore-env` is the explicit opt-in for restoring
 plaintext `.env`.
 
-## Next implementation priorities
+## Future implementation priorities
 
-1. Integrate recovery creation into the `ward setup` wizard flow.
-2. Cloud backup for recovery key (optional, cloud infra layer).
-3. Add richer profile templates for common frameworks.
-4. Team vault support with individual logs and org policy (commercial layer).
+1. Cloud backup for recovery key (optional, cloud infra layer).
+2. Add richer profile templates for common frameworks.
+3. Team vault support with individual logs and org policy (commercial layer).

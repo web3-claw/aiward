@@ -23,10 +23,10 @@ Tie human-mode child processes to the guardian lifecycle:
 - Run each child in a process group that Ward can terminate as a unit.
 - When TTL expires, `ward lock` runs, the guardian receives shutdown, or the
   main shell PID disappears, terminate active human-mode child process groups.
-- Stop the web dashboard with the guardian so ports like `7777` do not stay
-  open after the session ends.
-- Clean stale guardian sockets, ready markers, broker sessions, and dashboard
-  listeners during `ward human`, `ward lock`, and broker startup.
+- Keep the browser dashboard lifecycle separate from human mode. Use
+  `ward dashboard stop --all` to stop standalone dashboard instances.
+- Clean stale guardian sockets, ready markers, and broker sessions during
+  `ward human`, `ward lock`, and broker startup.
 
-This prevents orphaned dev servers and dashboard listeners from previous human
-mode sessions.
+This prevents orphaned dev servers from previous human mode sessions while
+leaving standalone dashboard instances under explicit dashboard commands.

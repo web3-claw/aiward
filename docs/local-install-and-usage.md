@@ -60,30 +60,53 @@ NEXT_PUBLIC_API_URL=http://localhost:3000
 EOF
 ```
 
-Run guided init:
+Run guided setup:
 
 ```bash
-ward init --project demo
+ward setup --project demo
 ```
 
 Ward will:
 - Create `.ward.json` with your project config and a random vault nonce
-- Import `.env` into an encrypted vault file with a derived filename
+- Import `.env` into an encrypted vault file
 - Verify the vault can decrypt
 - Replace plaintext `.env` with a locked marker
 - Create the initial run unlock session (session-encrypts the vault)
+- Create a recovery key with the same vault passphrase
 - Register the project globally
 - Update `.gitignore` to include `.env`, `.env.*`, and `.ward.json`
 - Write profile-based agent instructions to `AGENTS.md`
 
-The vault has no fixed name — its filename is derived from your passphrase and
-a random nonce. You don't need to remember it; ward resolves it automatically.
+Setup uses `.env.vault` by default. After `ward rotate`, the vault moves to a
+passphrase-derived hidden filename. You don't need to remember the rotated path;
+Ward resolves it automatically.
 
 For non-interactive scripted setup:
 
 ```bash
 ward setup --yes --project demo
 ```
+
+## Monorepo and Turborepo Setup
+
+Run Ward from the workspace root. The setup wizard detects `pnpm-workspace.yaml`,
+`package.json` workspaces, and `turbo.json`.
+
+```bash
+ward workspace discover
+ward setup
+```
+
+Detected app folders with a real `.env` can be configured as child projects:
+
+```bash
+ward setup --workspace --app core-workbench
+ward setup --workspace --all
+```
+
+Each configured app gets its own `.ward.json`, vault, profiles, registry entry,
+dashboard row, and project logs. Apps with only `.env.example` are listed as
+`needsEnv`; add a real local `.env` before configuring them.
 
 Check the setup:
 
@@ -174,7 +197,10 @@ filename exposure or as part of regular key hygiene.
 ## Human Mode
 
 Human mode turns your terminal into a ward-protected session. Secret-bearing
-commands go through ward automatically.
+commands go through ward automatically and receive all vault keys for that
+terminal. Inside a Ward project, wrapped commands fail closed if the guardian
+is not active, so a command like `pnpm dev` does not silently start without
+secrets.
 
 ```bash
 ward human
