@@ -377,6 +377,133 @@ fn setup_profiles_only_include_vault_present_database_key() {
     );
 }
 
+fn write_monorepo_fixture(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"cms-core","packageManager":"pnpm@9.15.9"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - \"apps/*\"\n  - \"packages/*\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("turbo.json"), "{}").unwrap();
+
+    for (dir, package, has_env) in [
+        ("apps/ambienta", "@cms-app/ambienta", false),
+        ("apps/core-workbench", "@cms-app/core-workbench", true),
+        ("apps/creativestudio", "@cms-app/creativestudio", true),
+    ] {
+        let path = root.join(dir);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("package.json"),
+            format!(r#"{{"name":"{package}","scripts":{{"dev":"next dev","payload":"payload"}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            path.join(".env.example"),
+            "DATABASE_URI=\nPAYLOAD_SECRET=\n",
+        )
+        .unwrap();
+        if has_env {
+            std::fs::write(
+                path.join(".env"),
+                "DATABASE_URI=mongodb://local\nPAYLOAD_SECRET=payload\n",
+            )
+            .unwrap();
+        }
+    }
+
+    let package = root.join("packages/cms-core");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"@cms-core/platform","scripts":{"build":"tsc"}}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn workspace_discover_lists_monorepo_apps_without_configuring_libraries() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    let output = Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .args(["workspace", "discover", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).unwrap();
+    let packages = json["packages"].as_array().unwrap();
+    let app_slugs = packages
+        .iter()
+        .filter(|package| package["appCandidate"].as_bool().unwrap())
+        .map(|package| package["slug"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        app_slugs,
+        vec!["ambienta", "core-workbench", "creativestudio"]
+    );
+    assert!(packages.iter().any(|package| {
+        package["slug"] == "platform" && package["appCandidate"] == serde_json::json!(false)
+    }));
+    assert!(packages
+        .iter()
+        .any(|package| { package["slug"] == "ambienta" && package["setupStatus"] == "needsEnv" }));
+}
+
+#[test]
+fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--workspace", "--app", "core-workbench"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cms-core:core-workbench"));
+
+    let app = root.path().join("apps/core-workbench");
+    assert!(app.join(".ward.json").exists());
+    assert!(app.join(".env.vault").exists());
+    assert!(!root.path().join("apps/creativestudio/.ward.json").exists());
+    let locked_env = std::fs::read_to_string(app.join(".env")).unwrap();
+    assert!(locked_env.contains("Ward managed locked .env"));
+    assert!(!locked_env.contains("mongodb://local"));
+
+    let config: Value =
+        serde_json::from_str(&std::fs::read_to_string(app.join(".ward.json")).unwrap()).unwrap();
+    assert_eq!(config["project"], "cms-core:core-workbench");
+    assert_eq!(config["profiles"]["dev"]["command"], "pnpm dev");
+    assert_eq!(
+        config["profiles"]["dev"]["env"],
+        serde_json::json!(["DATABASE_URI", "PAYLOAD_SECRET"])
+    );
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(&app)
+        .env("WARD_HOME", home.path())
+        .args(["projects", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Project: cms-core:core-workbench"));
+}
+
 #[test]
 fn rotate_moves_active_session_vault_to_derived_path_and_keeps_env_available() {
     let fixture = TestProject::new();
@@ -3573,6 +3700,9 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             keep_plaintext: true,
             unlock_ttl: "8h".to_string(),
             no_unlock: false,
+            workspace: false,
+            apps: Vec::new(),
+            all: false,
         },
     })
     .unwrap();
@@ -3598,6 +3728,9 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             keep_plaintext: false,
             unlock_ttl: "8h".to_string(),
             no_unlock: true,
+            workspace: false,
+            apps: Vec::new(),
+            all: false,
         },
     })
     .unwrap();

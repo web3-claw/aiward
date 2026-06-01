@@ -1108,7 +1108,7 @@ fn sign_with_session(
     approval_receipts::sign_payload(payload, &signing_key)
 }
 
-fn setup_project_with_passphrase(
+pub(crate) fn setup_project_with_passphrase(
     target_path: &Path,
     project: Option<&str>,
     passphrase: &str,

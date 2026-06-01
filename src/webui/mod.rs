@@ -28,6 +28,7 @@ use crate::{
     fs_util, human,
     logs::{self, LogKind},
     registry::{self, RegisteredProject},
+    workspace,
 };
 
 const DEFAULT_PORT: u16 = 7777;
@@ -104,6 +105,12 @@ struct ProjectView {
     vault: PathBuf,
     active: bool,
     config_status: String,
+    setup_status: String,
+    setup_available: bool,
+    workspace_root: Option<PathBuf>,
+    parent_project: Option<String>,
+    package_name: Option<String>,
+    package_kind: Option<String>,
     profiles: Vec<ProfileView>,
     env_names: Vec<String>,
     vault_keys_verified: bool,
@@ -925,7 +932,7 @@ fn dashboard_status() -> Result<DashboardStatus> {
 fn dashboard_projects() -> Result<Vec<ProjectView>> {
     let registry = registry::list_projects()?;
     let broker_status = broker::status().ok();
-    registry
+    let mut projects = registry
         .projects
         .iter()
         .map(|(name, project)| {
@@ -936,7 +943,15 @@ fn dashboard_projects() -> Result<Vec<ProjectView>> {
                 broker_status.as_ref(),
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    append_discovered_workspace_apps(&mut projects, &registry, broker_status.as_ref())?;
+    projects.sort_by(|left, right| {
+        left.workspace_root
+            .cmp(&right.workspace_root)
+            .then_with(|| left.parent_project.cmp(&right.parent_project))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok(projects)
 }
 
 fn project_view(
@@ -989,11 +1004,123 @@ fn project_view(
         vault: project.vault.clone(),
         active: active_project == Some(name),
         config_status,
+        setup_status: "configured".to_string(),
+        setup_available: false,
+        workspace_root: None,
+        parent_project: None,
+        package_name: None,
+        package_kind: None,
         profiles,
         env_names: env_names.into_iter().collect(),
         vault_keys_verified,
         broker_session_active,
     })
+}
+
+fn append_discovered_workspace_apps(
+    projects: &mut Vec<ProjectView>,
+    registry: &registry::Registry,
+    broker_status: Option<&broker::BrokerStatus>,
+) -> Result<()> {
+    let mut known_paths = projects
+        .iter()
+        .map(|project| canonical_or_self(&project.path))
+        .collect::<BTreeSet<_>>();
+    let known_names = projects
+        .iter()
+        .map(|project| project.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    for (root_project_name, registered) in &registry.projects {
+        let Some(discovery) = workspace::discover(&registered.path)? else {
+            continue;
+        };
+        for package in discovery.app_candidates() {
+            let canonical_path = canonical_or_self(&package.path);
+            if known_paths.contains(&canonical_path) || known_names.contains(&package.project_name)
+            {
+                continue;
+            }
+            known_paths.insert(canonical_path);
+            projects.push(discovered_project_view(
+                root_project_name,
+                package,
+                registry.active_project.as_deref(),
+                broker_status,
+            )?);
+        }
+    }
+    Ok(())
+}
+
+fn discovered_project_view(
+    parent_project: &str,
+    package: &workspace::WorkspacePackage,
+    active_project: Option<&str>,
+    broker_status: Option<&broker::BrokerStatus>,
+) -> Result<ProjectView> {
+    let mut env_names = BTreeSet::new();
+    env_names.extend(package.env_example_keys.iter().cloned());
+    let config_status = match package.setup_status {
+        workspace::WorkspaceSetupStatus::Configured => "ok".to_string(),
+        workspace::WorkspaceSetupStatus::NeedsEnv => "needs env".to_string(),
+        workspace::WorkspaceSetupStatus::NotConfigured => "not configured".to_string(),
+    };
+    let broker_session_active = broker_status
+        .map(|status| {
+            status.sessions.iter().any(|session| {
+                session.project == package.project_name
+                    && same_path(
+                        &session.vault,
+                        &package.path.join(config::DEFAULT_VAULT_FILE),
+                    )
+            })
+        })
+        .unwrap_or(false);
+
+    Ok(ProjectView {
+        name: package.project_name.clone(),
+        path: package.path.clone(),
+        vault: package.path.join(config::DEFAULT_VAULT_FILE),
+        active: active_project == Some(package.project_name.as_str()),
+        config_status,
+        setup_status: workspace_setup_status_label(&package.setup_status).to_string(),
+        setup_available: package.can_setup(),
+        workspace_root: Some(
+            package
+                .path
+                .parent()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| package.path.clone()),
+        ),
+        parent_project: Some(parent_project.to_string()),
+        package_name: package.name.clone(),
+        package_kind: Some(workspace_package_kind_label(&package.package_kind).to_string()),
+        profiles: Vec::new(),
+        env_names: env_names.into_iter().collect(),
+        vault_keys_verified: false,
+        broker_session_active,
+    })
+}
+
+fn workspace_setup_status_label(status: &workspace::WorkspaceSetupStatus) -> &'static str {
+    match status {
+        workspace::WorkspaceSetupStatus::Configured => "configured",
+        workspace::WorkspaceSetupStatus::NeedsEnv => "needsEnv",
+        workspace::WorkspaceSetupStatus::NotConfigured => "notConfigured",
+    }
+}
+
+fn workspace_package_kind_label(kind: &workspace::WorkspacePackageKind) -> &'static str {
+    match kind {
+        workspace::WorkspacePackageKind::App => "app",
+        workspace::WorkspacePackageKind::Package => "package",
+    }
+}
+
+fn canonical_or_self(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn collect_profile_env(profile: &ProfileConfig, names: &mut BTreeSet<String>) {
@@ -1082,13 +1209,11 @@ fn nested_str<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 
 fn project_for_path(path: &str, projects: &BTreeMap<String, RegisteredProject>) -> Option<String> {
     let candidate = Path::new(path);
-    projects.iter().find_map(|(name, project)| {
-        if candidate.starts_with(&project.path) {
-            Some(name.clone())
-        } else {
-            None
-        }
-    })
+    projects
+        .iter()
+        .filter(|(_, project)| candidate.starts_with(&project.path))
+        .max_by_key(|(_, project)| project.path.components().count())
+        .map(|(name, _)| name.clone())
 }
 
 fn scrub_sensitive_fields(value: &mut Value) {
@@ -1834,6 +1959,9 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("data-kind=\"execution\""));
         assert!(DASHBOARD_HTML.contains("profile policies"));
         assert!(DASHBOARD_HTML.contains("dropdown-button"));
+        assert!(DASHBOARD_HTML.contains("splitter"));
+        assert!(DASHBOARD_HTML.contains("openProjectLogs"));
+        assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
         assert!(!DASHBOARD_HTML.contains("<select"));
     }
 
@@ -1940,6 +2068,69 @@ mod tests {
 
         let deleted = delete_profile_policy("demo", "prod").unwrap();
         assert!(deleted.profiles.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn dashboard_projects_include_detected_workspace_apps_without_secret_values() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"cms-core","packageManager":"pnpm@9.15.9"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - \"apps/*\"\n  - \"packages/*\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("turbo.json"), "{}").unwrap();
+        let app = root.path().join("apps/ambienta");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"name":"@cms-app/ambienta","scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        std::fs::write(app.join(".env.example"), "PAYLOAD_SECRET=\nDATABASE_URI=\n").unwrap();
+        let lib = root.path().join("packages/cms-core");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(
+            lib.join("package.json"),
+            r#"{"name":"@cms-core/platform","scripts":{"build":"tsc"}}"#,
+        )
+        .unwrap();
+
+        let cfg = config::ProjectConfig::default_for_dir(root.path(), Some("cms-core".to_string()))
+            .unwrap();
+        config::write_project_config(root.path(), &cfg, true).unwrap();
+        registry::register_project(
+            "cms-core".to_string(),
+            root.path().to_path_buf(),
+            root.path().join(".env.vault"),
+        )
+        .unwrap();
+
+        let projects = dashboard_projects().unwrap();
+        let names = projects
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"cms-core"));
+        assert!(names.contains(&"cms-core:ambienta"));
+        let discovered = projects
+            .iter()
+            .find(|project| project.name == "cms-core:ambienta")
+            .unwrap();
+        assert_eq!(discovered.config_status, "needs env");
+        assert!(!discovered.setup_available);
+        assert_eq!(discovered.parent_project.as_deref(), Some("cms-core"));
+        assert!(discovered.env_names.contains(&"PAYLOAD_SECRET".to_string()));
+        assert!(!serde_json::to_string(discovered)
+            .unwrap()
+            .contains("payload-secret-value"));
     }
 
     #[test]

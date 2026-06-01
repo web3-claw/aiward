@@ -19,7 +19,7 @@ use crate::{
     policy::{self, AccessRequest, ApprovalMode},
     recovery, registry,
     runner::{self, RunCommandRequest},
-    term, unlock, vault, worktrees,
+    term, unlock, vault, workspace, worktrees,
 };
 
 #[derive(Debug)]
@@ -80,6 +80,12 @@ pub enum Commands {
         unlock_ttl: String,
         #[arg(long)]
         no_unlock: bool,
+        #[arg(long)]
+        workspace: bool,
+        #[arg(long = "app")]
+        apps: Vec<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// Create .ward.json and baseline local files.
     Init {
@@ -265,6 +271,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: WorktreesCommand,
     },
+    /// Discover and manage monorepo workspace apps.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// Print encrypted audit log paths.
     Logs {
         #[command(subcommand)]
@@ -447,6 +458,15 @@ pub enum WorktreesCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    /// Discover apps and packages in the current monorepo workspace.
+    Discover {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum EnvCommand {
     /// List env names in the encrypted vault.
     List {
@@ -584,18 +604,28 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             keep_plaintext,
             unlock_ttl,
             no_unlock,
-        } => setup(SetupOptions {
-            yes,
-            project,
-            source,
-            vault,
-            commit_vault,
-            ignore_vault,
-            remove_plaintext,
-            keep_plaintext,
-            unlock_ttl,
-            no_unlock,
-        }),
+            workspace,
+            apps,
+            all,
+        } => {
+            let options = SetupOptions {
+                yes,
+                project,
+                source,
+                vault,
+                commit_vault,
+                ignore_vault,
+                remove_plaintext,
+                keep_plaintext,
+                unlock_ttl,
+                no_unlock,
+            };
+            if workspace {
+                setup_workspace(options, apps, all)
+            } else {
+                setup(options)
+            }
+        }
         Commands::Init {
             project,
             force,
@@ -758,6 +788,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Doctor => doctor(),
         Commands::Broker { command } => broker_command(command),
         Commands::Worktrees { command } => worktrees_command(command),
+        Commands::Workspace { command } => workspace_command(command),
         Commands::Logs { command, kind } => logs(command, kind),
         Commands::Edit => edit(),
         Commands::Unlock { ttl, mode } => unlock_vault(&ttl, mode.as_deref()),
@@ -946,6 +977,7 @@ struct TeardownEvent<'a> {
     cleared_unlock_sessions: usize,
 }
 
+#[derive(Debug, Clone)]
 struct SetupOptions {
     yes: bool,
     project: Option<String>,
@@ -957,6 +989,25 @@ struct SetupOptions {
     keep_plaintext: bool,
     unlock_ttl: String,
     no_unlock: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSetupResult {
+    workspace: String,
+    root: PathBuf,
+    configured: Vec<WorkspaceSetupItem>,
+    skipped: Vec<WorkspaceSetupItem>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSetupItem {
+    app: String,
+    project: String,
+    path: PathBuf,
+    status: String,
+    reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1537,6 +1588,127 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn workspace_command(command: WorkspaceCommand) -> Result<()> {
+    match command {
+        WorkspaceCommand::Discover { json } => {
+            let cwd = env::current_dir()?;
+            let discovery = workspace::discover(&cwd)?
+                .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&discovery)?);
+            } else {
+                print_workspace_discovery(&discovery);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_workspace_discovery(discovery: &workspace::WorkspaceDiscovery) {
+    println!(
+        "Workspace: {} path={} manager={} turborepo={}",
+        discovery.workspace_name,
+        discovery.root.display(),
+        discovery.package_manager.as_deref().unwrap_or("-"),
+        discovery.turborepo
+    );
+    for package in &discovery.packages {
+        let app_marker = if package.app_candidate {
+            "app"
+        } else {
+            "package"
+        };
+        println!(
+            "{app_marker:7} {} project={} env={:?} setup={:?} path={}",
+            package.slug,
+            package.project_name,
+            package.env_status,
+            package.setup_status,
+            package.relative_path.display()
+        );
+    }
+}
+
+fn setup_workspace(options: SetupOptions, apps: Vec<String>, all: bool) -> Result<()> {
+    if options.commit_vault && options.ignore_vault {
+        anyhow::bail!("choose either --commit-vault or --ignore-vault");
+    }
+    if options.remove_plaintext && options.keep_plaintext {
+        anyhow::bail!("choose either --remove-plaintext or --keep-plaintext");
+    }
+
+    let cwd = env::current_dir()?;
+    let discovery = workspace::discover(&cwd)?
+        .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
+    let selected = discovery.selected_apps(&apps, all)?;
+    if selected.is_empty() {
+        print_workspace_discovery(&discovery);
+        term::blank();
+        term::info("Run `ward setup --workspace --all` or `ward setup --workspace --app <name>` to configure app projects.");
+        return Ok(());
+    }
+
+    let passphrase = vault::read_existing_passphrase()?;
+    let mut configured = Vec::new();
+    let mut skipped = Vec::new();
+    let project_prefix = options
+        .project
+        .as_deref()
+        .unwrap_or(&discovery.workspace_name)
+        .to_string();
+
+    for package in selected {
+        let project_name = format!("{project_prefix}:{}", package.slug);
+        if package.setup_status == workspace::WorkspaceSetupStatus::Configured {
+            skipped.push(WorkspaceSetupItem {
+                app: package.slug.clone(),
+                project: project_name,
+                path: package.path.clone(),
+                status: "configured".to_string(),
+                reason: Some("app already has .ward.json".to_string()),
+            });
+            continue;
+        }
+        if !package.can_setup() {
+            skipped.push(WorkspaceSetupItem {
+                app: package.slug.clone(),
+                project: project_name,
+                path: package.path.clone(),
+                status: workspace_setup_status_label(&package.setup_status).to_string(),
+                reason: Some("app has no plaintext .env to import".to_string()),
+            });
+            continue;
+        }
+
+        let status =
+            broker::setup_project_with_passphrase(&package.path, Some(&project_name), &passphrase)?;
+        configured.push(WorkspaceSetupItem {
+            app: package.slug.clone(),
+            project: status.project,
+            path: status.path,
+            status: "configured".to_string(),
+            reason: None,
+        });
+    }
+
+    let result = WorkspaceSetupResult {
+        workspace: discovery.workspace_name,
+        root: discovery.root,
+        configured,
+        skipped,
+    };
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn workspace_setup_status_label(status: &workspace::WorkspaceSetupStatus) -> &'static str {
+    match status {
+        workspace::WorkspaceSetupStatus::Configured => "configured",
+        workspace::WorkspaceSetupStatus::NeedsEnv => "needsEnv",
+        workspace::WorkspaceSetupStatus::NotConfigured => "notConfigured",
+    }
 }
 
 fn broker_command(command: BrokerCommand) -> Result<()> {
@@ -5366,6 +5538,9 @@ mod tests {
                 keep_plaintext: true,
                 unlock_ttl: "8h".to_string(),
                 no_unlock: false,
+                workspace: false,
+                apps: Vec::new(),
+                all: false,
             },
         })
         .unwrap();
@@ -5579,6 +5754,9 @@ mod tests {
                 keep_plaintext: false,
                 unlock_ttl: "8h".to_string(),
                 no_unlock: true,
+                workspace: false,
+                apps: Vec::new(),
+                all: false,
             },
         })
         .unwrap_err()
@@ -5836,6 +6014,9 @@ mod tests {
                 keep_plaintext: false,
                 unlock_ttl: "8h".to_string(),
                 no_unlock: true,
+                workspace: false,
+                apps: Vec::new(),
+                all: false,
             },
         })
         .unwrap();
@@ -7475,8 +7656,18 @@ mod tests {
         assert!(help.contains("Manage stored approval grants"));
 
         for subcommand in [
-            "setup", "request", "allow", "grants", "approve", "deny", "run", "dev", "migrate",
-            "logs", "unlock",
+            "setup",
+            "request",
+            "allow",
+            "grants",
+            "approve",
+            "deny",
+            "run",
+            "dev",
+            "migrate",
+            "logs",
+            "unlock",
+            "workspace",
         ] {
             let rendered = command
                 .find_subcommand_mut(subcommand)
@@ -7509,6 +7700,15 @@ mod tests {
                 "--unlock-ttl",
                 "1h",
             ],
+            vec!["ward", "setup", "--workspace", "--app", "ambienta"],
+            vec![
+                "ward",
+                "setup",
+                "--workspace",
+                "--all",
+                "--project",
+                "cms-core",
+            ],
             vec!["ward", "init", "--project", "demo", "--force", "--bare"],
             vec!["ward", "import", ".env", "--vault", ".env.vault"],
             vec![
@@ -7535,6 +7735,8 @@ mod tests {
             ],
             vec!["ward", "projects", "use", "demo"],
             vec!["ward", "projects", "remove", "demo"],
+            vec!["ward", "workspace", "discover"],
+            vec!["ward", "workspace", "discover", "--json"],
             vec!["ward", "env", "list", "--project", "demo"],
             vec!["ward", "env", "set", "--project", "demo", "KEY=value"],
             vec!["ward", "env", "unset", "--project", "demo", "KEY"],
@@ -7827,6 +8029,15 @@ mod tests {
                     keep_plaintext: false,
                     unlock_ttl: "8h".to_string(),
                     no_unlock: false,
+                    workspace: false,
+                    apps: Vec::new(),
+                    all: false,
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Workspace {
+                    command: WorkspaceCommand::Discover { json: true },
                 }
             ),
             format!(
@@ -7921,7 +8132,7 @@ mod tests {
             format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 27);
+        assert_eq!(commands.len(), 28);
         for value in commands {
             assert!(!value.is_empty());
         }

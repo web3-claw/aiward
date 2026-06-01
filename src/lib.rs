@@ -25,4 +25,5 @@ pub mod term;
 pub mod unlock;
 pub mod vault;
 pub mod webui;
+pub mod workspace;
 pub mod worktrees;

@@ -210,7 +210,8 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
     if let Some((name, registered)) = registry
         .projects
         .iter()
-        .find(|(_, registered)| cwd.starts_with(&registered.path))
+        .filter(|(_, registered)| cwd.starts_with(&registered.path))
+        .max_by_key(|(_, registered)| registered.path.components().count())
     {
         return Ok(ResolvedProject {
             name: name.clone(),
