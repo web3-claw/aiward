@@ -1,7 +1,7 @@
+pub mod tui;
+
 use anyhow::Result;
 use clap::ValueEnum;
-#[cfg(not(coverage))]
-use inquire::Select;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -45,15 +45,8 @@ pub fn prompt_for_approval(
     request: &AccessRequest,
     evaluation: &PolicyEvaluation,
 ) -> Result<ApprovalDecision> {
-    print_request_summary(request, evaluation);
     let critical = detection::has_critical_findings(&evaluation.findings);
     let suspicious_action = detection::has_suspicious_action_findings(&evaluation.findings);
-    if has_action_injection_findings(&evaluation.findings) {
-        print_action_warning();
-    }
-    if critical {
-        print_critical_warning();
-    }
 
     if let Some(scope) = test_approval_scope()? {
         validate_scope_for_findings(scope, &evaluation.findings)?;
@@ -65,7 +58,16 @@ pub fn prompt_for_approval(
     } else {
         approval_choices(request.branch.is_some(), !suspicious_action)
     };
-    let selected = select_approval_scope(choices)?;
+
+    #[cfg(not(any(test, coverage)))]
+    let selected = tui::run_approval_tui(request, evaluation, choices)?;
+    #[cfg(any(test, coverage))]
+    let selected = choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("approval prompt has no choices"))?;
+
+    validate_scope_for_findings(selected, &evaluation.findings)?;
     Ok(decision_for_scope(request, selected))
 }
 
@@ -101,19 +103,6 @@ pub(crate) fn validate_scope_for_findings(
         anyhow::bail!("suspicious action text cannot be approved with --scope always");
     }
     Ok(())
-}
-
-#[cfg(not(coverage))]
-fn select_approval_scope(choices: Vec<ApprovalScope>) -> Result<ApprovalScope> {
-    Ok(Select::new("Approve scoped env access?", choices).prompt()?)
-}
-
-#[cfg(coverage)]
-fn select_approval_scope(choices: Vec<ApprovalScope>) -> Result<ApprovalScope> {
-    choices
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("approval prompt has no choices"))
 }
 
 pub(crate) fn test_approval_scope() -> Result<Option<ApprovalScope>> {
@@ -163,57 +152,6 @@ pub fn auto_approval(evaluation: &PolicyEvaluation) -> ApprovalDecision {
         source: ApprovalSource::PolicyAuto,
         grant_id: None,
     }
-}
-
-fn print_request_summary(request: &AccessRequest, evaluation: &PolicyEvaluation) {
-    eprintln!("Ward access request");
-    eprintln!("Project: {}", request.project);
-    if let Some(agent) = &request.agent {
-        eprintln!("Agent: {agent}");
-    }
-    if let Some(branch) = &request.branch {
-        eprintln!("Branch: {branch}");
-    }
-    if let Some(action) = &request.action {
-        eprintln!("Declared action: {action}");
-    }
-    eprintln!("Command: {}", request.command);
-    eprintln!("Requested env: {}", request.env.join(", "));
-
-    if let Some(preset) = &evaluation.matched_preset {
-        eprintln!("Matched preset: {preset}");
-    }
-    if let Some(profile) = &evaluation.matched_profile {
-        eprintln!("Matched profile: {profile}");
-    }
-
-    for finding in &evaluation.findings {
-        eprintln!(
-            "[{:?}] {}: {}",
-            finding.severity, finding.code, finding.message
-        );
-    }
-}
-
-fn print_critical_warning() {
-    eprintln!();
-    eprintln!("CRITICAL Ward warning");
-    eprintln!("This command matched known secret-exfiltration patterns.");
-    eprintln!("Deny unless you explicitly expect this exact command to inspect secrets.");
-}
-
-fn print_action_warning() {
-    eprintln!();
-    eprintln!("Ward action warning");
-    eprintln!("The declared action contains suspicious or coercive text.");
-    eprintln!("Review the exact command and requested env vars before approving.");
-}
-
-fn has_action_injection_findings(findings: &[detection::Finding]) -> bool {
-    detection::has_suspicious_action_findings(findings)
-        || findings
-            .iter()
-            .any(|finding| finding.code == "action.secret_exfil_hint")
 }
 
 impl std::fmt::Display for ApprovalScope {
