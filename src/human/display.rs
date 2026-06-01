@@ -1,49 +1,11 @@
 use std::fmt::Write as FmtWrite;
 
-const PADLOCK_CLOSED: &[&str] = &[
-    "  \x1b[33m████\x1b[0m    ",
-    " \x1b[33m█    █\x1b[0m   ",
-    " \x1b[32m█ ██ █\x1b[0m   ",
-    " \x1b[32m█    █\x1b[0m   ",
-    " \x1b[32m██████\x1b[0m   ",
-];
-
-const PADLOCK_OPEN: &[&str] = &[
-    "        \x1b[33m████\x1b[0m",
-    "       \x1b[33m█\x1b[0m    ",
-    " \x1b[32m█      \x1b[0m    ",
-    " \x1b[32m█    █\x1b[0m     ",
-    " \x1b[32m██████\x1b[0m     ",
-];
-
-fn print_frame(frame: &[&str]) {
-    for line in frame {
-        println!("{line}");
-    }
-}
-
-fn clear_lines(n: usize) {
-    print!("\x1b[{n}A");
-}
-
-pub fn print_padlock_opening() {
-    print_frame(PADLOCK_CLOSED);
-    #[cfg(not(test))]
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    clear_lines(PADLOCK_CLOSED.len());
-    print_frame(PADLOCK_OPEN);
-}
-
-pub fn print_padlock_closing() {
-    print_frame(PADLOCK_OPEN);
-    #[cfg(not(test))]
-    std::thread::sleep(std::time::Duration::from_millis(250));
-    clear_lines(PADLOCK_OPEN.len());
-    print_frame(PADLOCK_CLOSED);
-}
-
 pub fn format_session_prefix(project: &str, ttl_label: &str) -> String {
-    format!("\x1b[32mᗝ\x1b[0m  \x1b[1m{project}\x1b[0m · \x1b[36mhuman mode\x1b[0m · {ttl_label}")
+    let p = "\x1b[38;5;135m";
+    let r = "\x1b[0m";
+    format!(
+        "{p}◬{r}  \x1b[1mward\x1b[0m · \x1b[1m{project}\x1b[0m · \x1b[36mhuman mode\x1b[0m · {ttl_label}"
+    )
 }
 
 pub fn format_human_table(headers: &[&str], rows: &[Vec<String>]) -> String {

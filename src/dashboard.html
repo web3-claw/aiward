@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ward dashboard</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -47,10 +48,19 @@
   }
 
   .logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
     font-weight: 700;
     font-size: 13px;
     color: var(--text);
     letter-spacing: 0.04em;
+  }
+  .brand-mark {
+    width: 20px;
+    height: 20px;
+    display: block;
+    flex: 0 0 auto;
   }
   .logo span { color: var(--accent); }
 
@@ -416,7 +426,7 @@
 <body>
 <header>
   <div class="dot"></div>
-  <div class="logo">ward <span id="page-title">dashboard</span></div>
+  <div class="logo"><img class="brand-mark" src="/assets/ward-logo-transparent.svg" alt="" aria-hidden="true">ward <span id="page-title">dashboard</span></div>
   <div class="header-right">
     <a class="btn" id="overview-link" href="/">overview</a>
     <a class="btn" id="logs-link" href="/logs">all logs</a>

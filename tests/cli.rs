@@ -768,8 +768,8 @@ fn zsh_prompt_badge_tracks_ward_project_state() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("locked=ward:locked"));
-    assert!(stdout.contains("active=ward:human"));
+    assert!(stdout.contains("locked=%F{244}ward:locked%f"));
+    assert!(stdout.contains("active=%F{135}◬ ward:human%f"));
     assert!(stdout.contains("outside="));
     assert!(!stdout.contains("outside=ward:"));
 }
@@ -1375,6 +1375,59 @@ fn setup_request_and_profile_error_edges_are_exercised_through_cli() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("failed to create"));
+}
+
+#[test]
+fn non_human_run_request_and_allow_require_agent_identity() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+
+    fixture
+        .command()
+        .args(["run", "--profile", "dev"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--agent is required outside human mode",
+        ));
+    fixture
+        .command()
+        .args(["dev"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--agent is required outside human mode",
+        ));
+    fixture
+        .command()
+        .args(["request", "--profile", "dev"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--agent is required outside human mode",
+        ));
+    fixture
+        .command()
+        .args(["allow", "--profile", "dev", "--scope", "always"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--agent is required outside human mode",
+        ));
+}
+
+#[test]
+fn no_prompt_run_without_agent_returns_structured_context_required() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+
+    fixture
+        .command()
+        .args(["run", "--profile", "dev", "--json", "--no-prompt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("context_required"))
+        .stdout(predicate::str::contains("agent"));
 }
 
 #[test]

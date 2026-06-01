@@ -193,6 +193,8 @@ When you run `ward setup`, ward writes an `AGENTS.md` (or appends to `CLAUDE.md`
 
 You don't need to configure agent mode manually. The file is auto-generated from your profiles and vault contents, and agents pick it up from their context window automatically.
 
+Agent runs outside human mode must identify themselves with `--agent <name>`. Ward rejects anonymous `run`, `request`, and `allow` calls so dashboard logs and approval grants stay tied to an agent identity.
+
 The agent flow at a glance:
 
 ```

@@ -359,6 +359,16 @@ fn handle(mut req: tiny_http::Request, token: &str) {
         return;
     }
 
+    if method == Method::Get && path == "/favicon.svg" {
+        serve_svg(req, WARD_LOGO_DARK_SVG);
+        return;
+    }
+
+    if method == Method::Get && path == "/assets/ward-logo-transparent.svg" {
+        serve_svg(req, WARD_LOGO_TRANSPARENT_SVG);
+        return;
+    }
+
     if method == Method::Get && is_dashboard_page_route(&path) {
         serve_html(req);
         return;
@@ -423,6 +433,21 @@ fn serve_html(req: tiny_http::Request) {
         ],
         Cursor::new(html),
         Some(html.len()),
+        None,
+    );
+    let _ = req.respond(response);
+}
+
+fn serve_svg(req: tiny_http::Request, svg: &'static str) {
+    let body = svg.as_bytes();
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes("Content-Type", "image/svg+xml; charset=utf-8").unwrap(),
+            Header::from_bytes("Cache-Control", "public, max-age=86400").unwrap(),
+        ],
+        Cursor::new(body),
+        Some(body.len()),
         None,
     );
     let _ = req.respond(response);
@@ -1495,6 +1520,8 @@ fn command_line(pid: u32) -> Option<String> {
 }
 
 const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
+const WARD_LOGO_DARK_SVG: &str = include_str!("../assets/ward-logo-dark.svg");
+const WARD_LOGO_TRANSPARENT_SVG: &str = include_str!("../assets/ward-logo-transparent.svg");
 
 #[allow(dead_code)]
 const LEGACY_OVERVIEW_HTML: &str = r##"<!doctype html>
@@ -1969,6 +1996,10 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("splitter"));
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
+        assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.svg\""));
+        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-transparent.svg"));
+        assert!(WARD_LOGO_DARK_SVG.contains("<rect"));
+        assert!(WARD_LOGO_TRANSPARENT_SVG.contains("<svg"));
         assert!(!DASHBOARD_HTML.contains("<select"));
     }
 

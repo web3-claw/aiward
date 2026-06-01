@@ -21,6 +21,10 @@ Profiles are the user-facing command layer. They map a short name such as
 `.ward.json` as lower-level policy rules for raw command matching and
 approval behavior; prefer profiles unless a profile does not exist.
 
+Agent runs outside human mode must identify themselves with `--agent
+<agent-name>`. Ward rejects anonymous `run`, `request`, and `allow` calls so
+logs and grants stay tied to an agent identity.
+
 No-prompt agent calls must always send full context up front: `--agent`,
 `--worktree`, `--branch`, `--git-remote`, `--commit`, `--action`, and either
 `--profile` or an exact `--command` plus exact `--env` names. Do not wait for

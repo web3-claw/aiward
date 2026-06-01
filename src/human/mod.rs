@@ -294,8 +294,6 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
         thread::sleep(Duration::from_millis(25));
     }
 
-    display::print_padlock_opening();
-
     let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
     let ttl_label = format_ttl_label(ttl_seconds);
     println!(

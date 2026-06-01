@@ -2092,7 +2092,11 @@ fn verified_no_prompt_context(
     resolved: &registry::ResolvedProject,
     context_options: &AgentContextOptions,
 ) -> Result<Option<context::VerifiedContext>> {
-    let Some(agent_name) = context_options.agent.as_deref() else {
+    let Some(agent_name) = context_options
+        .agent
+        .as_deref()
+        .filter(|agent| agent_identity_is_present(Some(*agent)))
+    else {
         let problem = context::ContextProblem::ContextRequired {
             missing: vec!["agent"],
         };
@@ -2126,6 +2130,17 @@ fn verified_no_prompt_context(
             Ok(None)
         }
     }
+}
+
+fn agent_identity_is_present(agent: Option<&str>) -> bool {
+    agent.is_some_and(|value| !value.trim().is_empty())
+}
+
+fn require_agent_identity_for_non_human(agent: Option<&str>) -> Result<()> {
+    if agent_identity_is_present(agent) {
+        return Ok(());
+    }
+    anyhow::bail!("--agent is required outside human mode; pass --agent <name> or run ward human")
 }
 
 fn enforce_worktree_for_no_prompt(
@@ -2190,9 +2205,17 @@ fn request(
     let resolved = registry::resolve_project(None, &cwd)?;
     let config = config::read_project_config(&resolved.path)?;
     let git = git_context::collect_git_context(&cwd);
+    let mut context_options = context_options;
+    let human_terminal = crate::human::is_human_terminal();
+    if human_terminal && !agent_identity_is_present(context_options.agent.as_deref()) {
+        context_options.agent = Some("human".to_string());
+    }
     let branch = context_options.branch.clone().or(git.branch.clone());
     let resolved_profile =
         resolve_profile(&config, profile.as_deref(), action, command, env_names)?;
+    if !human_terminal && !no_prompt {
+        require_agent_identity_for_non_human(context_options.agent.as_deref())?;
+    }
     let access = AccessRequest {
         project: resolved.name.clone(),
         agent: context_options.agent.clone(),
@@ -2294,6 +2317,7 @@ fn allow(
     if matches!(scope, ApprovalScope::Once | ApprovalScope::Deny) {
         anyhow::bail!("ward allow supports session, branch, and always scopes");
     }
+    require_agent_identity_for_non_human(agent.as_deref())?;
 
     let git = git_context::collect_git_context(&cwd);
     let branch = branch.or(git.branch.clone());
@@ -2609,10 +2633,10 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
     }
     // In a human terminal, infer remaining context from the current git repo.
     if human_terminal {
-        if context_options.agent.is_none() {
+        if !agent_identity_is_present(context_options.agent.as_deref()) {
             context_options.agent = Some("human".to_string());
         }
-        if options.agent.is_none() {
+        if !agent_identity_is_present(options.agent.as_deref()) {
             options.agent = Some("human".to_string());
         }
         if context_options.worktree.is_none() {
@@ -2644,6 +2668,9 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         options.command,
         human_terminal,
     )?;
+    if !human_terminal && !options.no_prompt {
+        require_agent_identity_for_non_human(options.agent.as_deref())?;
+    }
     let command_text = resolved_profile.command.clone();
 
     let access = AccessRequest {
@@ -3462,9 +3489,6 @@ fn lock() -> Result<()> {
     audit_logs::append_event(LogKind::Sessions, event)?;
     println!("Revoked {revoked} session grant(s).");
     println!("Cleared {cleared_unlocks} unlock session(s).");
-    if crate::human::is_human_terminal() {
-        crate::human::display::print_padlock_closing();
-    }
     Ok(())
 }
 
@@ -3978,19 +4002,27 @@ fn posix_init_code(
 fn zsh_prompt_badge_code(sock_path: &str) -> String {
     let mut out = String::new();
     out.push_str("if [ -n \"${ZSH_VERSION:-}\" ]; then\n");
+    out.push_str("__WARD_HUMAN_BADGE='%F{135}◬ ward:human%f'\n");
+    out.push_str("__WARD_LOCKED_BADGE='%F{244}ward:locked%f'\n");
     out.push_str("__ward_prompt_badge() {\n");
     out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
     out.push_str("  if [ -z \"$__ward_root\" ]; then\n");
     out.push_str("    return 0\n");
     out.push_str("  fi\n");
     out.push_str(&format!("  if [ -S \"{sock_path}\" ]; then\n"));
-    out.push_str("    printf '%s' 'ward:human'\n");
+    out.push_str("    printf '%s' \"$__WARD_HUMAN_BADGE\"\n");
     out.push_str("  else\n");
-    out.push_str("    printf '%s' 'ward:locked'\n");
+    out.push_str("    printf '%s' \"$__WARD_LOCKED_BADGE\"\n");
     out.push_str("  fi\n");
     out.push_str("}\n");
     out.push_str("__ward_prompt_without_badge() {\n");
     out.push_str("  __ward_prompt=\"${1:-}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt// $__WARD_HUMAN_BADGE/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt//$__WARD_HUMAN_BADGE/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt// $__WARD_LOCKED_BADGE/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt//$__WARD_LOCKED_BADGE/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt// ◬ ward:human/}\"\n");
+    out.push_str("  __ward_prompt=\"${__ward_prompt//◬ ward:human/}\"\n");
     out.push_str("  __ward_prompt=\"${__ward_prompt// ward:human/}\"\n");
     out.push_str("  __ward_prompt=\"${__ward_prompt//ward:human/}\"\n");
     out.push_str("  __ward_prompt=\"${__ward_prompt// ward:locked/}\"\n");
