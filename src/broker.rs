@@ -595,6 +595,30 @@ pub fn list_vault_keys(project: &str, vault: &Path) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+pub fn list_vault_keys_from_active_session(_project: &str, _vault: &Path) -> Result<Vec<String>> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(test))]
+pub fn list_vault_keys_from_active_session(project: &str, vault: &Path) -> Result<Vec<String>> {
+    let status = ping_status().context("Ward broker is not running")?;
+    if !broker_is_current(&status) {
+        anyhow::bail!("Ward broker is not current");
+    }
+    if matching_session_expiry(&status, project, vault, Utc::now()).is_none() {
+        anyhow::bail!("missing broker unlock session");
+    }
+    match send_simple(BrokerRequest::ListKeys {
+        project: project.to_string(),
+        vault: vault.to_path_buf(),
+    })? {
+        BrokerResponse::Keys { names } => Ok(names),
+        BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+#[cfg(test)]
 pub fn register_human_session(
     _shell_pid: u32,
     _session_token: &str,

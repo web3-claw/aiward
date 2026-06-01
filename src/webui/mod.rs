@@ -991,7 +991,7 @@ fn project_view(
 
     let mut vault_keys_verified = false;
     if broker_session_active {
-        if let Ok(vault_keys) = broker::list_vault_keys(name, &project.vault) {
+        if let Ok(vault_keys) = broker::list_vault_keys_from_active_session(name, &project.vault) {
             vault_keys_verified = true;
             env_names.extend(vault_keys);
         }
@@ -1384,6 +1384,13 @@ fn load_instances() -> Result<Vec<DashboardInstance>> {
 fn cleanup_stale_instances() -> Result<usize> {
     let mut removed = 0;
     for instance in load_instances()? {
+        let version_mismatch = instance.version != DASHBOARD_VERSION;
+        if version_mismatch {
+            terminate_dashboard_process(instance.pid);
+            let _ = remove_instance(instance.pid);
+            removed += 1;
+            continue;
+        }
         if !human::process_exists(instance.pid) || !is_dashboard_process(instance.pid) {
             let _ = remove_instance(instance.pid);
             removed += 1;
@@ -2197,6 +2204,27 @@ mod tests {
             started_path: PathBuf::from("/tmp/demo"),
             started_at: chrono::Utc::now().to_rfc3339(),
             version: DASHBOARD_VERSION.to_string(),
+        };
+        write_instance(&instance).unwrap();
+        assert!(metadata_path(instance.pid).exists());
+        assert_eq!(cleanup_stale_instances().unwrap(), 1);
+        assert!(!metadata_path(instance.pid).exists());
+    }
+
+    #[test]
+    #[serial]
+    fn cleanup_stale_instances_removes_old_version_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let instance = DashboardInstance {
+            pid: std::process::id(),
+            port: 7777,
+            url: dashboard_url(7777, "token"),
+            token: "token".to_string(),
+            started_project: Some("demo".to_string()),
+            started_path: PathBuf::from("/tmp/demo"),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            version: "0.0.0".to_string(),
         };
         write_instance(&instance).unwrap();
         assert!(metadata_path(instance.pid).exists());
