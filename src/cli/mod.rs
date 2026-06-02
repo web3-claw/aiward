@@ -19,7 +19,7 @@ use crate::{
     logs::{self as audit_logs, self as logs, LogKind},
     modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
-    recovery, registry,
+    project_store, recovery, registry,
     runner::{self, RunCommandRequest},
     term, unlock, vault, workspace, workspace_target, worktrees,
 };
@@ -123,6 +123,11 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Inspect the local encrypted project store.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
     },
     /// Manage the current project's dotenv vault and locked .env file.
     Env {
@@ -449,6 +454,45 @@ pub enum ProjectsCommand {
     Use { project: String },
     /// Remove a project from the global registry.
     Remove { project: String },
+    /// Provision a new project from selected envs in an unlocked source project.
+    Provision {
+        #[arg(long = "from")]
+        from_project: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
+        #[arg(long = "env")]
+        env_names: Vec<String>,
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StoreCommand {
+    /// List encrypted project-store snapshots.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one encrypted project-store snapshot summary.
+    Show {
+        project: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh a project-store snapshot from an active broker session.
+    Refresh {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -776,6 +820,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Use { project } => use_project(&project),
         Commands::Projects { command } => projects_command(command),
         Commands::Config { command } => config_command(command),
+        Commands::Store { command } => store_command(command),
         Commands::Env { command } => env_command(command),
         Commands::Request {
             project,
@@ -1572,6 +1617,19 @@ fn setup(options: SetupOptions) -> Result<()> {
             recovery_plaintext = vault::decrypt_vault_file(&vault_path, passphrase).ok();
         }
     }
+    if let (Some(passphrase), Some(plaintext)) = (
+        setup_passphrase_final.as_deref(),
+        recovery_plaintext.as_deref(),
+    ) {
+        warn_store_refresh_failure(project_store::refresh_from_plaintext(
+            &project_config.project,
+            &cwd,
+            &vault_path,
+            &project_config,
+            plaintext,
+            passphrase,
+        ));
+    }
 
     let unlock_session = if options.no_unlock {
         term::section("Session");
@@ -1793,6 +1851,15 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     vault::decrypt_vault_file(&written, &passphrase)?;
     env_file::lock_env_file(&source, &written)?;
     registry::update_project_vault(&config.project, cwd.clone(), written.clone())?;
+    let resolved = registry::ResolvedProject {
+        name: config.project.clone(),
+        path: cwd.clone(),
+        vault: written.clone(),
+    };
+    warn_store_refresh_failure(refresh_project_store_with_passphrase(
+        &resolved,
+        &passphrase,
+    ));
     let event = VaultImportEvent {
         event_type: "vault.import",
         project: &config.project,
@@ -1867,6 +1934,95 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
                 println!("Removed project {project}");
             } else {
                 println!("Project not found: {project}");
+            }
+        }
+        ProjectsCommand::Provision {
+            from_project,
+            path,
+            name,
+            profiles,
+            env_names,
+            agents,
+            json,
+        } => {
+            let cwd = env::current_dir()?;
+            let source = registry::resolve_project(Some(&from_project), &cwd)?;
+            let status = broker::provision_project_from_active_session(
+                &source.name,
+                &source.vault,
+                &path,
+                name,
+                profiles,
+                env_names,
+                agents,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("Provisioned {}", status.project);
+                println!("Path: {}", status.path.display());
+                println!("Vault: {}", status.vault.display());
+                println!("Env: {}", status.env_names.join(", "));
+                println!("Profiles: {}", status.profiles.join(", "));
+                if !status.agents.is_empty() {
+                    println!("Agents: {}", status.agents.join(", "));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn store_command(command: StoreCommand) -> Result<()> {
+    match command {
+        StoreCommand::List { json } => {
+            let summaries = project_store::list_summaries()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summaries)?);
+            } else if summaries.is_empty() {
+                println!("No project-store snapshots.");
+            } else {
+                for summary in summaries {
+                    let stale = if summary.stale { " stale" } else { "" };
+                    println!(
+                        "{} env={} profiles={} agents={} updated={}{}",
+                        summary.project_name,
+                        summary.env_names.len(),
+                        summary.profile_names.len(),
+                        summary.agent_names.len(),
+                        summary.updated_at,
+                        stale
+                    );
+                }
+            }
+        }
+        StoreCommand::Show { project, json } => {
+            let summary = project_store::show_summary(&project)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("Project: {}", summary.project_name);
+                println!("Path: {}", summary.path.display());
+                println!("Vault: {}", summary.vault.display());
+                println!("Env: {}", summary.env_names.join(", "));
+                println!("Profiles: {}", summary.profile_names.join(", "));
+                println!("Agents: {}", summary.agent_names.join(", "));
+                println!("Updated: {}", summary.updated_at);
+                println!("Stale: {}", summary.stale);
+            }
+        }
+        StoreCommand::Refresh { project, json } => {
+            let cwd = env::current_dir()?;
+            let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
+            let status =
+                broker::snapshot_project_from_active_session(&resolved.name, &resolved.vault)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "Refreshed project-store snapshot for {} at {}",
+                    status.store.project_name, status.store.updated_at
+                );
             }
         }
     }
@@ -2483,7 +2639,12 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let passphrase = vault::read_existing_passphrase()?;
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let key = with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::set_env_value(&resolved.vault, &passphrase, &assignment)
+                let key = env_file::set_env_value(&resolved.vault, &passphrase, &assignment)?;
+                warn_store_refresh_failure(refresh_project_store_with_passphrase(
+                    &resolved,
+                    &passphrase,
+                ));
+                Ok(key)
             })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.set", &resolved, None, Some(&key))?;
@@ -2493,7 +2654,12 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let passphrase = vault::read_existing_passphrase()?;
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let removed = with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::unset_env_value(&resolved.vault, &passphrase, &key)
+                let removed = env_file::unset_env_value(&resolved.vault, &passphrase, &key)?;
+                warn_store_refresh_failure(refresh_project_store_with_passphrase(
+                    &resolved,
+                    &passphrase,
+                ));
+                Ok(removed)
             })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.unset", &resolved, None, Some(&key))?;
@@ -2535,7 +2701,12 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let source = project_relative_path(&resolved.path, source);
             with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)
+                env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)?;
+                warn_store_refresh_failure(refresh_project_store_with_passphrase(
+                    &resolved,
+                    &passphrase,
+                ));
+                Ok(())
             })?;
             log_env_file_event("env.lock", &resolved, Some(&source), None)?;
             println!("Re-encrypted vault and locked {}", source.display());
@@ -2671,6 +2842,26 @@ fn with_passphrase_vault_access<T>(
         }
     }
     result
+}
+
+fn refresh_project_store_with_passphrase(
+    resolved: &registry::ResolvedProject,
+    passphrase: &str,
+) -> Result<project_store::ProjectStoreSummary> {
+    let config = config::read_project_config(&resolved.path)?;
+    project_store::refresh_from_vault(
+        &resolved.name,
+        &resolved.path,
+        &resolved.vault,
+        &config,
+        passphrase,
+    )
+}
+
+fn warn_store_refresh_failure(result: Result<project_store::ProjectStoreSummary>) {
+    if let Err(error) = result {
+        eprintln!("Ward warning: project-store snapshot refresh failed: {error}");
+    }
 }
 
 fn remaining_session_ttl(
@@ -4172,6 +4363,47 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
         Err(e) => term::fail(&format!("registry resolve failed — {e}")),
     }
 
+    // ── project store ────────────────────────────────────────────────────────
+    term::section("project store");
+    match registry::resolve_project(None, &cwd) {
+        Ok(project) => {
+            match project_store::diagnostics(&project.name) {
+                Ok(diagnostics) if diagnostics.exists => {
+                    if diagnostics.stale {
+                        term::warn(&format!(
+                            "snapshot stale  {}",
+                            term::short_path(&diagnostics.path)
+                        ));
+                    } else {
+                        term::ok(&format!(
+                            "snapshot  {}",
+                            term::short_path(&diagnostics.path)
+                        ));
+                    }
+                    term::info(&format!(
+                        "env={} profiles={} agentPolicies={}",
+                        diagnostics.env_count,
+                        diagnostics.profile_count,
+                        diagnostics.agent_policy_count
+                    ));
+                }
+                Ok(diagnostics) => {
+                    term::warn("no local project-store snapshot");
+                    term::info(&format!("expected {}", term::short_path(&diagnostics.path)));
+                }
+                Err(error) => term::fail(&format!("project-store check failed — {error}")),
+            }
+            match broker::active_session_expiry(&project.name, &project.vault) {
+                Ok(Some(_)) => term::ok("active broker session can refresh/provision"),
+                Ok(None) => {
+                    term::warn("run ward unlock --ttl 8h to refresh/provision from this project")
+                }
+                Err(error) => term::fail(&format!("broker session check failed — {error}")),
+            }
+        }
+        Err(error) => term::fail(&format!("registry resolve failed — {error}")),
+    }
+
     // ── human mode ───────────────────────────────────────────────────────────
     term::section("human mode");
     let human = crate::human::runtime_diagnostics();
@@ -4418,7 +4650,12 @@ fn edit(project: Option<String>, app: Option<String>) -> Result<()> {
     )?;
     let resolved = target.resolved_project();
     with_passphrase_vault_access(&resolved, &passphrase, || {
-        vault::edit_vault_file(&resolved.vault, &passphrase)
+        vault::edit_vault_file(&resolved.vault, &passphrase)?;
+        warn_store_refresh_failure(refresh_project_store_with_passphrase(
+            &resolved,
+            &passphrase,
+        ));
+        Ok(())
     })?;
     let event = VaultEditEvent {
         event_type: "vault.edit",
@@ -4646,6 +4883,14 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
 
     config::write_project_config(&cwd, &config, true)?;
     registry::update_project_vault(&project_name, cwd.clone(), new_vault.clone())?;
+    warn_store_refresh_failure(project_store::refresh_from_plaintext(
+        &project_name,
+        &cwd,
+        &new_vault,
+        &config,
+        &plaintext,
+        &passphrase,
+    ));
     env_file::refresh_locked_env(&cwd, &new_vault)?;
     config::ensure_gitignore(&cwd, true)?;
     println!("[ok] Vault rotated to {}", new_vault.display());
@@ -9284,6 +9529,7 @@ mod tests {
             vault: ".env.vault".into(),
             presets: Vec::new(),
             profiles: std::collections::BTreeMap::new(),
+            agent_policies: std::collections::BTreeMap::new(),
             anomaly_detection: config::AnomalyDetectionConfig {
                 enabled: true,
                 working_hours_start: 8,
@@ -9476,6 +9722,7 @@ mod tests {
             "unlock",
             "workspace",
             "config",
+            "store",
         ] {
             let rendered = command
                 .find_subcommand_mut(subcommand)
@@ -9543,6 +9790,28 @@ mod tests {
             ],
             vec!["ward", "projects", "use", "demo"],
             vec!["ward", "projects", "remove", "demo"],
+            vec![
+                "ward",
+                "projects",
+                "provision",
+                "--from",
+                "source",
+                "--path",
+                "./target",
+                "--name",
+                "target",
+                "--profile",
+                "dev",
+                "--env",
+                "DATABASE_URL",
+                "--agent",
+                "codex",
+                "--json",
+            ],
+            vec!["ward", "store", "list"],
+            vec!["ward", "store", "list", "--json"],
+            vec!["ward", "store", "show", "demo", "--json"],
+            vec!["ward", "store", "refresh", "--project", "demo", "--json"],
             vec!["ward", "workspace", "discover"],
             vec!["ward", "workspace", "discover", "--json"],
             vec!["ward", "env", "list", "--project", "demo"],

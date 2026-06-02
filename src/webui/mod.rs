@@ -28,6 +28,7 @@ use crate::{
     fs_util, human,
     logs::{self, LogKind},
     notifications,
+    project_store,
     registry::{self, RegisteredProject},
     workspace, worktrees,
 };
@@ -113,9 +114,11 @@ struct ProjectView {
     package_name: Option<String>,
     package_kind: Option<String>,
     profiles: Vec<ProfileView>,
+    agent_policies: Vec<AgentPolicyView>,
     env_names: Vec<String>,
     vault_keys_verified: bool,
     broker_session_active: bool,
+    store_snapshot: Option<project_store::ProjectStoreSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +129,14 @@ struct ProfileView {
     env: Vec<String>,
     default_scope: crate::approvals::ApprovalScope,
     action: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPolicyView {
+    agent: String,
+    profiles: Vec<String>,
+    env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +174,20 @@ struct ProjectSetupRequest {
     path: PathBuf,
     project: Option<String>,
     source_project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectProvisionRequest {
+    source_project: Option<String>,
+    path: PathBuf,
+    project: String,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    agents: Vec<String>,
 }
 
 pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
@@ -387,6 +412,9 @@ fn handle(mut req: tiny_http::Request, token: &str) {
 
     match (method, path.as_str()) {
         (Method::Get, "/api/projects") => respond_json_result(req, dashboard_projects()),
+        (Method::Get, "/api/store/projects") => {
+            respond_json_result(req, project_store::list_summaries())
+        }
         (Method::Get, "/api/events") => {
             let project = query_param(&query, "project");
             respond_json_result(req, Ok(load_all_events(project.as_deref())))
@@ -406,6 +434,10 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             let result = setup_project_from_dashboard(&mut req);
             respond_project_setup_result(req, result);
         }
+        (Method::Post, "/api/projects/provision") => {
+            let result = provision_project_from_dashboard(&mut req);
+            respond_project_provision_result(req, result);
+        }
         (Method::Post, _) => {
             if let Some((request_id, action)) = approval_action_route(&path) {
                 let result = approval_action(&mut req, request_id, &action);
@@ -416,6 +448,9 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             } else if let Some(project) = profiles_collection_route(&path) {
                 let result = create_profile_policy(&project, &mut req);
                 respond_json_result(req, result);
+            } else if let Some(project) = store_snapshot_route(&path) {
+                let result = snapshot_project_from_dashboard(&project);
+                respond_project_snapshot_result(req, result);
             } else if let Some((project, profile)) = profile_env_route(&path) {
                 let result = update_profile_env(&project, &profile, &mut req);
                 respond_json_result(req, result);
@@ -561,6 +596,59 @@ fn respond_approval_result(req: tiny_http::Request, result: Result<Value>) {
     }
 }
 
+fn respond_project_snapshot_result(
+    req: tiny_http::Request,
+    result: Result<broker::BrokerProjectSnapshotStatus>,
+) {
+    respond_broker_project_result(req, result, "project_snapshot_failed")
+}
+
+fn respond_project_provision_result(
+    req: tiny_http::Request,
+    result: Result<broker::BrokerProjectProvisionStatus>,
+) {
+    respond_broker_project_result(req, result, "project_provision_failed")
+}
+
+fn respond_broker_project_result<T: Serialize>(
+    req: tiny_http::Request,
+    result: Result<T>,
+    error_name: &'static str,
+) {
+    match result {
+        Ok(value) => respond_json(req, StatusCode(200), &value),
+        Err(error) => {
+            if let Some(broker_error) = error.downcast_ref::<broker::BrokerError>() {
+                if broker_error.reason() == "unlock_required"
+                    || broker_error
+                        .message()
+                        .contains("missing broker unlock session")
+                    || broker_error
+                        .message()
+                        .contains("expired broker unlock session")
+                {
+                    respond_json(
+                        req,
+                        StatusCode(423),
+                        &json!({
+                            "status": "unlock_required",
+                            "unlockRequired": true,
+                            "message": broker_error.message(),
+                            "fixCommand": "ward unlock --ttl 8h"
+                        }),
+                    );
+                    return;
+                }
+            }
+            respond_json(
+                req,
+                StatusCode(500),
+                &json!({ "error": error_name, "message": error.to_string() }),
+            );
+        }
+    }
+}
+
 fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value: &T) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let response = Response::new(
@@ -661,6 +749,14 @@ fn project_logs_route(path: &str) -> Option<String> {
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match parts.as_slice() {
         ["projects", project, "logs"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn store_snapshot_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "store", "projects", project, "snapshot"] => Some(url_decode(project)),
         _ => None,
     }
 }
@@ -1073,6 +1169,30 @@ fn setup_project_from_dashboard(
     )
 }
 
+fn snapshot_project_from_dashboard(project: &str) -> Result<broker::BrokerProjectSnapshotStatus> {
+    let cwd = std::env::current_dir()?;
+    let resolved = registry::resolve_project(Some(project), &cwd)?;
+    broker::snapshot_project_from_active_session(&resolved.name, &resolved.vault)
+}
+
+fn provision_project_from_dashboard(
+    req: &mut tiny_http::Request,
+) -> Result<broker::BrokerProjectProvisionStatus> {
+    let requested: ProjectProvisionRequest = read_json_body(req)?;
+    let target_path = requested.path;
+    let cwd = std::env::current_dir()?;
+    let source = registry::resolve_project(requested.source_project.as_deref(), &cwd)?;
+    broker::provision_project_from_active_session(
+        &source.name,
+        &source.vault,
+        &target_path,
+        requested.project,
+        requested.profiles,
+        requested.env,
+        requested.agents,
+    )
+}
+
 fn validate_dashboard_setup_target(path: &Path) -> Result<PathBuf> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !path.is_dir() {
@@ -1172,6 +1292,7 @@ fn project_view(
     let config_result = config::read_project_config(&project.path);
     let mut env_names = BTreeSet::new();
     let mut profiles = Vec::new();
+    let mut agent_policies = Vec::new();
     let config_status = match config_result {
         Ok(cfg) => {
             for (profile_name, profile) in cfg.profiles {
@@ -1182,6 +1303,14 @@ fn project_view(
                     env: profile.env,
                     default_scope: profile.default_scope,
                     action: profile.action,
+                });
+            }
+            for (agent, policy) in cfg.agent_policies {
+                env_names.extend(policy.env.iter().cloned());
+                agent_policies.push(AgentPolicyView {
+                    agent,
+                    profiles: policy.profiles,
+                    env: policy.env,
                 });
             }
             "ok".to_string()
@@ -1207,6 +1336,7 @@ fn project_view(
     }
 
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    agent_policies.sort_by(|left, right| left.agent.cmp(&right.agent));
     Ok(ProjectView {
         name: name.to_string(),
         path: project.path.clone(),
@@ -1220,9 +1350,11 @@ fn project_view(
         package_name: None,
         package_kind: None,
         profiles,
+        agent_policies,
         env_names: env_names.into_iter().collect(),
         vault_keys_verified,
         broker_session_active,
+        store_snapshot: project_store::show_summary(name).ok(),
     })
 }
 
@@ -1307,9 +1439,11 @@ fn discovered_project_view(
         package_name: package.name.clone(),
         package_kind: Some(workspace_package_kind_label(&package.package_kind).to_string()),
         profiles: Vec::new(),
+        agent_policies: Vec::new(),
         env_names: env_names.into_iter().collect(),
         vault_keys_verified: false,
         broker_session_active,
+        store_snapshot: None,
     })
 }
 
@@ -2157,6 +2291,10 @@ mod tests {
         );
         assert_eq!(
             profiles_collection_route("/api/projects/demo/profiles"),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            store_snapshot_route("/api/store/projects/demo/snapshot"),
             Some("demo".to_string())
         );
         assert!(is_dashboard_page_route("/"));

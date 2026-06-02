@@ -532,6 +532,7 @@ let events = [];
 let selectedProject = null;
 let selectedRow = null;
 let selectedEventKey = null;
+let pendingProvision = null;
 let lastProjectClick = { name: null, at: 0 };
 let kindFilter = 'all';
 let sevFilter = 'all';
@@ -605,6 +606,10 @@ function renderOverview() {
   document.getElementById('logs-link').href = link('/logs');
   renderProjectFilters();
   renderProjectTable();
+  if (pendingProvision) {
+    renderProvisionForm();
+    return;
+  }
   const project = currentProject();
   renderProjectDetail(project);
 }
@@ -626,7 +631,7 @@ function renderProjectFilters() {
 function renderProjectTable() {
   const table = document.getElementById('main-table');
   table.innerHTML = `<thead><tr>
-    <th>project</th><th>config</th><th>setup</th><th>session</th><th>env</th><th>profiles</th>
+    <th>project</th><th>config</th><th>setup</th><th>session</th><th>store</th><th>env</th><th>profiles</th><th>agents</th>
   </tr></thead><tbody></tbody>`;
   const tbody = table.querySelector('tbody');
   projects.forEach((project, index) => {
@@ -637,8 +642,10 @@ function renderProjectTable() {
       <td>${statusBadge(project.configStatus === 'ok', project.configStatus)}</td>
       <td>${statusBadge(project.setupStatus === 'configured' || project.configStatus === 'ok', project.setupStatus || 'configured')}</td>
       <td>${statusBadge(project.brokerSessionActive, project.brokerSessionActive ? 'active' : 'locked')}</td>
+      <td>${statusBadge(Boolean(project.storeSnapshot), project.storeSnapshot ? (project.storeSnapshot.stale ? 'stale' : 'stored') : 'missing')}</td>
       <td>${project.envNames.length}</td>
-      <td>${project.profiles.length}</td>`;
+      <td>${project.profiles.length}</td>
+      <td>${(project.agentPolicies || []).length}</td>`;
     tr.addEventListener('click', () => {
       if (projectWasDoubleClicked(project.name)) {
         openProjectLogs(project.name);
@@ -684,9 +691,11 @@ function renderProjectDetail(project) {
     ${field('vault', shortPath(project.vault))}
     ${field('config', project.configStatus)}
     ${field('setup', project.setupStatus || 'configured')}
+    ${field('project store', project.storeSnapshot ? `${project.storeSnapshot.stale ? 'stale' : 'ready'} · ${esc(project.storeSnapshot.updatedAt)}` : 'missing')}
     ${project.setupAvailable ? `<button class="btn primary" data-setup-detected="${esc(project.name)}">setup app</button>` : ''}
     ${field('vault keys', project.vaultKeysVerified ? 'verified' : 'unavailable')}
     ${field('env names', project.envNames.map(envChip).join('') || '<span class="sev-info">none</span>')}
+    ${field('agent policies', (project.agentPolicies || []).map(policy => `<span class="env-chip">${esc(policy.agent)}</span>`).join('') || '<span class="sev-info">none</span>')}
     <div class="field-group">
       <div class="field-label">profile policies</div>
       <div id="profiles"></div>
@@ -1102,7 +1111,71 @@ async function addProject() {
       if (!manual) return;
       picked = await api('/api/projects/pick-folder', { method: 'POST', body: JSON.stringify({ path: manual }) });
     }
-    const result = await api('/api/projects/setup', { method: 'POST', body: JSON.stringify({ path: picked.path, sourceProject: setupSourceProject() }) });
+    const sourceProject = setupSourceProject();
+    if (!sourceProject) throw new Error('no source project is available');
+    pendingProvision = {
+      path: picked.path,
+      sourceProject,
+      project: defaultProjectName(picked.path)
+    };
+    renderProvisionForm();
+  } catch (error) {
+    alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
+  }
+}
+
+function renderProvisionForm() {
+  const source = projects.find(project => project.name === pendingProvision.sourceProject);
+  const pane = document.getElementById('detail-pane');
+  if (!source) {
+    pane.innerHTML = '<div class="detail-empty">source project not found</div>';
+    return;
+  }
+  selectedProject = source.name;
+  const profileNames = source.profiles.map(profile => profile.name);
+  pane.innerHTML = `
+    <div class="detail-header">
+      <span class="badge ${source.brokerSessionActive ? 'badge-ok' : 'badge-warn'}">${source.brokerSessionActive ? 'source active' : 'source locked'}</span>
+      <span class="detail-title">create project</span>
+      <button class="btn detail-ts" data-provision-cancel>cancel</button>
+    </div>
+    ${field('source', esc(source.name))}
+    ${field('target', shortPath(pendingProvision.path))}
+    <div class="form-grid" data-provision-editor>
+      <input class="full" data-field="project" placeholder="project name" value="${esc(pendingProvision.project)}">
+      <div class="field-label full">env names</div>
+      <div class="full check-grid">
+        ${source.envNames.map(name => `<label><input type="checkbox" data-provision-env="${esc(name)}" checked>${esc(name)}</label>`).join('') || '<span class="sev-info">none</span>'}
+      </div>
+      <div class="field-label full">profiles</div>
+      <div class="full check-grid">
+        ${profileNames.map(name => `<label><input type="checkbox" data-provision-profile="${esc(name)}" checked>${esc(name)}</label>`).join('') || '<span class="sev-info">none</span>'}
+      </div>
+      <input class="full" data-field="agents" placeholder="agent allowlist, comma separated">
+      <div class="full inline-form">
+        <button class="btn primary" data-provision-create>create</button>
+      </div>
+    </div>`;
+  pane.querySelector('[data-provision-cancel]').addEventListener('click', () => {
+    pendingProvision = null;
+    renderOverview();
+  });
+  pane.querySelector('[data-provision-create]').addEventListener('click', createProvisionProject);
+}
+
+async function createProvisionProject() {
+  const editor = document.querySelector('[data-provision-editor]');
+  const body = {
+    sourceProject: pendingProvision.sourceProject,
+    path: pendingProvision.path,
+    project: editor.querySelector('[data-field="project"]').value.trim(),
+    env: [...editor.querySelectorAll('[data-provision-env]:checked')].map(input => input.dataset.provisionEnv),
+    profiles: [...editor.querySelectorAll('[data-provision-profile]:checked')].map(input => input.dataset.provisionProfile),
+    agents: editor.querySelector('[data-field="agents"]').value.split(',').map(value => value.trim()).filter(Boolean)
+  };
+  try {
+    const result = await api('/api/projects/provision', { method: 'POST', body: JSON.stringify(body) });
+    pendingProvision = null;
     selectedProject = result.project;
     await load();
   } catch (error) {
@@ -1289,6 +1362,11 @@ function bindNotificationStream() {
     source.close();
     setTimeout(bindNotificationStream, 2500);
   };
+}
+
+function defaultProjectName(path) {
+  const parts = String(path || '').split('/').filter(Boolean);
+  return parts[parts.length - 1] || 'ward-project';
 }
 
 function bindSplitter() {

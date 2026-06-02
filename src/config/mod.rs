@@ -39,6 +39,8 @@ pub struct ProjectConfig {
     pub presets: Vec<PresetConfig>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agent_policies: BTreeMap<String, AgentPolicyConfig>,
     #[serde(default = "default_anomaly_detection")]
     pub anomaly_detection: AnomalyDetectionConfig,
     #[serde(default)]
@@ -71,6 +73,15 @@ pub struct ProfileConfig {
     pub env: Vec<String>,
     pub default_scope: ApprovalScope,
     pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPolicyConfig {
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +135,7 @@ impl ProjectConfig {
             vault: PathBuf::from(DEFAULT_VAULT_FILE),
             presets: Vec::new(),
             profiles,
+            agent_policies: BTreeMap::new(),
             anomaly_detection: default_anomaly_detection(),
             storage_mode: StorageMode::VaultFile,
             vault_nonce: vault::generate_vault_nonce(),
