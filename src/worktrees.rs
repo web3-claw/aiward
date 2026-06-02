@@ -111,6 +111,40 @@ pub fn list_project(project: &str) -> Result<ProjectWorktrees> {
     Ok(state.projects.remove(project).unwrap_or_default())
 }
 
+pub fn trust_worktree(
+    project: &str,
+    path: &Path,
+    git_remote: &str,
+    git_common_dir: Option<String>,
+    match_kind: &str,
+) -> Result<KnownWorktree> {
+    let mut state = load_state()?;
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let project_state = state.projects.entry(project.to_string()).or_default();
+    project_state.pending.retain(|pending| pending.path != path);
+
+    let known = KnownWorktree {
+        path,
+        git_remote: context::normalize_remote(git_remote),
+        git_common_dir,
+        detected_at: Utc::now(),
+        match_kind: match_kind.to_string(),
+    };
+
+    if let Some(existing) = project_state
+        .known_worktrees
+        .iter_mut()
+        .find(|candidate| candidate.path == known.path)
+    {
+        *existing = known.clone();
+    } else {
+        project_state.known_worktrees.push(known.clone());
+    }
+
+    save_state(&state)?;
+    Ok(known)
+}
+
 pub fn approve_pending(id: uuid::Uuid) -> Result<Option<KnownWorktree>> {
     let mut state = load_state()?;
     for project_state in state.projects.values_mut() {
@@ -354,6 +388,49 @@ mod tests {
             WorktreeDecision::AutoBound { .. }
         ));
         assert!(remove_root("demo", &missing_root).unwrap());
+
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn trust_worktree_upserts_known_worktree_and_clears_pending() {
+        let _guard = env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let worktree = root.path().join("repo");
+        std::fs::create_dir(&worktree).unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+
+        let registered = registered(repo.path());
+        assert!(matches!(
+            evaluate_worktree(&registered, "demo", &verified(worktree.clone())).unwrap(),
+            WorktreeDecision::ApprovalRequired { .. }
+        ));
+
+        let known = trust_worktree(
+            "demo",
+            &worktree,
+            "https://example.test/repo.git",
+            Some(".git".to_string()),
+            "workspace-root-setup",
+        )
+        .unwrap();
+        assert_eq!(known.path, worktree.canonicalize().unwrap());
+        assert_eq!(known.git_remote, "https://example.test/repo");
+        assert_eq!(known.git_common_dir.as_deref(), Some(".git"));
+        assert_eq!(known.match_kind, "workspace-root-setup");
+
+        let state = list_project("demo").unwrap();
+        assert_eq!(state.pending.len(), 0);
+        assert_eq!(state.known_worktrees.len(), 1);
+
+        let known_again =
+            trust_worktree("demo", &worktree, "", None, "workspace-root-setup").unwrap();
+        assert_eq!(known_again.path, known.path);
+        let state = list_project("demo").unwrap();
+        assert_eq!(state.known_worktrees.len(), 1);
 
         std::env::remove_var("WARD_HOME");
     }

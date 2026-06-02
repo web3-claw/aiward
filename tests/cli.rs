@@ -86,9 +86,9 @@ impl TestProject {
             .assert()
             .success()
             .stderr(
-                predicate::str::contains("Vault encrypted")
-                    .and(predicate::str::contains("Session unlocked"))
-                    .and(predicate::str::contains("Recovery key created")),
+                predicate::str::contains(".env encrypted")
+                    .and(predicate::str::contains("unlocked until"))
+                    .and(predicate::str::contains("recovery key created")),
             );
     }
 
@@ -556,6 +556,25 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         .assert()
         .success()
         .stdout(predicate::str::contains("Project: cms-core:core-workbench"));
+
+    let output = Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(&app)
+        .env("WARD_HOME", home.path())
+        .args(["worktrees", "list", "--project", "cms-core:core-workbench"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let worktrees: Value = serde_json::from_slice(&output).unwrap();
+    let known = worktrees["knownWorktrees"].as_array().unwrap();
+    assert_eq!(known.len(), 1);
+    assert_eq!(
+        known[0]["path"],
+        serde_json::json!(root.path().canonicalize().unwrap())
+    );
+    assert_eq!(known[0]["matchKind"], "workspace-root-setup");
 }
 
 #[test]
@@ -2198,15 +2217,29 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
     ];
 
     let mut request = Command::cargo_bin("ward").unwrap();
-    request
+    let request_assert = request
         .current_dir(worktree.path())
         .env("WARD_HOME", fixture.ward_home.path())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["request", "--profile", "dev", "--json", "--no-prompt"])
         .args(&context_args)
         .assert()
-        .success()
-        .stdout(predicate::str::contains("worktree_approval_required"));
+        .success();
+    let request_output = request_assert.get_output().stdout.clone();
+    let response: Value = serde_json::from_slice(&request_output).unwrap();
+    assert_eq!(response["status"], "worktree_approval_required");
+    assert_eq!(response["approvalRequired"], true);
+    assert_eq!(response["approvalType"], "worktreeBinding");
+    assert_eq!(response["approvalOptions"][0]["action"], "approve");
+    assert_eq!(response["approvalOptions"][1]["action"], "deny");
+    assert!(response["approveCommand"]
+        .as_str()
+        .unwrap()
+        .starts_with("ward worktrees approve "));
+    assert!(response["denyCommand"]
+        .as_str()
+        .unwrap()
+        .starts_with("ward worktrees deny "));
 
     let mut run = Command::cargo_bin("ward").unwrap();
     run.current_dir(worktree.path())

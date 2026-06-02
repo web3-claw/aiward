@@ -11,8 +11,12 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, fs_util, logs};
+use crate::{broker, fs_util, logs, term};
 use base64::Engine as _;
+
+const HUMAN_ACTIVATION_BODY: &str =
+    "Enter your vault passphrase to activate human mode for this terminal.";
+const HUMAN_ACTIVE_BODY: &str = "This terminal is now protected. Normal commands in this Ward project will receive vault envs through Ward while this session is active.";
 
 // ── Path helpers ─────────────────────────────────────────────────────────────
 
@@ -233,9 +237,30 @@ pub fn send_guardian_shutdown() -> Result<()> {
 // ── Activation (ward human command handler) ───────────────────────────────────
 
 pub fn activate_human_mode(ttl: &str) -> Result<()> {
-    use crate::{logs::LogKind, registry, unlock, vault};
+    use crate::{config, logs::LogKind, registry, unlock, vault};
 
     let cwd = std::env::current_dir()?;
+    let (header_project, header_path) = config::find_project_root(&cwd)
+        .and_then(|root| {
+            config::read_project_config(&root)
+                .ok()
+                .map(|cfg| (cfg.project, root))
+        })
+        .unwrap_or_else(|| {
+            let project = cwd
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("project")
+                .to_string();
+            (project, cwd.clone())
+        });
+    term::guided_header(
+        "human",
+        &header_project,
+        &header_path,
+        HUMAN_ACTIVATION_BODY,
+    );
+
     let passphrase = vault::read_existing_passphrase()?;
     let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
     registry::update_project_vault(
@@ -247,8 +272,19 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     let ttl_seconds = duration.num_seconds();
 
     // Unlock vault in broker (handles both passphrase-encrypted and session-encrypted vaults).
-    crate::cli::create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, None)
-        .context("incorrect passphrase — human mode not activated")?;
+    if let Err(error) = crate::cli::create_run_unlock_session(
+        &resolved.name,
+        &resolved.vault,
+        &passphrase,
+        ttl,
+        None,
+    ) {
+        term::section("Session");
+        term::warn("human mode was not activated");
+        term::info("The vault passphrase did not unlock this project.");
+        term::next("try again with: ward human");
+        return Err(error).context("human mode was not activated");
+    }
 
     // Generate a random session token.
     use rand::RngCore;
@@ -257,7 +293,7 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     let session_token = base64::engine::general_purpose::STANDARD.encode(bytes);
 
     let shell_pid = parent_pid();
-    warn_if_shell_hooks_not_loaded();
+    let shell_hooks_loaded = shell_hooks_loaded();
     let _ = cleanup_stale_runtime();
 
     // Clean up any stale previous session for this terminal.
@@ -289,6 +325,10 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(3);
     while !ready.exists() {
         if Instant::now() >= deadline {
+            term::section("Session");
+            term::warn("human mode was not activated");
+            term::info("The terminal guardian did not become ready in time.");
+            term::next("try again with: ward human");
             anyhow::bail!("human guardian did not become ready in time");
         }
         thread::sleep(Duration::from_millis(25));
@@ -296,14 +336,26 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
 
     let expires_at = (chrono::Utc::now() + duration).to_rfc3339();
     let ttl_label = format_ttl_label(ttl_seconds);
-    println!(
-        "{}",
-        display::format_session_prefix(&resolved.name, &ttl_label)
-    );
+
+    term::info(HUMAN_ACTIVE_BODY);
+    term::blank();
+    term::section("Session");
+    term::ok("human mode active");
+    term::ok(&format!("expires in {ttl_label}"));
+    term::ok(&format!("guardian attached to shell {shell_pid}"));
+
+    term::section("Commands");
+    if shell_hooks_loaded {
+        term::ok("wrapped project commands route through ward run");
+        term::next("try: pnpm dev");
+    } else {
+        print_missing_shell_hooks_warning();
+    }
 
     if let Ok(instances) = crate::webui::dashboard_diagnostics() {
         if let Some(instance) = instances.first() {
-            println!("  ◆ dashboard  →  {}", instance.url);
+            term::section("Dashboard");
+            term::next(&format!("open: {}", instance.url));
         }
     }
 
@@ -325,13 +377,25 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     Ok(())
 }
 
-fn warn_if_shell_hooks_not_loaded() {
-    if std::env::var_os("WARD_SHELL_INTEGRATION").is_some() {
-        return;
-    }
-    eprintln!(
-        "Warning: Ward shell hooks are not loaded in this shell. Reload your shell after installing shell integration, then run `ward human` again if commands like pnpm are not wrapped."
-    );
+fn shell_hooks_loaded() -> bool {
+    std::env::var_os("WARD_SHELL_INTEGRATION").is_some()
+}
+
+fn missing_shell_hooks_warning_lines() -> [&'static str; 4] {
+    [
+        "shell hooks are not loaded for this terminal",
+        "Ward can unlock the vault, but normal commands may not be wrapped yet.",
+        "Reload your shell, then run:",
+        "exec $SHELL && ward human",
+    ]
+}
+
+fn print_missing_shell_hooks_warning() {
+    let [title, body, lead, command] = missing_shell_hooks_warning_lines();
+    term::warn(title);
+    term::info(body);
+    term::info(lead);
+    term::command_hint(command);
 }
 
 fn terminate_existing_guardians(shell_pid: u32) {
@@ -457,5 +521,18 @@ mod tests {
         assert_eq!(format_ttl_label(3600), "1h");
         assert_eq!(format_ttl_label(5400), "1h 30m");
         assert_eq!(format_ttl_label(1800), "30m");
+    }
+
+    #[test]
+    fn missing_shell_hooks_copy_includes_exact_reload_command() {
+        let lines = missing_shell_hooks_warning_lines();
+        assert_eq!(lines[0], "shell hooks are not loaded for this terminal");
+        assert_eq!(lines[3], "exec $SHELL && ward human");
+    }
+
+    #[test]
+    fn activation_copy_distinguishes_prompt_from_success() {
+        assert!(HUMAN_ACTIVATION_BODY.contains("activate human mode"));
+        assert!(HUMAN_ACTIVE_BODY.contains("This terminal is now protected"));
     }
 }

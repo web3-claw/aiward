@@ -117,6 +117,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProjectsCommand,
     },
+    /// Manage the local project config manifest.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage the current project's dotenv vault and locked .env file.
     Env {
         #[command(subcommand)]
@@ -386,6 +391,19 @@ pub enum ProjectsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Restore a missing .ward.json from the local private metadata backup.
+    Restore {
+        /// Overwrite an existing .ward.json.
+        #[arg(long)]
+        force: bool,
+        /// Print machine-readable restore status.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum DashboardCommand {
     /// Start the local browser dashboard.
     Start {
@@ -643,6 +661,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => register(project, path, vault),
         Commands::Use { project } => use_project(&project),
         Commands::Projects { command } => projects_command(command),
+        Commands::Config { command } => config_command(command),
         Commands::Env { command } => env_command(command),
         Commands::Request {
             profile,
@@ -999,6 +1018,11 @@ struct SetupOptions {
     no_unlock: bool,
 }
 
+const SETUP_GUIDED_BODY: &str = "Ward will encrypt your local env, create a vault, and prepare this project for safe human and agent access.";
+const RECOVERY_EXPORT_PROMPT: &str = "Export a recovery backup now?";
+const RECOVERY_EXPORT_HELP: &str =
+    "Store this somewhere safe, such as a USB drive or secure cloud backup.";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSetupResult {
@@ -1123,14 +1147,25 @@ struct InvalidInvocationResponse {
 #[serde(rename_all = "camelCase")]
 struct WorktreeRequiredResponse<'a> {
     status: &'static str,
+    approval_required: bool,
+    approval_type: &'static str,
     project: &'a str,
     worktree: &'a Path,
     git_remote: &'a str,
     branch: &'a str,
     commit: &'a str,
     reason: &'a str,
+    approval_options: Vec<WorktreeApprovalOption>,
     approve_command: String,
     deny_command: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeApprovalOption {
+    action: &'static str,
+    label: &'static str,
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -1164,6 +1199,11 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
+    let auto_restored_config = if !config::config_path(&cwd).exists() {
+        config::restore_project_config_from_backup(&cwd, false)?
+    } else {
+        None
+    };
     if should_auto_route_workspace_setup(&options) {
         if let Some(discovery) = workspace::discover(&cwd)? {
             if discovery.app_candidates().next().is_some() {
@@ -1230,13 +1270,14 @@ fn setup(options: SetupOptions) -> Result<()> {
     config::ensure_gitignore(&cwd, commit_vault)?;
 
     // Print header before any prompts so PIN input is visually grouped below it.
-    term::header(&project_config.project);
+    term::guided_header("setup", &project_config.project, &cwd, SETUP_GUIDED_BODY);
 
     let mut imported = false;
     let mut locked_env = false;
     let mut setup_passphrase = None;
     let mut verified_env_keys = None;
     let mut recovery_plaintext = None;
+    term::section("Vault");
     if source_exists {
         if source_is_locked {
             if !vault_path.exists() {
@@ -1248,10 +1289,11 @@ fn setup(options: SetupOptions) -> Result<()> {
             }
             env_file::lock_env_file(&options.source, &vault_path)?;
             locked_env = true;
+            term::ok("locked .env marker refreshed");
         } else {
             let passphrase = vault::read_new_passphrase()?;
             term::blank();
-            let sp = term::spinner("Encrypting vault");
+            let sp = term::spinner("Encrypting local env");
             vault::import_env_file(&options.source, &vault_path, &passphrase)?;
             let plaintext = vault::decrypt_vault_file(&vault_path, &passphrase)?;
             verified_env_keys = Some(config::env_keys_from_dotenv_str(&plaintext)?);
@@ -1262,7 +1304,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                 env_file::lock_env_file(&options.source, &vault_path)?;
                 locked_env = true;
             }
-            term::done(sp, "Vault encrypted");
+            term::done(sp, ".env encrypted");
         }
     } else if !vault_path.exists() {
         let passphrase = vault::read_new_passphrase()?;
@@ -1277,6 +1319,11 @@ fn setup(options: SetupOptions) -> Result<()> {
         setup_passphrase = Some(passphrase);
         locked_env = true;
         term::done(sp, "Empty vault encrypted");
+    } else {
+        term::ok("encrypted vault found");
+    }
+    if locked_env && !source_is_locked {
+        term::ok("locked marker written");
     }
 
     if let Some(env_keys) = verified_env_keys.as_deref() {
@@ -1285,6 +1332,15 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     registry::update_project_vault(&project_config.project, cwd.clone(), vault_path.clone())?;
+    term::section("Project");
+    term::ok(".ward.json ready");
+    if let Some(restored) = auto_restored_config.as_ref() {
+        term::ok(&format!(
+            ".ward.json restored from local backup  {}",
+            term::short_path(&restored.backup_path)
+        ));
+    }
+    term::ok("project registered");
     term::ok(".gitignore updated");
     if env_example.is_some() {
         term::ok(".env.example created");
@@ -1317,10 +1373,13 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     let unlock_session = if options.no_unlock {
+        term::section("Session");
+        term::warn("session not started (--no-unlock)");
         None
     } else {
         let passphrase = setup_passphrase_final.as_deref().unwrap();
-        let sp = term::spinner("Starting broker session");
+        term::section("Session");
+        let sp = term::spinner("Starting protected session");
         match create_run_unlock_session(
             &project_config.project,
             &vault_path,
@@ -1330,15 +1389,15 @@ fn setup(options: SetupOptions) -> Result<()> {
         ) {
             Ok(session) => {
                 let expires = session.expires_at.format("%H:%M").to_string();
-                term::done(sp, &format!("Session unlocked · expires {}", expires));
+                term::done(sp, &format!("unlocked until {}", expires));
                 Some(session)
             }
             Err(error) => {
                 if error.to_string().contains("failed to decrypt vault") {
-                    term::warn_step(sp, "Broker unlock failed");
+                    term::warn_step(sp, "protected session failed");
                     return Err(error);
                 }
-                term::warn_step(sp, &format!("Broker unlock failed: {error}"));
+                term::warn_step(sp, &format!("protected session failed: {error}"));
                 term::info("Run `ward unlock` before running protected commands.");
                 None
             }
@@ -1363,6 +1422,7 @@ fn setup(options: SetupOptions) -> Result<()> {
 
     // Auto-create recovery key using the same PIN/passphrase — no extra prompt.
     if let Some(ref passphrase) = setup_passphrase_final {
+        term::section("Recovery");
         let sp = term::spinner("Creating recovery key");
         match recovery::create_recovery_files_with_material(
             &project_config.project,
@@ -1373,7 +1433,7 @@ fn setup(options: SetupOptions) -> Result<()> {
             Ok(recovery_file) => {
                 term::done(
                     sp,
-                    &format!("Recovery key created  {}", term::short_path(&recovery_file)),
+                    &format!("recovery key created  {}", term::short_path(&recovery_file)),
                 );
                 project_config.recovery_created = true;
                 let _ = config::write_project_config(&cwd, &project_config, true);
@@ -1383,12 +1443,11 @@ fn setup(options: SetupOptions) -> Result<()> {
                 {
                     term::blank();
                     let export = options.yes
-                        || inquire::Confirm::new(
-                            "Export a recovery backup now? (store it somewhere safe — USB, cloud backup)",
-                        )
-                        .with_default(true)
-                        .prompt()
-                        .unwrap_or(false);
+                        || inquire::Confirm::new(RECOVERY_EXPORT_PROMPT)
+                            .with_help_message(RECOVERY_EXPORT_HELP)
+                            .with_default(true)
+                            .prompt()
+                            .unwrap_or(false);
 
                     if export {
                         let dest = dirs::desktop_dir()
@@ -1402,7 +1461,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                             Ok(out_path) => {
                                 project_config.backup_exported = true;
                                 let _ = config::write_project_config(&cwd, &project_config, true);
-                                term::ok(&format!("Backup saved  {}", term::short_path(&out_path)));
+                                term::ok(&format!("backup saved  {}", term::short_path(&out_path)));
                                 #[cfg(not(test))]
                                 let _ = std::process::Command::new("open")
                                     .arg("-R")
@@ -1410,8 +1469,8 @@ fn setup(options: SetupOptions) -> Result<()> {
                                     .spawn();
                             }
                             Err(e) => {
-                                term::warn(&format!("Export failed — {e}"));
-                                term::info("Run `ward recovery export` manually.");
+                                term::warn(&format!("backup export failed — {e}"));
+                                term::info("Run `ward recovery export` when ready.");
                             }
                         }
                     } else {
@@ -1420,7 +1479,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                 }
             }
             Err(error) => {
-                term::warn_step(sp, &format!("Recovery key creation failed: {error}"));
+                term::warn_step(sp, &format!("recovery key creation failed: {error}"));
                 term::info("Run `ward recovery create` manually.");
             }
         }
@@ -1438,9 +1497,15 @@ fn setup(options: SetupOptions) -> Result<()> {
     if options.keep_plaintext {
         term::warn("plaintext env was kept (--keep-plaintext)");
     }
+    term::section("Shell");
     if let Some(rc) = ensure_shell_integration() {
-        term::ok(&format!("Shell integration added to {}", rc.display()));
+        term::ok(&format!(
+            "shell integration installed  {}",
+            term::short_path(&rc)
+        ));
         prompt_shell_reload(&rc);
+    } else {
+        term::ok("shell integration ready");
     }
     Ok(())
 }
@@ -1607,6 +1672,42 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
     Ok(())
 }
 
+fn config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Restore { force, json } => {
+            let cwd = env::current_dir()?;
+            match config::restore_project_config_from_backup(&cwd, force)? {
+                Some(restored) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&restored)?);
+                    } else {
+                        println!("Restored .ward.json for {}", restored.project);
+                        println!("Config: {}", restored.config_path.display());
+                        println!("Backup: {}", restored.backup_path.display());
+                    }
+                }
+                None => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "notFound",
+                                "message": "No local .ward.json backup was found for this folder."
+                            }))?
+                        );
+                    } else {
+                        anyhow::bail!(
+                            "no local .ward.json backup found for {}; run ward setup to create a new config",
+                            cwd.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn workspace_command(command: WorkspaceCommand) -> Result<()> {
     match command {
         WorkspaceCommand::Discover { json } => {
@@ -1673,8 +1774,24 @@ fn setup_workspace_with_discovery(
     print_workspace_discovery(&discovery);
     term::blank();
 
+    let project_prefix = options
+        .project
+        .as_deref()
+        .unwrap_or(&discovery.workspace_name)
+        .to_string();
     let selected = selected_workspace_apps(&discovery, &apps, all, options.yes)?;
     if selected.is_empty() {
+        let refreshed = trust_workspace_root_for_configured_apps(&discovery, &project_prefix)?;
+        if !refreshed.is_empty() {
+            let result = WorkspaceSetupResult {
+                workspace: discovery.workspace_name,
+                root: discovery.root,
+                configured: Vec::new(),
+                skipped: refreshed,
+            };
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            return Ok(());
+        }
         term::info("Run `ward setup --workspace --all` or `ward setup --workspace --app <name>` to configure app projects.");
         return Ok(());
     }
@@ -1682,15 +1799,11 @@ fn setup_workspace_with_discovery(
     let passphrase = vault::read_existing_passphrase()?;
     let mut configured = Vec::new();
     let mut skipped = Vec::new();
-    let project_prefix = options
-        .project
-        .as_deref()
-        .unwrap_or(&discovery.workspace_name)
-        .to_string();
 
     for package in selected {
-        let project_name = format!("{project_prefix}:{}", package.slug);
+        let project_name = workspace_package_project_name(package, &project_prefix);
         if package.setup_status == workspace::WorkspaceSetupStatus::Configured {
+            trust_workspace_root_for_project(&project_name, &discovery.root)?;
             skipped.push(WorkspaceSetupItem {
                 app: package.slug.clone(),
                 project: project_name,
@@ -1713,6 +1826,7 @@ fn setup_workspace_with_discovery(
 
         let status =
             broker::setup_project_with_passphrase(&package.path, Some(&project_name), &passphrase)?;
+        trust_workspace_root_for_project(&status.project, &discovery.root)?;
         configured.push(WorkspaceSetupItem {
             app: package.slug.clone(),
             project: status.project,
@@ -1729,6 +1843,50 @@ fn setup_workspace_with_discovery(
         skipped,
     };
     println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+fn trust_workspace_root_for_configured_apps(
+    discovery: &workspace::WorkspaceDiscovery,
+    project_prefix: &str,
+) -> Result<Vec<WorkspaceSetupItem>> {
+    let mut refreshed = Vec::new();
+    for package in discovery
+        .app_candidates()
+        .filter(|package| package.setup_status == workspace::WorkspaceSetupStatus::Configured)
+    {
+        let project_name = workspace_package_project_name(package, project_prefix);
+        trust_workspace_root_for_project(&project_name, &discovery.root)?;
+        refreshed.push(WorkspaceSetupItem {
+            app: package.slug.clone(),
+            project: project_name,
+            path: package.path.clone(),
+            status: "configured".to_string(),
+            reason: Some("workspace Git root trusted".to_string()),
+        });
+    }
+    Ok(refreshed)
+}
+
+fn workspace_package_project_name(
+    package: &workspace::WorkspacePackage,
+    project_prefix: &str,
+) -> String {
+    config::read_project_config(&package.path)
+        .map(|config| config.project)
+        .unwrap_or_else(|_| format!("{project_prefix}:{}", package.slug))
+}
+
+fn trust_workspace_root_for_project(project: &str, workspace_root: &Path) -> Result<()> {
+    let git = git_context::collect_git_context(workspace_root);
+    let git_remote = git.remote.as_deref().unwrap_or_default();
+    worktrees::trust_worktree(
+        project,
+        workspace_root,
+        git_remote,
+        git.common_dir,
+        "workspace-root-setup",
+    )?;
     Ok(())
 }
 
@@ -2165,16 +2323,32 @@ fn enforce_worktree_for_no_prompt(
             Ok(true)
         }
         worktrees::WorktreeDecision::ApprovalRequired { request } => {
+            let approve_command = format!("ward worktrees approve {}", request.id);
+            let deny_command = format!("ward worktrees deny {}", request.id);
             let response = WorktreeRequiredResponse {
                 status: "worktree_approval_required",
+                approval_required: true,
+                approval_type: "worktreeBinding",
                 project: &resolved.name,
                 worktree: &request.path,
                 git_remote: &request.git_remote,
                 branch: &request.branch,
                 commit: &request.commit,
                 reason: &request.reason,
-                approve_command: format!("ward worktrees approve {}", request.id),
-                deny_command: format!("ward worktrees deny {}", request.id),
+                approval_options: vec![
+                    WorktreeApprovalOption {
+                        action: "approve",
+                        label: "Approve this worktree",
+                        command: approve_command.clone(),
+                    },
+                    WorktreeApprovalOption {
+                        action: "deny",
+                        label: "Deny this worktree",
+                        command: deny_command.clone(),
+                    },
+                ],
+                approve_command,
+                deny_command,
             };
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(false)
@@ -2967,7 +3141,17 @@ fn doctor() -> Result<()> {
     term::section("config");
 
     if !config_path.exists() {
-        term::fail(".ward.json missing — run ward setup");
+        match config::find_project_config_backup_for_path(&cwd)? {
+            Some((backup_path, backup)) => {
+                term::warn(&format!(
+                    ".ward.json missing but recoverable for {}",
+                    backup.project
+                ));
+                term::info(&format!("backup {}", term::short_path(&backup_path)));
+                term::info("run ward config restore, or rerun ward setup to restore automatically");
+            }
+            None => term::fail(".ward.json missing — run ward setup"),
+        }
         term::blank();
         return Ok(());
     }
@@ -2985,6 +3169,17 @@ fn doctor() -> Result<()> {
                     "vault not found  {}",
                     term::short_path(&vault_path)
                 ));
+            }
+            match config::find_project_config_backup_for_path(&cwd)? {
+                Some((backup_path, _)) => {
+                    term::ok(&format!(
+                        "config backup  {}",
+                        term::short_path(&backup_path)
+                    ));
+                }
+                None => {
+                    term::warn("config backup missing — rerun ward setup to refresh metadata");
+                }
             }
         }
         Err(e) => {
@@ -3669,7 +3864,8 @@ fn decrypt_vault_for_recovery(
 fn prompt_shell_reload(_rc: &Path) {
     #[cfg(not(coverage))]
     {
-        let reload = inquire::Confirm::new("Reload shell now to activate ward hooks?")
+        let reload = inquire::Confirm::new("Reload your shell now to activate Ward hooks?")
+            .with_help_message("After reload, run ward human to protect this terminal.")
             .with_default(true)
             .prompt()
             .unwrap_or(false);
@@ -3678,21 +3874,15 @@ fn prompt_shell_reload(_rc: &Path) {
             crate::fs_util::ensure_private_dir(&broker::run_dir()).ok();
             fs::write(&marker, "").ok();
             // Fallback if the ward() shell function isn't installed yet.
-            println!();
-            println!("  Run this to reload and activate:");
-            println!("    exec $SHELL  &&  ward human");
+            term::next("reload with: exec $SHELL && ward human");
         } else {
-            println!();
-            println!("  When ready, reload your shell:");
-            println!("    exec $SHELL  &&  ward human");
+            term::next("when ready: exec $SHELL && ward human");
         }
     }
     #[cfg(coverage)]
     {
         let _ = rc;
-        println!();
-        println!("  Reload your shell and activate human mode:");
-        println!("    exec $SHELL  &&  ward human");
+        term::next("reload with: exec $SHELL && ward human");
     }
 }
 
@@ -7902,6 +8092,7 @@ mod tests {
             "logs",
             "unlock",
             "workspace",
+            "config",
         ] {
             let rendered = command
                 .find_subcommand_mut(subcommand)
@@ -8048,6 +8239,8 @@ mod tests {
             vec!["ward", "grants", "list"],
             vec!["ward", "grants", "revoke", &request_id],
             vec!["ward", "grants", "prune"],
+            vec!["ward", "config", "restore"],
+            vec!["ward", "config", "restore", "--force", "--json"],
             vec![
                 "ward",
                 "approve",
@@ -8276,6 +8469,15 @@ mod tests {
             ),
             format!(
                 "{:?}",
+                Commands::Config {
+                    command: ConfigCommand::Restore {
+                        force: true,
+                        json: true,
+                    },
+                }
+            ),
+            format!(
+                "{:?}",
                 Commands::Dev {
                     agent: Some("codex".to_string()),
                     agent_key_id: None,
@@ -8367,10 +8569,19 @@ mod tests {
             format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 28);
+        assert_eq!(commands.len(), 29);
         for value in commands {
             assert!(!value.is_empty());
         }
+    }
+
+    #[test]
+    fn setup_wizard_copy_is_product_ready() {
+        assert!(SETUP_GUIDED_BODY.contains("encrypt your local env"));
+        assert!(SETUP_GUIDED_BODY.contains("safe human and agent access"));
+        assert_eq!(RECOVERY_EXPORT_PROMPT, "Export a recovery backup now?");
+        assert!(RECOVERY_EXPORT_HELP.contains("USB drive"));
+        assert!(RECOVERY_EXPORT_HELP.contains("secure cloud backup"));
     }
 
     #[cfg(unix)]
