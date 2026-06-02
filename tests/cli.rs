@@ -2275,6 +2275,22 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["logs", "view", "approvals"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "\"requestId\":\"{request_id}\""
+        )))
+        .stdout(predicate::str::contains(
+            "\"approvalChannel\":\"agent-mediated-cli\"",
+        ))
+        .stdout(predicate::str::contains("\"requestSnapshot\""))
+        .stdout(predicate::str::contains("\"agent\":\"codex\""))
+        .stdout(predicate::str::contains("\"command\":\"pnpm dev\""));
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -2295,6 +2311,12 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"grantId\""))
+        .stdout(predicate::str::contains(
+            "\"approvalChannel\":\"grant-reuse\"",
+        ))
+        .stdout(predicate::str::contains(format!(
+            "\"grantOriginRequestId\":\"{request_id}\""
+        )))
         .stdout(predicate::str::contains("pnpm dev"));
 }
 
@@ -3814,6 +3836,21 @@ fn denied_request_logs_denial_message() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Denied request"));
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["logs", "view", "approvals"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "\"requestId\":\"{request_id}\""
+        )))
+        .stdout(predicate::str::contains(
+            "\"approvalChannel\":\"agent-mediated-cli\"",
+        ))
+        .stdout(predicate::str::contains("\"approved\":false"))
+        .stdout(predicate::str::contains("\"command\":\"pnpm lint\""));
 }
 
 #[test]

@@ -819,7 +819,7 @@ function filteredEvents() {
   return events.filter(event => {
     const payload = event.payload || event;
     if (kindFilter !== 'all' && event._kind !== kindFilter) return false;
-    const agent = payload.agent || (payload.access && payload.access.agent) || '';
+    const agent = eventAgent(payload, '');
     if (agentFilter && agent !== agentFilter) return false;
     if (sevFilter === 'warn' && severity(event) === 'info') return false;
     if (sevFilter === 'crit' && severity(event) !== 'crit') return false;
@@ -838,8 +838,8 @@ function renderLogTable() {
   const tbody = table.querySelector('tbody');
   rows.forEach((event, index) => {
     const payload = event.payload || event;
-    const agent = payload.agent || (payload.access && payload.access.agent) || '-';
-    const cmd = payload.requestedCommand || (payload.access && payload.access.command) || payload.declaredAction || (payload.access && payload.access.action) || payload.eventType || '-';
+    const agent = eventAgent(payload, '-');
+    const cmd = eventCommand(payload, '-');
     const sev = severity(event);
     const tr = document.createElement('tr');
     if (selectedEventKey && eventKey(event) === selectedEventKey) tr.classList.add('selected');
@@ -878,7 +878,7 @@ function eventKey(event) {
 function updateAgentSelect() {
   const agents = [...new Set(events.map(event => {
     const payload = event.payload || event;
-    return payload.agent || (payload.access && payload.access.agent) || '';
+    return eventAgent(payload, '');
   }).filter(Boolean))].sort();
   if (agentFilter && !agents.includes(agentFilter)) agentFilter = '';
   const host = document.getElementById('agent-filter');
@@ -948,17 +948,92 @@ function closeDropdowns(except = null) {
   });
 }
 
+function eventSnapshot(payload) {
+  return payload.requestSnapshot || null;
+}
+
+function eventAgent(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.agent || (payload.access && payload.access.agent) || (snapshot && snapshot.agent) || fallback;
+}
+
+function eventBranch(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.branch || (payload.git && payload.git.branch) || (payload.access && payload.access.branch) || (snapshot && snapshot.branch) || (snapshot && snapshot.git && snapshot.git.branch) || fallback;
+}
+
+function eventWorktree(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return (payload.git && payload.git.worktreePath) || payload.cwd || (snapshot && snapshot.git && snapshot.git.worktreePath) || fallback;
+}
+
+function eventCommit(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return (payload.git && payload.git.commit) || (snapshot && snapshot.git && snapshot.git.commit) || fallback;
+}
+
+function eventCommand(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.requestedCommand || (payload.access && payload.access.command) || (snapshot && snapshot.command) || payload.declaredAction || (payload.access && payload.access.action) || (snapshot && snapshot.action) || payload.eventType || fallback;
+}
+
+function eventAction(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.declaredAction || (payload.access && payload.access.action) || (snapshot && snapshot.action) || fallback;
+}
+
+function eventEnvVars(payload) {
+  const snapshot = eventSnapshot(payload);
+  return payload.injectedEnv || payload.requestedEnv || (payload.access && payload.access.env) || (snapshot && (snapshot.env || snapshot.requestedEnv)) || [];
+}
+
+function eventFindings(payload) {
+  const snapshot = eventSnapshot(payload);
+  return payload.policyFindings || (payload.policy && payload.policy.findings) || (snapshot && snapshot.policyFindings) || [];
+}
+
+function relatedAuditEvents(event) {
+  const payload = event.payload || event;
+  const correlationId = payload.correlationId || null;
+  const requestId = payload.requestId || null;
+  if (!correlationId && !requestId) return [];
+  return events.filter(candidate => {
+    if (candidate === event) return false;
+    const candidatePayload = candidate.payload || candidate;
+    return (correlationId && candidatePayload.correlationId === correlationId)
+      || (requestId && (candidatePayload.requestId === requestId || candidatePayload.grantOriginRequestId === requestId));
+  });
+}
+
+function requestOutcome(event) {
+  if (event._kind !== 'request') return null;
+  const payload = event.payload || event;
+  const related = relatedAuditEvents(event);
+  if (related.some(item => {
+    const relatedPayload = item.payload || item;
+    return item._kind === 'execution' && relatedPayload.eventType === 'execution.finished';
+  })) return 'executed';
+  const approval = related.find(item => item._kind === 'approval');
+  if (approval) {
+    const decision = (approval.payload || approval).decision;
+    if (decision && typeof decision === 'object') return decision.approved ? 'approved' : 'denied';
+  }
+  if (payload.expiresAt && Date.parse(payload.expiresAt) < Date.now()) return 'expired';
+  return 'pending';
+}
+
 function renderEventDetail(event) {
   const payload = event.payload || event;
   const sev = severity(event);
-  const agent = payload.agent || (payload.access && payload.access.agent) || null;
-  const branch = payload.branch || (payload.git && payload.git.branch) || (payload.access && payload.access.branch) || null;
-  const worktree = (payload.git && payload.git.worktreePath) || payload.cwd || null;
-  const commit = payload.git && payload.git.commit ? payload.git.commit.slice(0,12) : null;
-  const cmd = payload.requestedCommand || (payload.access && payload.access.command) || null;
-  const action = payload.declaredAction || (payload.access && payload.access.action) || null;
-  const envVars = payload.injectedEnv || payload.requestedEnv || (payload.access && payload.access.env) || [];
-  const findings = payload.policyFindings || [];
+  const agent = eventAgent(payload, null);
+  const branch = eventBranch(payload, null);
+  const worktree = eventWorktree(payload, null);
+  const commitValue = eventCommit(payload, null);
+  const commit = commitValue ? commitValue.slice(0,12) : null;
+  const cmd = eventCommand(payload, null);
+  const action = eventAction(payload, null);
+  const envVars = eventEnvVars(payload);
+  const findings = eventFindings(payload);
   const outcome = payload.outcome || null;
   let html = `<div class="detail-header">
     <span class="badge badge-${event._kind}">${event._kind}</span>
@@ -972,6 +1047,23 @@ function renderEventDetail(event) {
   if (action) html += field('action', esc(action));
   if (commit) html += field('commit', esc(commit));
   if (event._project) html += field('project', esc(event._project));
+  const outcomeLabel = requestOutcome(event);
+  if (outcomeLabel) html += field('request status', esc(outcomeLabel));
+  if (payload.correlationId) html += field('correlation', esc(payload.correlationId));
+  if (payload.requestId) html += field('request', esc(payload.requestId));
+  if (payload.expiresAt) html += field('expires', esc(payload.expiresAt));
+  if (payload.approvalChannel) html += field('approved by', esc(payload.approvalChannel));
+  if (payload.approvalScope) html += field('approval scope', esc(payload.approvalScope));
+  if (payload.approvalSource) html += field('approval source', esc(payload.approvalSource));
+  if (payload.grantId) html += field('grant', esc(payload.grantId));
+  if (payload.grantOriginRequestId) html += field('grant request', esc(payload.grantOriginRequestId));
+  if (payload.approvalReceiptHash) html += field('receipt', esc(shorten(payload.approvalReceiptHash, 24)));
+  if (payload.decision && typeof payload.decision === 'object') {
+    html += field('decision', `<span class="${payload.decision.approved ? 'outcome-success' : 'outcome-failure'}">${payload.decision.approved ? 'approved' : 'denied'}</span>`);
+    if (payload.decision.scope) html += field('decision scope', esc(payload.decision.scope));
+    if (payload.decision.source) html += field('decision source', esc(payload.decision.source));
+  }
+  if (payload.criticalConfirmation) html += field('critical confirmation', 'true');
   if (outcome) {
     const code = typeof outcome === 'object' ? outcome.exitCode ?? outcome.exit_code : outcome;
     const ok = code === 0 || code === 'success';
@@ -992,11 +1084,11 @@ function renderEventDetail(event) {
 function severity(event) {
   const payload = event.payload || event;
   if (event._kind === 'alert') return 'warn';
-  const findings = payload.policyFindings || [];
+  const findings = eventFindings(payload);
   if (findings.some(f => f.severity === 'critical')) return 'crit';
   if (findings.some(f => f.severity === 'warning')) return 'warn';
   const decision = payload.decision || '';
-  if (decision === 'deny') return 'warn';
+  if (decision === 'deny' || (decision && typeof decision === 'object' && decision.approved === false)) return 'warn';
   return 'info';
 }
 

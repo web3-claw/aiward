@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{
     agents, anomaly,
-    approvals::{self, ApprovalDecision, ApprovalScope},
+    approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
     broker, config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
     modes, notifications, pending_requests,
@@ -1020,6 +1020,12 @@ struct EnvFileEvent<'a> {
 
 #[derive(Serialize)]
 struct RequestEvent<'a> {
+    #[serde(rename = "correlationId")]
+    correlation_id: uuid::Uuid,
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
+    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    expires_at: Option<&'a chrono::DateTime<chrono::Utc>>,
     access: &'a AccessRequest,
     policy: &'a policy::PolicyEvaluation,
     git: &'a git_context::GitContext,
@@ -1029,8 +1035,33 @@ struct RequestEvent<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ApprovalEvent<'a> {
+struct RequestAuditSnapshot<'a> {
     project: &'a str,
+    agent: &'a Option<String>,
+    branch: &'a Option<String>,
+    action: &'a Option<String>,
+    command: &'a str,
+    env: &'a [String],
+    requested_env: &'a [String],
+    matched_profile: &'a Option<String>,
+    matched_preset: &'a Option<String>,
+    matched_mode: &'a Option<String>,
+    policy_findings: &'a [detection::Finding],
+    git: &'a git_context::GitContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_context: Option<&'a context::VerifiedContext>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApprovalEvent<'a> {
+    correlation_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
+    project: &'a str,
+    approval_channel: ApprovalChannel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_snapshot: Option<RequestAuditSnapshot<'a>>,
     decision: &'a ApprovalDecision,
     persisted_grant: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1049,6 +1080,9 @@ struct ApprovalEvent<'a> {
 struct ExecutionStartedEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
+    correlation_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
     project: &'a str,
     agent: &'a Option<String>,
     branch: &'a Option<String>,
@@ -1061,7 +1095,10 @@ struct ExecutionStartedEvent<'a> {
     policy_findings: &'a [detection::Finding],
     approval_scope: ApprovalScope,
     approval_source: approvals::ApprovalSource,
+    approval_channel: ApprovalChannel,
     grant_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_origin_request_id: Option<uuid::Uuid>,
     approval_receipt_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_key_id: Option<&'a str>,
@@ -1074,6 +1111,9 @@ struct ExecutionStartedEvent<'a> {
 struct ExecutionEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
+    correlation_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
     project: &'a str,
     agent: &'a Option<String>,
     branch: &'a Option<String>,
@@ -1086,7 +1126,10 @@ struct ExecutionEvent<'a> {
     policy_findings: &'a [detection::Finding],
     approval_scope: ApprovalScope,
     approval_source: approvals::ApprovalSource,
+    approval_channel: ApprovalChannel,
     grant_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_origin_request_id: Option<uuid::Uuid>,
     approval_receipt_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_key_id: Option<&'a str>,
@@ -2880,6 +2923,9 @@ fn request_for_target(
         let pending =
             create_run_pending_request(&access, &evaluation, &git, Some(verified_context))?;
         let request_event = RequestEvent {
+            correlation_id: pending.id,
+            request_id: Some(pending.id),
+            expires_at: Some(&pending.expires_at),
             access: &pending.access,
             policy: &pending.policy,
             git: &pending.git,
@@ -2891,6 +2937,7 @@ fn request_for_target(
         return Ok(());
     }
 
+    let correlation_id = uuid::Uuid::new_v4();
     let decision = decide_access(&access, &evaluation, true)?;
     let critical_confirmation = critical_confirmation_for_decision(&decision, &evaluation);
     let receipt_context = Some(grants::GrantReceiptContext::synthetic(
@@ -2903,13 +2950,21 @@ fn request_for_target(
         .and_then(|grant| grant.receipt.as_ref());
 
     let request_event = RequestEvent {
+        correlation_id,
+        request_id: None,
+        expires_at: None,
         access: &access,
         policy: &evaluation,
         git: &git,
         verified_context: None,
     };
+    let request_snapshot = request_audit_snapshot(&access, &evaluation, &git, None);
     let approval_event = ApprovalEvent {
+        correlation_id,
+        request_id: None,
         project: &access.project,
+        approval_channel: approval_channel_for_source(decision.source),
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2919,7 +2974,9 @@ fn request_for_target(
         human_proof: approval_human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Requests, request_event)?;
-    audit_logs::append_event(LogKind::Approvals, &approval_event)?;
+    if should_log_approval_event(&decision) {
+        audit_logs::append_event(LogKind::Approvals, &approval_event)?;
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&approval_event)?);
@@ -2980,6 +3037,7 @@ fn allow_for_target(
 
     let git = git_context::collect_git_context(&cwd);
     let branch = branch.or(git.branch.clone());
+    let correlation_id = uuid::Uuid::new_v4();
     let access = AccessRequest {
         project: resolved.name,
         agent,
@@ -3002,8 +3060,13 @@ fn allow_for_target(
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&access, &grant);
     decision.source = approvals::ApprovalSource::ManualAllow;
+    let request_snapshot = request_audit_snapshot(&access, &evaluation, &git, None);
     let approval_event = ApprovalEvent {
+        correlation_id,
+        request_id: None,
         project: &access.project,
+        approval_channel: ApprovalChannel::ManualAllow,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: Some(grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -3130,7 +3193,13 @@ fn approve(
     agent_mediated: bool,
     json: bool,
 ) -> Result<()> {
-    match approve_inner(request_id, scope, confirm_critical, agent_mediated) {
+    match approve_inner(
+        request_id,
+        scope,
+        confirm_critical,
+        agent_mediated,
+        approval_channel_for_terminal(agent_mediated),
+    ) {
         Ok(response) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -3165,6 +3234,7 @@ struct ApproveJsonResponse {
     signer_key_id: Option<String>,
     signature_algorithm: Option<String>,
     approval_source: approvals::ApprovalSource,
+    approval_channel: ApprovalChannel,
 }
 
 fn approve_inner(
@@ -3172,6 +3242,7 @@ fn approve_inner(
     scope: ApprovalScope,
     confirm_critical: bool,
     agent_mediated: bool,
+    approval_channel: ApprovalChannel,
 ) -> Result<ApproveJsonResponse> {
     if scope == ApprovalScope::Deny {
         anyhow::bail!("use ward deny for denied requests");
@@ -3186,11 +3257,11 @@ fn approve_inner(
     } else {
         approvals::ApprovalSource::LocalTty
     };
-    let receipt_context = Some(grants::GrantReceiptContext {
+    let receipt_context = Some(grants::GrantReceiptContext::pending(
         request_id,
-        critical_confirmation: critical && confirm_critical,
-        verified_context: pending.verified_context.clone(),
-    });
+        critical && confirm_critical,
+        pending.verified_context.clone(),
+    ));
     let access = &pending.access;
     let vault = &resolved.vault;
     let grant = grants::persist_manual_grant(access, scope, source, vault, receipt_context)?;
@@ -3199,8 +3270,18 @@ fn approve_inner(
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&pending.access, &grant);
     decision.source = source;
+    let request_snapshot = request_audit_snapshot(
+        &pending.access,
+        &pending.policy,
+        &pending.git,
+        pending.verified_context.as_ref(),
+    );
     let approval_event = ApprovalEvent {
+        correlation_id: request_id,
+        request_id: Some(request_id),
         project: &pending.access.project,
+        approval_channel,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: Some(grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -3219,6 +3300,7 @@ fn approve_inner(
         signer_key_id: receipt.map(|receipt| receipt.signer_key_id.clone()),
         signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.clone()),
         approval_source: source,
+        approval_channel,
     })
 }
 
@@ -3227,7 +3309,13 @@ pub(crate) fn approve_request_from_dashboard(
     scope: ApprovalScope,
     confirm_critical: bool,
 ) -> Result<Value> {
-    let response = approve_inner(request_id, scope, confirm_critical, true)?;
+    let response = approve_inner(
+        request_id,
+        scope,
+        confirm_critical,
+        true,
+        ApprovalChannel::Dashboard,
+    )?;
     serde_json::to_value(response).context("failed to serialize approval response")
 }
 
@@ -3268,8 +3356,19 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         source,
         grant_id: None,
     };
+    let approval_channel = approval_channel_for_terminal(agent_mediated);
+    let request_snapshot = request_audit_snapshot(
+        &pending.access,
+        &pending.policy,
+        &pending.git,
+        pending.verified_context.as_ref(),
+    );
     let approval_event = ApprovalEvent {
+        correlation_id: request_id,
+        request_id: Some(request_id),
         project: &pending.access.project,
+        approval_channel,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: None,
         approval_receipt_hash: None,
@@ -3287,6 +3386,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
                 "requestId": request_id,
                 "project": pending.access.project,
                 "approvalSource": source,
+                "approvalChannel": approval_channel,
             }))?
         );
     } else {
@@ -3307,8 +3407,18 @@ pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Valu
         source,
         grant_id: None,
     };
+    let request_snapshot = request_audit_snapshot(
+        &pending.access,
+        &pending.policy,
+        &pending.git,
+        pending.verified_context.as_ref(),
+    );
     let approval_event = ApprovalEvent {
+        correlation_id: request_id,
+        request_id: Some(request_id),
         project: &pending.access.project,
+        approval_channel: ApprovalChannel::Dashboard,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: None,
         approval_receipt_hash: None,
@@ -3323,6 +3433,7 @@ pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Valu
         "requestId": request_id,
         "project": pending.access.project,
         "approvalSource": source,
+        "approvalChannel": ApprovalChannel::Dashboard,
     }))
 }
 
@@ -3461,6 +3572,8 @@ fn run_with_context(
     };
     let evaluation = evaluate_access(&config, &access);
     let mut verified_context = None;
+    let mut correlation_id = uuid::Uuid::new_v4();
+    let mut linked_request_id = None;
     let decision = if human_terminal && !options.no_prompt {
         ApprovalDecision {
             approved: true,
@@ -3500,6 +3613,9 @@ fn run_with_context(
                     verified_context.clone(),
                 )?;
                 let request_event = RequestEvent {
+                    correlation_id: pending.id,
+                    request_id: Some(pending.id),
+                    expires_at: Some(&pending.expires_at),
                     access: &pending.access,
                     policy: &pending.policy,
                     git: &pending.git,
@@ -3507,6 +3623,8 @@ fn run_with_context(
                 };
                 audit_logs::append_event(LogKind::Requests, request_event)?;
                 if options.wait_for_approval {
+                    correlation_id = pending.id;
+                    linked_request_id = Some(pending.id);
                     let Some(decision) = wait_for_run_approval(
                         &pending,
                         &access,
@@ -3525,6 +3643,33 @@ fn run_with_context(
             }
         };
         if !decision.approved {
+            let request_event = RequestEvent {
+                correlation_id,
+                request_id: linked_request_id,
+                expires_at: None,
+                access: &access,
+                policy: &evaluation,
+                git: &git,
+                verified_context: verified_context.as_ref(),
+            };
+            let request_snapshot =
+                request_audit_snapshot(&access, &evaluation, &git, verified_context.as_ref());
+            let approval_event = ApprovalEvent {
+                correlation_id,
+                request_id: linked_request_id,
+                project: &access.project,
+                approval_channel: approval_channel_for_source(decision.source),
+                request_snapshot: Some(request_snapshot),
+                decision: &decision,
+                persisted_grant: None,
+                approval_receipt_hash: None,
+                signer_key_id: None,
+                signature_algorithm: None,
+                critical_confirmation: false,
+                human_proof: approval_human_proof(decision.source),
+            };
+            audit_logs::append_event(LogKind::Requests, request_event)?;
+            audit_logs::append_event(LogKind::Approvals, approval_event)?;
             create_run_block_notification(
                 notifications::NotificationKind::PolicyDenied,
                 &access,
@@ -3542,6 +3687,7 @@ fn run_with_context(
     let critical_confirmation = critical_confirmation_for_decision(&decision, &evaluation);
     let receipt_context = Some(grants::GrantReceiptContext {
         request_id: uuid::Uuid::new_v4(),
+        pending_request: false,
         critical_confirmation,
         verified_context: verified_context.clone(),
     });
@@ -3552,13 +3698,23 @@ fn run_with_context(
         .and_then(|grant| grant.receipt.as_ref());
 
     let request_event = RequestEvent {
+        correlation_id,
+        request_id: linked_request_id,
+        expires_at: None,
         access: &access,
         policy: &evaluation,
         git: &git,
         verified_context: verified_context.as_ref(),
     };
+    let request_snapshot =
+        request_audit_snapshot(&access, &evaluation, &git, verified_context.as_ref());
+    let approval_channel = approval_channel_for_source(decision.source);
     let approval_event = ApprovalEvent {
+        correlation_id,
+        request_id: linked_request_id,
         project: &access.project,
+        approval_channel,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -3568,16 +3724,21 @@ fn run_with_context(
         human_proof: approval_human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Requests, request_event)?;
-    audit_logs::append_event(LogKind::Approvals, approval_event)?;
+    if should_log_approval_event(&decision) {
+        audit_logs::append_event(LogKind::Approvals, approval_event)?;
+    }
 
     if !decision.approved {
         anyhow::bail!("Ward access denied");
     }
 
     let grant_id = effective_grant_id(&decision, persisted_grant.as_ref());
+    let grant_origin_request_id = grant_origin_request_id(&decision);
     let approval_receipt_hash = grant_receipt_hash(&decision, persisted_grant.as_ref())?;
     let started_event = ExecutionStartedEvent {
         event_type: "execution.started",
+        correlation_id,
+        request_id: linked_request_id,
         project: &resolved.name,
         agent: &access.agent,
         branch: &access.branch,
@@ -3590,7 +3751,9 @@ fn run_with_context(
         policy_findings: &evaluation.findings,
         approval_scope: decision.scope,
         approval_source: decision.source,
+        approval_channel,
         grant_id,
+        grant_origin_request_id,
         approval_receipt_hash: approval_receipt_hash.as_deref(),
         agent_key_id: verified_agent_key_id(verified_context.as_ref()),
         verified_context: verified_context.as_ref(),
@@ -3702,6 +3865,8 @@ fn run_with_context(
 
     let execution_event = ExecutionEvent {
         event_type: "execution.finished",
+        correlation_id,
+        request_id: linked_request_id,
         project: &resolved.name,
         agent: &access.agent,
         branch: &access.branch,
@@ -3714,7 +3879,9 @@ fn run_with_context(
         policy_findings: &evaluation.findings,
         approval_scope: decision.scope,
         approval_source: decision.source,
+        approval_channel,
         grant_id,
+        grant_origin_request_id,
         approval_receipt_hash: approval_receipt_hash.as_deref(),
         agent_key_id: verified_agent_key_id(verified_context.as_ref()),
         verified_context: verified_context.as_ref(),
@@ -5534,6 +5701,64 @@ fn evaluate_access(
     policy::evaluate_request(config, access, None, findings)
 }
 
+fn request_audit_snapshot<'a>(
+    access: &'a AccessRequest,
+    evaluation: &'a policy::PolicyEvaluation,
+    git: &'a git_context::GitContext,
+    verified_context: Option<&'a context::VerifiedContext>,
+) -> RequestAuditSnapshot<'a> {
+    RequestAuditSnapshot {
+        project: &access.project,
+        agent: &access.agent,
+        branch: &access.branch,
+        action: &access.action,
+        command: &access.command,
+        env: &access.env,
+        requested_env: &evaluation.requested_env,
+        matched_profile: &evaluation.matched_profile,
+        matched_preset: &evaluation.matched_preset,
+        matched_mode: &evaluation.matched_mode,
+        policy_findings: &evaluation.findings,
+        git,
+        verified_context,
+    }
+}
+
+fn approval_channel_for_source(source: approvals::ApprovalSource) -> ApprovalChannel {
+    match source {
+        approvals::ApprovalSource::LocalTty => ApprovalChannel::LocalPrompt,
+        approvals::ApprovalSource::ManualAllow => ApprovalChannel::ManualAllow,
+        approvals::ApprovalSource::AgentMediated => ApprovalChannel::AgentMediatedCli,
+        approvals::ApprovalSource::Grant => ApprovalChannel::GrantReuse,
+        approvals::ApprovalSource::PolicyAuto => ApprovalChannel::PolicyAuto,
+        approvals::ApprovalSource::PolicyDeny => ApprovalChannel::PolicyDeny,
+    }
+}
+
+fn approval_channel_for_terminal(agent_mediated: bool) -> ApprovalChannel {
+    if agent_mediated {
+        ApprovalChannel::AgentMediatedCli
+    } else {
+        ApprovalChannel::TerminalApprove
+    }
+}
+
+fn grant_origin_request_id(decision: &ApprovalDecision) -> Option<uuid::Uuid> {
+    if decision.source != approvals::ApprovalSource::Grant {
+        return None;
+    }
+    let grant_id = decision.grant_id?;
+    grants::load_grants()
+        .ok()?
+        .into_iter()
+        .find(|grant| grant.id == grant_id)
+        .and_then(|grant| grant.request_id)
+}
+
+fn should_log_approval_event(decision: &ApprovalDecision) -> bool {
+    decision.source != approvals::ApprovalSource::Grant
+}
+
 fn approval_human_proof(source: approvals::ApprovalSource) -> Option<&'static str> {
     match source {
         approvals::ApprovalSource::AgentMediated => Some("external-agent-ui"),
@@ -6487,6 +6712,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     .is_err());
     let context_receipt = grants::GrantReceiptContext {
         request_id: uuid::Uuid::new_v4(),
+        pending_request: false,
         critical_confirmation: false,
         verified_context: Some(auto_context.clone()),
     };
@@ -8921,6 +9147,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             created_at: now,
             expires_at: None,
+            request_id: None,
             project: "demo".to_string(),
             agent: None,
             branch: None,
@@ -9186,6 +9413,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             expires_at: None,
+            request_id: None,
             project: access.project.clone(),
             agent: access.agent.clone(),
             branch: access.branch.clone(),
