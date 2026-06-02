@@ -117,6 +117,23 @@ pub fn discover(root: &Path) -> Result<Option<WorkspaceDiscovery>> {
     }))
 }
 
+pub fn find_workspace_root(cwd: &Path) -> Result<Option<PathBuf>> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    for dir in cwd.ancestors() {
+        if discover(dir)?.is_some() {
+            return Ok(Some(dir.to_path_buf()));
+        }
+    }
+    Ok(None)
+}
+
+pub fn discover_containing(cwd: &Path) -> Result<Option<WorkspaceDiscovery>> {
+    let Some(root) = find_workspace_root(cwd)? else {
+        return Ok(None);
+    };
+    discover(&root)
+}
+
 impl WorkspaceDiscovery {
     pub fn app_candidates(&self) -> impl Iterator<Item = &WorkspacePackage> {
         self.packages.iter().filter(|package| package.app_candidate)
@@ -148,7 +165,7 @@ impl WorkspacePackage {
             && self.env_status == WorkspaceEnvStatus::Present
     }
 
-    fn matches(&self, value: &str) -> bool {
+    pub fn matches(&self, value: &str) -> bool {
         self.slug == value
             || self.project_name == value
             || self.name.as_deref() == Some(value)

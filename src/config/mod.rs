@@ -6,14 +6,17 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
-use crate::{approvals::ApprovalScope, policy::ApprovalMode, vault};
+use crate::{approvals::ApprovalScope, fs_util, logs, policy::ApprovalMode, vault};
 
 pub const PROJECT_CONFIG_FILE: &str = ".ward.json";
 pub const WARD_JSON_GITIGNORE_ENTRY: &str = ".ward.json";
 pub const DEFAULT_VAULT_FILE: &str = ".env.vault";
 pub const AGENT_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 pub const CLAUDE_INSTRUCTIONS_FILE: &str = "CLAUDE.md";
+pub const CONFIG_BACKUP_DIR: &str = "config-backups";
+const CONFIG_BACKUP_VERSION: u32 = 1;
 
 const ENV_EXAMPLE_HEADER: &str = "# Ward managed environment.\n# Plaintext .env files should not be committed or shared with AI agents.\n# Agents should request scoped access with ward request, then run approved commands with ward run.\n\n";
 const AGENT_INSTRUCTIONS_MARKER: &str = "<!-- ward-agent-instructions -->";
@@ -80,6 +83,28 @@ pub struct AnomalyDetectionConfig {
     pub max_branches_per_grant: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectConfigBackup {
+    pub version: u32,
+    pub project: String,
+    pub project_path: PathBuf,
+    pub config_path: PathBuf,
+    pub config_sha256: String,
+    pub updated_at: String,
+    pub config: ProjectConfig,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectConfigRestore {
+    pub project: String,
+    pub project_path: PathBuf,
+    pub config_path: PathBuf,
+    pub backup_path: PathBuf,
+    pub updated_at: String,
+}
+
 impl ProjectConfig {
     pub fn default_for_dir(cwd: &Path, project: Option<String>) -> Result<Self> {
         let project = match project {
@@ -143,7 +168,117 @@ pub fn write_project_config(cwd: &Path, config: &ProjectConfig, force: bool) -> 
     let contents = serde_json::to_string_pretty(config)?;
     fs::write(&path, format!("{contents}\n"))
         .context(format!("failed to write {}", path.display()))?;
+    maybe_write_project_config_backup(cwd, config, &contents);
     Ok(path)
+}
+
+pub fn config_backups_dir() -> PathBuf {
+    logs::ward_home().join(CONFIG_BACKUP_DIR)
+}
+
+pub fn config_backup_path(project: &str) -> PathBuf {
+    config_backups_dir().join(format!("{}.json", slugify(project)))
+}
+
+pub fn read_project_config_backup(project: &str) -> Result<ProjectConfigBackup> {
+    let path = config_backup_path(project);
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+pub fn find_project_config_backup_for_path(
+    cwd: &Path,
+) -> Result<Option<(PathBuf, ProjectConfigBackup)>> {
+    let dir = config_backups_dir();
+    if !dir.exists() {
+        return Ok(None);
+    }
+
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(backup) = serde_json::from_str::<ProjectConfigBackup>(&contents) else {
+            continue;
+        };
+        if same_path(&backup.project_path, cwd) {
+            matches.push((path, backup));
+        }
+    }
+
+    matches.sort_by(|(_, left), (_, right)| right.updated_at.cmp(&left.updated_at));
+    Ok(matches.into_iter().next())
+}
+
+pub fn restore_project_config_from_backup(
+    cwd: &Path,
+    force: bool,
+) -> Result<Option<ProjectConfigRestore>> {
+    let config_path = config_path(cwd);
+    if config_path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists; pass --force to overwrite",
+            config_path.display()
+        );
+    }
+
+    let Some((backup_path, backup)) = find_project_config_backup_for_path(cwd)? else {
+        return Ok(None);
+    };
+
+    let contents = serde_json::to_string_pretty(&backup.config)?;
+    let hash = sha256_hex(contents.as_bytes());
+    if hash != backup.config_sha256 {
+        anyhow::bail!(
+            "config backup checksum mismatch for {}; refusing to restore",
+            backup.project
+        );
+    }
+
+    fs::write(&config_path, format!("{contents}\n"))
+        .context(format!("failed to write {}", config_path.display()))?;
+    maybe_write_project_config_backup(cwd, &backup.config, &contents);
+    Ok(Some(ProjectConfigRestore {
+        project: backup.project,
+        project_path: cwd.to_path_buf(),
+        config_path,
+        backup_path,
+        updated_at: backup.updated_at,
+    }))
+}
+
+fn maybe_write_project_config_backup(cwd: &Path, config: &ProjectConfig, contents: &str) {
+    if cfg!(test) && std::env::var_os("WARD_HOME").is_none() {
+        return;
+    }
+    let _ = write_project_config_backup(cwd, config, contents);
+}
+
+fn write_project_config_backup(
+    cwd: &Path,
+    config: &ProjectConfig,
+    contents: &str,
+) -> Result<PathBuf> {
+    let project_path = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let backup = ProjectConfigBackup {
+        version: CONFIG_BACKUP_VERSION,
+        project: config.project.clone(),
+        project_path: project_path.clone(),
+        config_path: project_path.join(PROJECT_CONFIG_FILE),
+        config_sha256: sha256_hex(contents.as_bytes()),
+        updated_at: chrono::Utc::now().to_rfc3339(),
+        config: config.clone(),
+    };
+    let backup_path = config_backup_path(&backup.project);
+    let backup_contents = serde_json::to_string_pretty(&backup)?;
+    fs_util::write_private_file(&backup_path, format!("{backup_contents}\n").as_bytes())?;
+    Ok(backup_path)
 }
 
 pub fn env_keys_from_dotenv_file(path: &Path) -> Result<Vec<String>> {
@@ -324,7 +459,7 @@ Use profiles where available:
 
 ```bash
 ward request --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
-ward run --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
+ward run --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --wait-for-approval --approval-timeout 30m --json --no-prompt
 ward dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
 ward migrate --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
 ```
@@ -344,6 +479,15 @@ No-prompt agent calls must always send full context up front: `--agent`,
 Ward to ask follow-up questions. Ward verifies the claimed branch, remote,
 commit, and worktree path locally before creating or reusing approvals.
 For repositories with no `origin` remote, pass `--git-remote ""` explicitly.
+In monorepos, `--worktree` must be the Git top-level path from
+`git rev-parse --show-toplevel`, not the child app folder, even when the Ward
+project lives inside `apps/<name>`.
+
+For commands that should continue after a human approval, prefer
+`ward run --wait-for-approval --approval-timeout 30m --json --no-prompt`.
+Ward will create a dashboard notification and keep the original process alive
+until the request is approved, denied, unlocked, or timed out. Do not end the
+task just because Ward is waiting.
 
 Manual request template:
 
@@ -368,6 +512,15 @@ interface supports it; do not present approval choices as loose prose when
 buttons, selectors, or typed choice prompts are available. If your structured
 choice UI has a 4-option limit, present the approval scopes in the picker and
 show `denyCommand` as a separate explicit denial action.
+
+If a no-prompt command returns `"status": "worktree_approval_required"` or
+`"approvalType": "worktreeBinding"`, show the worktree binding as a structured
+approve/deny choice. This approval trusts the exact checkout path, branch,
+commit, and remote for this Ward project; it is not a normal secret grant.
+Display `project`, `worktree`, `gitRemote`, `branch`, `commit`, and `reason`,
+then present `approvalOptions` when available. If your interface cannot render
+those options directly, present two explicit choices using `approveCommand` and
+`denyCommand`. Do not run either command until the user chooses approve or deny.
 
 Surface `action.*` findings before asking for approval. They mean the declared
 action text may include prompt-injection, approval-coercion, or secret-exposure
@@ -423,6 +576,8 @@ ward run \
   --commit <sha> \
   --action "<why this command needs secrets>" \
   --env <ENV_NAME> \
+  --wait-for-approval \
+  --approval-timeout 30m \
   --json \
   --no-prompt \
   -- <command> <args>
@@ -566,6 +721,42 @@ fn append_gitignore_line(lines: &mut Vec<String>, expected: &str) {
     }
 }
 
+fn same_path(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+fn slugify(project: &str) -> String {
+    let slug = project
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -618,6 +809,55 @@ mod tests {
         assert!(write_project_config(tempdir.path(), &config, false).is_err());
         assert!(write_project_config(tempdir.path(), &config, true).is_ok());
         assert_eq!(read_project_config(tempdir.path()).unwrap().project, "demo");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_backup_restores_missing_project_config() {
+        let project = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let previous_home = std::env::var_os("WARD_HOME");
+        std::env::set_var("WARD_HOME", home.path());
+
+        let mut config =
+            ProjectConfig::default_for_dir(project.path(), Some("demo".to_string())).unwrap();
+        config.profiles.get_mut("dev").unwrap().env = vec!["DATABASE_URI".to_string()];
+        write_project_config(project.path(), &config, false).unwrap();
+
+        let backup_path = config_backup_path("demo");
+        assert!(backup_path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(backup_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let file_mode = std::fs::metadata(&backup_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+
+        std::fs::remove_file(config_path(project.path())).unwrap();
+        let restored = restore_project_config_from_backup(project.path(), false)
+            .unwrap()
+            .expect("backup should match project path");
+        assert_eq!(restored.project, "demo");
+        assert_eq!(read_project_config(project.path()).unwrap().project, "demo");
+        assert_eq!(
+            read_project_config(project.path()).unwrap().profiles["dev"].env,
+            vec!["DATABASE_URI".to_string()]
+        );
+
+        match previous_home {
+            Some(value) => std::env::set_var("WARD_HOME", value),
+            None => std::env::remove_var("WARD_HOME"),
+        }
     }
 
     #[test]
@@ -676,6 +916,9 @@ mod tests {
         assert!(contents.contains("Profiles are the user-facing command layer"));
         assert!(contents.contains("Presets may be added"));
         assert!(contents.contains("All Ward flags must appear before `--`"));
+        assert!(contents.contains("worktree_approval_required"));
+        assert!(contents.contains("approve/deny choice"));
+        assert!(contents.contains("git rev-parse --show-toplevel"));
 
         let tempdir = tempfile::tempdir().unwrap();
         let claude_path = tempdir.path().join(CLAUDE_INSTRUCTIONS_FILE);

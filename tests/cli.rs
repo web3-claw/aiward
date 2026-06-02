@@ -6,6 +6,8 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    thread,
+    time::{Duration, Instant},
 };
 use ward::{
     approvals::ApprovalScope,
@@ -86,9 +88,9 @@ impl TestProject {
             .assert()
             .success()
             .stderr(
-                predicate::str::contains("Vault encrypted")
-                    .and(predicate::str::contains("Session unlocked"))
-                    .and(predicate::str::contains("Recovery key created")),
+                predicate::str::contains(".env encrypted")
+                    .and(predicate::str::contains("unlocked until"))
+                    .and(predicate::str::contains("recovery key created")),
             );
     }
 
@@ -479,6 +481,81 @@ fn write_monorepo_fixture(root: &Path) {
     .unwrap();
 }
 
+fn git_context_args_for_worktree(worktree: &Path, agent: &str, branch: &str) -> Vec<String> {
+    StdCommand::new("git")
+        .args(["init"])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.email", "tester@example.test"])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["config", "user.name", "Tester"])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["remote", "remove", "origin"])
+        .current_dir(worktree)
+        .output()
+        .ok();
+    StdCommand::new("git")
+        .args([
+            "remote",
+            "add",
+            "origin",
+            "https://example.test/cms-core.git",
+        ])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["checkout", "-B", branch])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["add", "."])
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    StdCommand::new("git")
+        .args(["commit", "--allow-empty", "-m", "context"])
+        .env("GIT_AUTHOR_NAME", "Tester")
+        .env("GIT_AUTHOR_EMAIL", "tester@example.test")
+        .env("GIT_COMMITTER_NAME", "Tester")
+        .env("GIT_COMMITTER_EMAIL", "tester@example.test")
+        .current_dir(worktree)
+        .output()
+        .unwrap();
+    let commit = String::from_utf8(
+        StdCommand::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(worktree)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    vec![
+        "--agent".to_string(),
+        agent.to_string(),
+        "--worktree".to_string(),
+        worktree.display().to_string(),
+        "--git-remote".to_string(),
+        "https://example.test/cms-core.git".to_string(),
+        "--commit".to_string(),
+        commit,
+        "--branch".to_string(),
+        branch.to_string(),
+    ]
+}
+
 #[test]
 fn workspace_discover_lists_monorepo_apps_without_configuring_libraries() {
     let root = tempfile::tempdir().unwrap();
@@ -529,7 +606,13 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         .args(["setup", "--workspace", "--app", "core-workbench"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cms-core:core-workbench"));
+        .stderr(
+            predicate::str::contains("Workspace: cms-core")
+                .and(predicate::str::contains(
+                    "core-workbench configured as cms-core:core-workbench",
+                ))
+                .and(predicate::str::contains("open the dashboard")),
+        );
 
     let app = root.path().join("apps/core-workbench");
     assert!(app.join(".ward.json").exists());
@@ -556,6 +639,25 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         .assert()
         .success()
         .stdout(predicate::str::contains("Project: cms-core:core-workbench"));
+
+    let output = Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(&app)
+        .env("WARD_HOME", home.path())
+        .args(["worktrees", "list", "--project", "cms-core:core-workbench"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let worktrees: Value = serde_json::from_slice(&output).unwrap();
+    let known = worktrees["knownWorktrees"].as_array().unwrap();
+    assert_eq!(known.len(), 1);
+    assert_eq!(
+        known[0]["path"],
+        serde_json::json!(root.path().canonicalize().unwrap())
+    );
+    assert_eq!(known[0]["matchKind"], "workspace-root-setup");
 }
 
 #[test]
@@ -573,14 +675,227 @@ fn setup_yes_auto_detects_workspace_apps_from_monorepo_root() {
         .args(["setup", "--yes"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cms-core:core-workbench"))
-        .stdout(predicate::str::contains("cms-core:creativestudio"))
-        .stdout(predicate::str::contains("cms-core:ambienta"));
+        .stderr(
+            predicate::str::contains("Workspace: cms-core")
+                .and(predicate::str::contains("2 app(s) ready to configure"))
+                .and(predicate::str::contains("ambienta  needs .env"))
+                .and(predicate::str::contains(
+                    "core-workbench configured as cms-core:core-workbench",
+                ))
+                .and(predicate::str::contains(
+                    "creativestudio configured as cms-core:creativestudio",
+                )),
+        );
 
     assert!(!root.path().join(".ward.json").exists());
     assert!(!root.path().join("apps/ambienta/.ward.json").exists());
     assert!(root.path().join("apps/core-workbench/.ward.json").exists());
     assert!(root.path().join("apps/creativestudio/.ward.json").exists());
+}
+
+#[test]
+fn setup_workspace_continues_when_one_app_env_is_invalid() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+    std::fs::write(
+        root.path().join("apps/core-workbench/.env"),
+        "DATABASE_URI=mongodb://local\nVALUE HER\nPAYLOAD_SECRET=payload\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--yes"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("core-workbench")
+                .and(predicate::str::contains("failed"))
+                .and(predicate::str::contains(
+                    "creativestudio configured as cms-core:creativestudio",
+                )),
+        );
+
+    assert!(root.path().join("apps/creativestudio/.ward.json").exists());
+    assert!(root.path().join("apps/creativestudio/.env.vault").exists());
+}
+
+#[test]
+fn workspace_root_env_and_doctor_are_app_target_aware() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--yes"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["env", "unlock"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("workspace root has multiple Ward app projects")
+                .and(predicate::str::contains("--app <app>")),
+        );
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .args(["doctor"])
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Workspace")
+                .and(predicate::str::contains("core-workbench"))
+                .and(predicate::str::contains("creativestudio")),
+        );
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["env", "unlock", "--app", "core-workbench", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("apps/core-workbench/.env"));
+
+    let plaintext_env =
+        std::fs::read_to_string(root.path().join("apps/core-workbench/.env")).unwrap();
+    assert!(plaintext_env.contains("DATABASE_URI=mongodb://local"));
+    assert!(plaintext_env.contains("PAYLOAD_SECRET=payload"));
+}
+
+#[test]
+fn workspace_run_app_profile_executes_from_selected_app_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    write_monorepo_fixture(root.path());
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["setup", "--yes"])
+        .assert()
+        .success();
+
+    let cwd_file = root.path().join("run-cwd.txt");
+    let bin_dir = root.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let pnpm = bin_dir.join("pnpm");
+    std::fs::write(
+        &pnpm,
+        format!(
+            "#!/bin/sh\npwd > '{}'\nprintf 'dev ok %s\\n' \"$DATABASE_URI\"\n",
+            cwd_file.display()
+        ),
+    )
+    .unwrap();
+    make_executable(&pnpm);
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        env::var("PATH").unwrap_or_default()
+    );
+    let context = git_context_args_for_worktree(root.path(), "codex", "main");
+
+    let output = Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("PATH", &path)
+        .args([
+            "request",
+            "--app",
+            "core-workbench",
+            "--profile",
+            "dev",
+            "--json",
+            "--no-prompt",
+        ])
+        .args(&context)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["project"], "cms-core:core-workbench");
+    let request_id = response["requestId"].as_str().unwrap();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["unlock", "--app", "core-workbench", "--ttl", "1h"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .args([
+            "approve",
+            request_id,
+            "--scope",
+            "branch",
+            "--agent-mediated",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("ward")
+        .unwrap()
+        .current_dir(root.path())
+        .env("WARD_HOME", home.path())
+        .env("PATH", &path)
+        .args([
+            "run",
+            "--app",
+            "core-workbench",
+            "--profile",
+            "dev",
+            "--json",
+            "--no-prompt",
+        ])
+        .args(&context)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dev ok [WARD_REDACTED]"));
+
+    let observed_cwd = std::fs::read_to_string(cwd_file).unwrap();
+    assert_eq!(
+        PathBuf::from(observed_cwd.trim()).canonicalize().unwrap(),
+        root.path()
+            .join("apps/core-workbench")
+            .canonicalize()
+            .unwrap()
+    );
 }
 
 #[test]
@@ -659,7 +974,12 @@ fn shell_init_wraps_common_dev_commands_even_outside_project() {
                 .and(predicate::str::contains(
                     "node() { __ward_wrap node \"$@\"; }",
                 ))
-                .and(predicate::str::contains("command ward run -- \"$@\"")),
+                .and(predicate::str::contains("__ward_workspace_root()"))
+                .and(predicate::str::contains("__ward_app_from_command()"))
+                .and(predicate::str::contains("command ward run -- \"$@\""))
+                .and(predicate::str::contains(
+                    "command ward run --app \"$__ward_app\" -- \"$@\"",
+                )),
         );
 }
 
@@ -1955,6 +2275,22 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
     fixture
         .command()
         .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["logs", "view", "approvals"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "\"requestId\":\"{request_id}\""
+        )))
+        .stdout(predicate::str::contains(
+            "\"approvalChannel\":\"agent-mediated-cli\"",
+        ))
+        .stdout(predicate::str::contains("\"requestSnapshot\""))
+        .stdout(predicate::str::contains("\"agent\":\"codex\""))
+        .stdout(predicate::str::contains("\"command\":\"pnpm dev\""));
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
         .args(["unlock", "--ttl", "1h"])
         .assert()
         .success();
@@ -1975,6 +2311,12 @@ fn profile_request_approval_and_run_flow_uses_short_profile_commands() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"grantId\""))
+        .stdout(predicate::str::contains(
+            "\"approvalChannel\":\"grant-reuse\"",
+        ))
+        .stdout(predicate::str::contains(format!(
+            "\"grantOriginRequestId\":\"{request_id}\""
+        )))
         .stdout(predicate::str::contains("pnpm dev"));
 }
 
@@ -2198,15 +2540,29 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
     ];
 
     let mut request = Command::cargo_bin("ward").unwrap();
-    request
+    let request_assert = request
         .current_dir(worktree.path())
         .env("WARD_HOME", fixture.ward_home.path())
         .env("WARD_UNSAFE_TEST_KEYRING", "1")
         .args(["request", "--profile", "dev", "--json", "--no-prompt"])
         .args(&context_args)
         .assert()
-        .success()
-        .stdout(predicate::str::contains("worktree_approval_required"));
+        .success();
+    let request_output = request_assert.get_output().stdout.clone();
+    let response: Value = serde_json::from_slice(&request_output).unwrap();
+    assert_eq!(response["status"], "worktree_approval_required");
+    assert_eq!(response["approvalRequired"], true);
+    assert_eq!(response["approvalType"], "worktreeBinding");
+    assert_eq!(response["approvalOptions"][0]["action"], "approve");
+    assert_eq!(response["approvalOptions"][1]["action"], "deny");
+    assert!(response["approveCommand"]
+        .as_str()
+        .unwrap()
+        .starts_with("ward worktrees approve "));
+    assert!(response["denyCommand"]
+        .as_str()
+        .unwrap()
+        .starts_with("ward worktrees deny "));
 
     let mut run = Command::cargo_bin("ward").unwrap();
     run.current_dir(worktree.path())
@@ -2217,6 +2573,74 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
         .assert()
         .success()
         .stdout(predicate::str::contains("worktree_approval_required"));
+}
+
+#[test]
+fn no_prompt_run_waits_for_approval_and_resumes_after_cli_approve() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+    let context = fixture.context_args("codex", "feature/wait");
+    let output_path = fixture.project_dir.path().join("wait.out");
+    let ward_bin = assert_cmd::cargo::cargo_bin("ward");
+
+    let mut args = vec![
+        "run".to_string(),
+        "--wait-for-approval".to_string(),
+        "--approval-timeout".to_string(),
+        "1m".to_string(),
+    ];
+    args.extend(context);
+    args.extend([
+        "--action".to_string(),
+        "Run command after dashboard approval".to_string(),
+        "--env".to_string(),
+        "DATABASE_URL".to_string(),
+        "--json".to_string(),
+        "--no-prompt".to_string(),
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf waited > wait.out".to_string(),
+    ]);
+
+    let child = StdCommand::new(&ward_bin)
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .args(&args)
+        .spawn()
+        .unwrap();
+
+    let request_id =
+        wait_for_single_pending_request(fixture.ward_home.path(), Duration::from_secs(10));
+    let approval = StdCommand::new(&ward_bin)
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .args([
+            "approve",
+            &request_id.to_string(),
+            "--scope",
+            "once",
+            "--agent-mediated",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        approval.status.success(),
+        "approval failed: {}",
+        String::from_utf8_lossy(&approval.stderr)
+    );
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "waited run failed stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(output_path).unwrap(), "waited");
 }
 
 #[test]
@@ -3412,6 +3836,21 @@ fn denied_request_logs_denial_message() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Denied request"));
+
+    fixture
+        .command()
+        .env("WARD_UNSAFE_TEST_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["logs", "view", "approvals"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "\"requestId\":\"{request_id}\""
+        )))
+        .stdout(predicate::str::contains(
+            "\"approvalChannel\":\"agent-mediated-cli\"",
+        ))
+        .stdout(predicate::str::contains("\"approved\":false"))
+        .stdout(predicate::str::contains("\"command\":\"pnpm lint\""));
 }
 
 #[test]
@@ -3925,7 +4364,11 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
 
     dispatch(Cli {
         command: Commands::Env {
-            command: EnvCommand::List { project: None },
+            command: EnvCommand::List {
+                project: None,
+                app: None,
+                all: false,
+            },
         },
     })
     .unwrap();
@@ -3933,6 +4376,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Set {
                 project: None,
+                app: None,
                 assignment: "OPENAI_API_KEY=sk-test".to_string(),
             },
         },
@@ -3942,6 +4386,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Unset {
                 project: None,
+                app: None,
                 key: "OPENAI_API_KEY".to_string(),
             },
         },
@@ -3951,6 +4396,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Unset {
                 project: None,
+                app: None,
                 key: "MISSING_ENV".to_string(),
             },
         },
@@ -3960,6 +4406,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Unlock {
                 project: None,
+                app: None,
+                all: false,
                 output: ".env.manual".into(),
                 force: false,
             },
@@ -3970,6 +4418,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Lock {
                 project: None,
+                app: None,
                 source: ".env.manual".into(),
             },
         },
@@ -3979,6 +4428,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Export {
                 project: None,
+                app: None,
                 output: None,
                 force: true,
                 unsafe_stdout: false,
@@ -3990,6 +4440,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Export {
                 project: None,
+                app: None,
                 output: Some(".env.dispatch.export".into()),
                 force: false,
                 unsafe_stdout: false,
@@ -4001,6 +4452,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Export {
                 project: None,
+                app: None,
                 output: Some(project.path().join(".env.absolute.export")),
                 force: false,
                 unsafe_stdout: false,
@@ -4012,6 +4464,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Env {
             command: EnvCommand::Export {
                 project: None,
+                app: None,
                 output: None,
                 force: false,
                 unsafe_stdout: true,
@@ -4028,6 +4481,9 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
 
     dispatch(Cli {
         command: Commands::Unlock {
+            project: None,
+            app: None,
+            all: false,
             ttl: "1h".to_string(),
             mode: None,
             verify_only: false,
@@ -4038,6 +4494,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
 
     assert!(dispatch(Cli {
         command: Commands::Allow {
+            project: None,
+            app: None,
             profile: Some("dev".to_string()),
             scope: Some(ApprovalScope::Always),
             agent: Some("codex".to_string()),
@@ -4049,6 +4507,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     .is_err());
     assert!(dispatch(Cli {
         command: Commands::Allow {
+            project: None,
+            app: None,
             profile: None,
             scope: Some(ApprovalScope::Always),
             agent: Some("codex".to_string()),
@@ -4062,6 +4522,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Run {
             profile: Some("dev".to_string()),
             project: None,
+            app: None,
             agent: Some("codex".to_string()),
             agent_key_id: None,
             worktree: Some(context.worktree.clone()),
@@ -4072,6 +4533,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             env_names: Vec::new(),
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
             command: Vec::new(),
         },
     })
@@ -4079,6 +4542,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
 
     dispatch(Cli {
         command: Commands::Request {
+            project: None,
+            app: None,
             profile: None,
             agent: Some("codex".to_string()),
             agent_key_id: None,
@@ -4107,6 +4572,9 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         .unwrap();
     dispatch(Cli {
         command: Commands::Unlock {
+            project: None,
+            app: None,
+            all: false,
             ttl: "1h".to_string(),
             mode: None,
             verify_only: false,
@@ -4127,6 +4595,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
         command: Commands::Run {
             profile: None,
             project: None,
+            app: None,
             agent: Some("codex".to_string()),
             agent_key_id: None,
             worktree: Some(context.worktree.clone()),
@@ -4137,6 +4606,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             env_names: vec!["DATABASE_URL".to_string()],
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         },
     })
@@ -4164,6 +4635,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     .unwrap();
     dispatch(Cli {
         command: Commands::Request {
+            project: None,
+            app: None,
             profile: None,
             agent: Some("codex".to_string()),
             agent_key_id: None,
@@ -4182,6 +4655,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     assert!(dispatch(Cli {
         command: Commands::Teardown {
             project: None,
+            app: None,
             export_path: ".env.unused".into(),
             yes: false,
             restore_env: false,
@@ -4192,6 +4666,7 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
     dispatch(Cli {
         command: Commands::Teardown {
             project: None,
+            app: None,
             export_path: ".env.final".into(),
             yes: true,
             restore_env: false,
@@ -4210,6 +4685,32 @@ struct ContextParts {
     git_remote: String,
     commit: String,
     branch: String,
+}
+
+fn wait_for_single_pending_request(home: &Path, timeout: Duration) -> uuid::Uuid {
+    let deadline = Instant::now() + timeout;
+    let requests_dir = home.join("requests");
+    loop {
+        if requests_dir.exists() {
+            if let Some(request_id) = std::fs::read_dir(&requests_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+                .and_then(|path| {
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+                })
+            {
+                return request_id;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for pending Ward request");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn context_parts_for_path(path: &Path, branch: &str) -> ContextParts {

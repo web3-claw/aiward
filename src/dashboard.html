@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ward dashboard</title>
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.png" type="image/png">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -56,11 +56,12 @@
     color: var(--text);
     letter-spacing: 0.04em;
   }
-  .brand-mark {
-    width: 20px;
-    height: 20px;
+  .brand-logo {
+    width: 92px;
+    height: 26px;
     display: block;
     flex: 0 0 auto;
+    object-fit: contain;
   }
   .logo span { color: var(--accent); }
 
@@ -101,6 +102,67 @@
   .btn:hover, #refresh-btn:hover { color: var(--text); border-color: var(--muted); }
   .btn.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
   .btn.danger:hover { color: var(--red); border-color: var(--red); }
+  .notification-wrap { position: relative; }
+  .notification-btn.active {
+    color: var(--text);
+    border-color: var(--accent);
+    background: #1c1a2e;
+  }
+  .notification-count {
+    display: inline-block;
+    min-width: 16px;
+    padding: 0 5px;
+    margin-left: 5px;
+    border-radius: 99px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+  }
+  .notification-panel {
+    position: absolute;
+    z-index: 80;
+    top: calc(100% + 8px);
+    right: 0;
+    width: min(560px, calc(100vw - 32px));
+    max-height: min(680px, calc(100vh - 88px));
+    overflow: auto;
+    display: none;
+    background: #101014;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: 0 20px 44px rgba(0, 0, 0, 0.48);
+    padding: 10px;
+  }
+  .notification-panel.open { display: block; }
+  .notification-list { display: grid; gap: 8px; }
+  .notification-item {
+    border: 1px solid var(--border);
+    background: var(--surface);
+    border-radius: var(--radius);
+    padding: 9px 10px;
+  }
+  .notification-top {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 7px;
+  }
+  .notification-title { color: var(--text); font-weight: 700; }
+  .notification-meta { margin-left: auto; color: var(--muted); font-size: 10px; }
+  .notification-message { color: var(--muted); line-height: 1.45; margin-bottom: 8px; }
+  .notification-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .notification-code {
+    display: block;
+    padding: 6px 7px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    overflow-wrap: anywhere;
+    line-height: 1.4;
+  }
 
   .filters {
     display: flex;
@@ -426,11 +488,15 @@
 <body>
 <header>
   <div class="dot"></div>
-  <div class="logo"><img class="brand-mark" src="/assets/ward-logo-transparent.svg" alt="" aria-hidden="true">ward <span id="page-title">dashboard</span></div>
+  <div class="logo"><img class="brand-logo" src="/assets/ward-logo-dark.png" alt="Ward"> <span id="page-title">dashboard</span></div>
   <div class="header-right">
     <a class="btn" id="overview-link" href="/">overview</a>
     <a class="btn" id="logs-link" href="/logs">all logs</a>
     <button class="btn" id="add-project-btn">add project</button>
+    <div class="notification-wrap" id="notification-wrap">
+      <button class="btn notification-btn" id="notifications-btn" type="button">notifications<span class="notification-count" id="notification-count">0</span></button>
+      <div class="notification-panel" id="notification-panel"></div>
+    </div>
     <span id="last-refresh">-</span>
     <button id="refresh-btn">refresh</button>
   </div>
@@ -470,6 +536,8 @@ let lastProjectClick = { name: null, at: 0 };
 let kindFilter = 'all';
 let sevFilter = 'all';
 let agentFilter = '';
+let notifications = [];
+let notificationsOpen = false;
 const paneWidthStorageKey = 'ward.dashboard.tablePaneWidth';
 
 restorePaneWidth();
@@ -507,9 +575,10 @@ function projectFromLogPath(path) {
 function isLogsPage() { return currentPath === '/logs' || logsProject; }
 
 async function load() {
-  [projects, status] = await Promise.all([
+  [projects, status, notifications] = await Promise.all([
     api('/api/projects'),
-    api('/api/dashboard/status')
+    api('/api/dashboard/status'),
+    api('/api/notifications')
   ]);
   if (!selectedProject && projects.length) {
     selectedProject = logsProject || (projects.find(p => p.active) || projects[0]).name;
@@ -521,6 +590,8 @@ async function load() {
     renderOverview();
   }
   document.getElementById('last-refresh').textContent = new Date().toLocaleTimeString();
+  renderNotificationBadge();
+  if (notificationsOpen) renderNotifications();
 }
 
 async function loadEvents(project) {
@@ -748,7 +819,7 @@ function filteredEvents() {
   return events.filter(event => {
     const payload = event.payload || event;
     if (kindFilter !== 'all' && event._kind !== kindFilter) return false;
-    const agent = payload.agent || (payload.access && payload.access.agent) || '';
+    const agent = eventAgent(payload, '');
     if (agentFilter && agent !== agentFilter) return false;
     if (sevFilter === 'warn' && severity(event) === 'info') return false;
     if (sevFilter === 'crit' && severity(event) !== 'crit') return false;
@@ -767,8 +838,8 @@ function renderLogTable() {
   const tbody = table.querySelector('tbody');
   rows.forEach((event, index) => {
     const payload = event.payload || event;
-    const agent = payload.agent || (payload.access && payload.access.agent) || '-';
-    const cmd = payload.requestedCommand || (payload.access && payload.access.command) || payload.declaredAction || (payload.access && payload.access.action) || payload.eventType || '-';
+    const agent = eventAgent(payload, '-');
+    const cmd = eventCommand(payload, '-');
     const sev = severity(event);
     const tr = document.createElement('tr');
     if (selectedEventKey && eventKey(event) === selectedEventKey) tr.classList.add('selected');
@@ -807,7 +878,7 @@ function eventKey(event) {
 function updateAgentSelect() {
   const agents = [...new Set(events.map(event => {
     const payload = event.payload || event;
-    return payload.agent || (payload.access && payload.access.agent) || '';
+    return eventAgent(payload, '');
   }).filter(Boolean))].sort();
   if (agentFilter && !agents.includes(agentFilter)) agentFilter = '';
   const host = document.getElementById('agent-filter');
@@ -877,17 +948,92 @@ function closeDropdowns(except = null) {
   });
 }
 
+function eventSnapshot(payload) {
+  return payload.requestSnapshot || null;
+}
+
+function eventAgent(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.agent || (payload.access && payload.access.agent) || (snapshot && snapshot.agent) || fallback;
+}
+
+function eventBranch(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.branch || (payload.git && payload.git.branch) || (payload.access && payload.access.branch) || (snapshot && snapshot.branch) || (snapshot && snapshot.git && snapshot.git.branch) || fallback;
+}
+
+function eventWorktree(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return (payload.git && payload.git.worktreePath) || payload.cwd || (snapshot && snapshot.git && snapshot.git.worktreePath) || fallback;
+}
+
+function eventCommit(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return (payload.git && payload.git.commit) || (snapshot && snapshot.git && snapshot.git.commit) || fallback;
+}
+
+function eventCommand(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.requestedCommand || (payload.access && payload.access.command) || (snapshot && snapshot.command) || payload.declaredAction || (payload.access && payload.access.action) || (snapshot && snapshot.action) || payload.eventType || fallback;
+}
+
+function eventAction(payload, fallback = null) {
+  const snapshot = eventSnapshot(payload);
+  return payload.declaredAction || (payload.access && payload.access.action) || (snapshot && snapshot.action) || fallback;
+}
+
+function eventEnvVars(payload) {
+  const snapshot = eventSnapshot(payload);
+  return payload.injectedEnv || payload.requestedEnv || (payload.access && payload.access.env) || (snapshot && (snapshot.env || snapshot.requestedEnv)) || [];
+}
+
+function eventFindings(payload) {
+  const snapshot = eventSnapshot(payload);
+  return payload.policyFindings || (payload.policy && payload.policy.findings) || (snapshot && snapshot.policyFindings) || [];
+}
+
+function relatedAuditEvents(event) {
+  const payload = event.payload || event;
+  const correlationId = payload.correlationId || null;
+  const requestId = payload.requestId || null;
+  if (!correlationId && !requestId) return [];
+  return events.filter(candidate => {
+    if (candidate === event) return false;
+    const candidatePayload = candidate.payload || candidate;
+    return (correlationId && candidatePayload.correlationId === correlationId)
+      || (requestId && (candidatePayload.requestId === requestId || candidatePayload.grantOriginRequestId === requestId));
+  });
+}
+
+function requestOutcome(event) {
+  if (event._kind !== 'request') return null;
+  const payload = event.payload || event;
+  const related = relatedAuditEvents(event);
+  if (related.some(item => {
+    const relatedPayload = item.payload || item;
+    return item._kind === 'execution' && relatedPayload.eventType === 'execution.finished';
+  })) return 'executed';
+  const approval = related.find(item => item._kind === 'approval');
+  if (approval) {
+    const decision = (approval.payload || approval).decision;
+    if (decision && typeof decision === 'object') return decision.approved ? 'approved' : 'denied';
+  }
+  if (payload.expiresAt && Date.parse(payload.expiresAt) < Date.now()) return 'expired';
+  return 'pending';
+}
+
 function renderEventDetail(event) {
   const payload = event.payload || event;
   const sev = severity(event);
-  const agent = payload.agent || (payload.access && payload.access.agent) || null;
-  const branch = payload.branch || (payload.git && payload.git.branch) || (payload.access && payload.access.branch) || null;
-  const worktree = (payload.git && payload.git.worktreePath) || payload.cwd || null;
-  const commit = payload.git && payload.git.commit ? payload.git.commit.slice(0,12) : null;
-  const cmd = payload.requestedCommand || (payload.access && payload.access.command) || null;
-  const action = payload.declaredAction || (payload.access && payload.access.action) || null;
-  const envVars = payload.injectedEnv || payload.requestedEnv || (payload.access && payload.access.env) || [];
-  const findings = payload.policyFindings || [];
+  const agent = eventAgent(payload, null);
+  const branch = eventBranch(payload, null);
+  const worktree = eventWorktree(payload, null);
+  const commitValue = eventCommit(payload, null);
+  const commit = commitValue ? commitValue.slice(0,12) : null;
+  const cmd = eventCommand(payload, null);
+  const action = eventAction(payload, null);
+  const envVars = eventEnvVars(payload);
+  const findings = eventFindings(payload);
   const outcome = payload.outcome || null;
   let html = `<div class="detail-header">
     <span class="badge badge-${event._kind}">${event._kind}</span>
@@ -901,6 +1047,23 @@ function renderEventDetail(event) {
   if (action) html += field('action', esc(action));
   if (commit) html += field('commit', esc(commit));
   if (event._project) html += field('project', esc(event._project));
+  const outcomeLabel = requestOutcome(event);
+  if (outcomeLabel) html += field('request status', esc(outcomeLabel));
+  if (payload.correlationId) html += field('correlation', esc(payload.correlationId));
+  if (payload.requestId) html += field('request', esc(payload.requestId));
+  if (payload.expiresAt) html += field('expires', esc(payload.expiresAt));
+  if (payload.approvalChannel) html += field('approved by', esc(payload.approvalChannel));
+  if (payload.approvalScope) html += field('approval scope', esc(payload.approvalScope));
+  if (payload.approvalSource) html += field('approval source', esc(payload.approvalSource));
+  if (payload.grantId) html += field('grant', esc(payload.grantId));
+  if (payload.grantOriginRequestId) html += field('grant request', esc(payload.grantOriginRequestId));
+  if (payload.approvalReceiptHash) html += field('receipt', esc(shorten(payload.approvalReceiptHash, 24)));
+  if (payload.decision && typeof payload.decision === 'object') {
+    html += field('decision', `<span class="${payload.decision.approved ? 'outcome-success' : 'outcome-failure'}">${payload.decision.approved ? 'approved' : 'denied'}</span>`);
+    if (payload.decision.scope) html += field('decision scope', esc(payload.decision.scope));
+    if (payload.decision.source) html += field('decision source', esc(payload.decision.source));
+  }
+  if (payload.criticalConfirmation) html += field('critical confirmation', 'true');
   if (outcome) {
     const code = typeof outcome === 'object' ? outcome.exitCode ?? outcome.exit_code : outcome;
     const ok = code === 0 || code === 'success';
@@ -921,11 +1084,11 @@ function renderEventDetail(event) {
 function severity(event) {
   const payload = event.payload || event;
   if (event._kind === 'alert') return 'warn';
-  const findings = payload.policyFindings || [];
+  const findings = eventFindings(payload);
   if (findings.some(f => f.severity === 'critical')) return 'crit';
   if (findings.some(f => f.severity === 'warning')) return 'warn';
   const decision = payload.decision || '';
-  if (decision === 'deny') return 'warn';
+  if (decision === 'deny' || (decision && typeof decision === 'object' && decision.approved === false)) return 'warn';
   return 'info';
 }
 
@@ -972,6 +1135,160 @@ function setupSourceProject() {
   if (selected && selected.brokerSessionActive) return selected.name;
   const active = projects.find(project => project.brokerSessionActive);
   return active ? active.name : (selected ? selected.name : null);
+}
+
+function renderNotificationBadge() {
+  const count = notifications.length;
+  const badge = document.getElementById('notification-count');
+  const btn = document.getElementById('notifications-btn');
+  badge.textContent = String(count);
+  badge.style.display = count ? 'inline-block' : 'none';
+  btn.classList.toggle('active', notificationsOpen || count > 0);
+}
+
+function toggleNotifications(force) {
+  notificationsOpen = typeof force === 'boolean' ? force : !notificationsOpen;
+  document.getElementById('notification-panel').classList.toggle('open', notificationsOpen);
+  renderNotificationBadge();
+  if (notificationsOpen) renderNotifications();
+}
+
+function renderNotifications() {
+  const panel = document.getElementById('notification-panel');
+  if (!notifications.length) {
+    panel.innerHTML = '<div class="detail-empty">no pending notifications</div>';
+    return;
+  }
+  panel.innerHTML = `<div class="notification-list">${notifications.map(notificationMarkup).join('')}</div>`;
+  panel.querySelectorAll('[data-approve-scope]').forEach(button => {
+    button.addEventListener('click', async () => {
+      await approveNotification(button.dataset.notificationId, button.dataset.approveScope);
+    });
+  });
+  panel.querySelectorAll('[data-deny-notification]').forEach(button => {
+    button.addEventListener('click', async () => {
+      await denyNotification(button.dataset.notificationId, button.dataset.notificationKind);
+    });
+  });
+  panel.querySelectorAll('[data-copy-command]').forEach(button => {
+    button.addEventListener('click', async () => {
+      const command = button.dataset.copyCommand;
+      try { await navigator.clipboard.writeText(command); button.textContent = 'copied'; }
+      catch (_) { prompt('Copy command:', command); }
+    });
+  });
+}
+
+function notificationMarkup(notification) {
+  const riskClass = notification.risk === 'critical' ? 'sev-crit' : notification.risk === 'warning' ? 'sev-warn' : 'sev-info';
+  const env = (notification.env || []).length ? field('env', notification.env.map(envChip).join('')) : '';
+  const command = notification.command ? field('command', `<span class="notification-code">${esc(notification.command)}</span>`) : '';
+  const worktree = notification.worktree ? field('worktree', esc(shortPath(notification.worktree))) : '';
+  const message = notification.message ? `<div class="notification-message">${esc(notification.message)}</div>` : '';
+  const findings = (notification.findings || []).length ? `<div class="field-group"><div class="field-label">findings</div>${notification.findings.map(findingMarkup).join('')}</div>` : '';
+  const fallback = notification.fixCommand || notification.denyCommand || firstApproveCommand(notification);
+  const fallbackMarkup = fallback ? `${field('fallback command', `<span class="notification-code">${esc(fallback)}</span>`)}<button class="btn" data-copy-command="${esc(fallback)}">copy command</button>` : '';
+  return `<div class="notification-item">
+    <div class="notification-top">
+      <span class="badge ${notification.kind === 'worktreeApproval' ? 'badge-alert' : 'badge-request'}">${esc(notification.kind)}</span>
+      <span class="notification-title">${esc(notification.title)}</span>
+      <span class="${riskClass}">${esc(notification.risk)}</span>
+      <span class="notification-meta">${esc(timeAgo(notification.createdAt))}</span>
+    </div>
+    ${field('project', esc(notification.project))}
+    ${notification.agent ? field('agent', esc(notification.agent)) : ''}
+    ${command}
+    ${worktree}
+    ${env}
+    ${message}
+    ${findings}
+    ${fallbackMarkup}
+    ${notificationActions(notification)}
+  </div>`;
+}
+
+function findingMarkup(finding) {
+  const cls = finding.severity === 'critical' ? 'sev-crit' : finding.severity === 'warning' ? 'sev-warn' : 'sev-info';
+  return `<div class="finding"><div class="finding-header"><span class="${cls}">${esc(finding.severity)}</span><span class="finding-msg">${esc(finding.code)}</span></div><div class="finding-msg">${esc(finding.message)}</div></div>`;
+}
+
+function notificationActions(notification) {
+  const id = esc(notification.id);
+  let html = '<div class="notification-actions">';
+  if (notification.canApprove) {
+    if (notification.kind === 'worktreeApproval') {
+      html += `<button class="btn primary" data-approve-scope="worktree" data-notification-id="${id}">approve worktree</button>`;
+    } else {
+      (notification.approvalOptions || []).filter(scope => scope !== 'deny').forEach(scope => {
+        html += `<button class="btn primary" data-approve-scope="${esc(scope)}" data-notification-id="${id}">approve ${esc(scope)}</button>`;
+      });
+    }
+  }
+  if (notification.canDeny) {
+    html += `<button class="btn danger" data-deny-notification="${id}" data-notification-kind="${esc(notification.kind)}">deny</button>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function firstApproveCommand(notification) {
+  const command = (notification.approveCommands || [])[0];
+  return command ? command.command : null;
+}
+
+async function approveNotification(id, scope) {
+  const notification = notifications.find(item => item.id === id);
+  if (!notification) return;
+  try {
+    if (notification.kind === 'worktreeApproval' || scope === 'worktree') {
+      await api(`/api/worktrees/${encodeURIComponent(id)}/approve`, { method: 'POST', body: '{}' });
+    } else {
+      await api(`/api/approvals/${encodeURIComponent(id)}/approve`, {
+        method: 'POST',
+        body: JSON.stringify({ scope, confirmCritical: notification.kind === 'criticalApproval' })
+      });
+    }
+    await load();
+  } catch (error) {
+    alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
+  }
+}
+
+async function denyNotification(id, kind) {
+  try {
+    const path = kind === 'worktreeApproval' ? `/api/worktrees/${encodeURIComponent(id)}/deny` : `/api/approvals/${encodeURIComponent(id)}/deny`;
+    await api(path, { method: 'POST', body: '{}' });
+    await load();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+function timeAgo(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.round(minutes / 60)}h`;
+}
+
+function bindNotificationStream() {
+  if (!window.EventSource) return;
+  const source = new EventSource(withToken('/api/notifications/stream'));
+  source.addEventListener('notifications', event => {
+    try {
+      const data = JSON.parse(event.data);
+      notifications = data.notifications || [];
+      renderNotificationBadge();
+      if (notificationsOpen) renderNotifications();
+    } catch (_) {}
+  });
+  source.onerror = () => {
+    source.close();
+    setTimeout(bindNotificationStream, 2500);
+  };
 }
 
 function bindSplitter() {
@@ -1028,8 +1345,13 @@ function esc(value) {
 
 document.getElementById('refresh-btn').addEventListener('click', load);
 document.getElementById('add-project-btn').addEventListener('click', addProject);
+document.getElementById('notifications-btn').addEventListener('click', event => {
+  event.stopPropagation();
+  toggleNotifications();
+});
 bindSplitter();
 document.addEventListener('click', event => {
+  if (notificationsOpen && !event.target.closest('#notification-wrap')) toggleNotifications(false);
   if (!event.target.closest('[data-dropdown]')) closeDropdowns();
 });
 document.addEventListener('keydown', event => {
@@ -1038,6 +1360,7 @@ document.addEventListener('keydown', event => {
 load().catch(error => {
   document.getElementById('detail-pane').innerHTML = `<div class="finding"><div class="finding-header"><span class="sev-crit">error</span></div><div class="finding-msg">${esc(error.message)}</div></div>`;
 });
+bindNotificationStream();
 setInterval(load, 5000);
 </script>
 </body>

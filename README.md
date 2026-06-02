@@ -14,6 +14,13 @@ There are two modes:
 
 **Agent mode** — AI agents (Claude, Codex, etc.) request scoped access through ward's approval flow. You see what they're asking for and approve or deny it. Ward generates the agent instructions automatically — you don't configure this manually.
 
+Ward lets you tune how much friction each project requires. You can define
+profiles and presets for trusted commands, grant approvals for a session,
+branch, or long-lived project workflow, and use session modes to limit which
+envs are available while the vault is unlocked. For more casual environments,
+create broader profiles or auto-approved presets. Agent mode still stays
+explicit, scoped, and audited.
+
 ---
 
 ## Install
@@ -46,13 +53,28 @@ Ward will walk you through:
 - Detecting workspace apps when the project is a monorepo
 - Wiring up your shell
 
+The setup wizard groups progress by project, vault, session, recovery, and shell
+status, and prints exact next-step commands when action is needed.
+
 Your plaintext `.env` is replaced with a locked marker file — secrets live in the encrypted vault from this point on.
+
+Ward also keeps a private local metadata backup of `.ward.json` under
+`~/.ward/config-backups/`. The backup is unencrypted, permissioned as local
+private metadata, and never contains plaintext secret values. If `.ward.json` is
+deleted, rerun `ward setup` in the project; setup tries to restore the config
+from that backup before creating anything new. You can also restore explicitly:
+
+```bash
+ward config restore
+```
 
 For monorepos and Turborepos, run setup from the workspace root. Ward detects
 workspace apps from `pnpm-workspace.yaml`, `package.json` workspaces, and
 `turbo.json`, then configures each app that has its own `.env` as a child
 project. Apps with only `.env.example` are shown as `needsEnv` until a real
-`.env` is available.
+`.env` is available. Workspace setup also records the workspace Git root as a
+trusted worktree for each configured child app project, so agents should claim
+the Git root as `--worktree` even when running commands from an app folder.
 
 ```bash
 ward workspace discover --json
@@ -73,6 +95,10 @@ ward human
 ```
 
 Ward spawns a guardian tied to your terminal. When you run `pnpm dev`, `node`, or any other command that needs secrets, ward intercepts it, injects the approved env vars, and lets the process run. Inside a Ward project, wrapped commands fail closed if human mode is not active for that terminal, so a dev server does not silently start without secrets.
+
+`ward human` prints a guided activation summary with the active project, session
+TTL, guardian shell, command routing status, and dashboard link when a dashboard
+is already running.
 
 **Shell integration** (add to `~/.zshrc` for automatic loading):
 
@@ -96,7 +122,8 @@ ward lock
 
 ## Session modes
 
-Modes let you define permission envelopes — which secrets a command is allowed to touch and for how long.
+Modes let you define permission envelopes: which env names are available during
+an unlock session and, in supervised mode, which command patterns are allowed.
 
 Create a `.ward.modes.json` in your project:
 
@@ -131,7 +158,67 @@ Unlock with a specific mode:
 ward unlock --ttl 2h --mode dev
 ```
 
-Now commands outside that mode's `allowedEnv` are blocked automatically — even if you run them manually.
+Now commands that request env names outside that mode's `allowedEnv` are blocked
+automatically, even if you run them manually through Ward.
+
+---
+
+## Reducing approval prompts
+
+Ward gives you several levels of freedom without turning agent access into an
+unscoped free-for-all.
+
+**Profiles** are the preferred command layer. A profile maps a short name to one
+command, exact env names, a default approval scope, and an action description:
+
+```json
+{
+  "profiles": {
+    "dev": {
+      "command": "pnpm dev",
+      "env": ["DATABASE_URI", "PAYLOAD_SECRET", "NEXT_PUBLIC_SERVER_URL"],
+      "defaultScope": "always",
+      "action": "Run local development server"
+    }
+  }
+}
+```
+
+Allow a trusted agent to reuse that profile:
+
+```bash
+ward allow --profile dev --agent codex --scope always
+ward dev --agent codex
+```
+
+**Presets** are lower-level policy rules for raw command matching. Use them when
+you want a known command pattern to be approved automatically if it asks only
+for the allowed env names and no critical findings are detected:
+
+```json
+{
+  "presets": [
+    {
+      "name": "safe-dev",
+      "match": ["pnpm dev", "pnpm dev *"],
+      "allowedEnv": ["DATABASE_URI", "PAYLOAD_SECRET", "NEXT_PUBLIC_*"],
+      "approval": "auto"
+    }
+  ]
+}
+```
+
+**Approval scopes** control how long a grant can be reused:
+
+```bash
+ward allow --profile dev --agent codex --scope session
+ward allow --profile dev --agent codex --scope branch --branch main
+ward allow --profile dev --agent codex --scope always
+```
+
+`always` is durable for the same project workflow, but it is still scoped to the
+agent, command/profile, and env names. It does not decrypt the vault by itself
+and it is not a generic "give this agent everything forever" switch.
 
 ---
 
@@ -162,6 +249,12 @@ ward dashboard tui
 The dashboard never displays or edits secret values. It can add/register
 projects and edit profile policies by env name only. Monorepo app projects
 appear alongside regular projects once detected or configured.
+
+The header notification center shows anything currently blocking an agent:
+run approvals, critical confirmations, worktree bindings, unlock-required
+states, missing vault keys, and policy denials. For approvable requests, the
+dashboard uses the same signed grant logic as `ward approve`; it also shows
+copyable CLI commands as a fallback.
 
 ---
 
@@ -195,10 +288,27 @@ You don't need to configure agent mode manually. The file is auto-generated from
 
 Agent runs outside human mode must identify themselves with `--agent <name>`. Ward rejects anonymous `run`, `request`, and `allow` calls so dashboard logs and approval grants stay tied to an agent identity.
 
+If an agent reaches a new checkout, Ward may return a
+`worktree_approval_required` response before any secret grant is considered.
+Generated agent instructions tell Codex, Claude Code, and other agents to show
+that as a structured approve/deny choice with the exact path, branch, commit,
+remote, and reason. Agents must not approve that trust binding themselves.
+
+For commands that should continue after approval, agents should use:
+
+```bash
+ward run --wait-for-approval --approval-timeout 30m --json --no-prompt -- <command>
+```
+
+When Ward blocks, this creates a dashboard notification and keeps the original
+process alive until the human approves, denies, unlocks, or the timeout expires.
+The lower-level tools are `ward approvals list --json` and
+`ward approvals wait <request-id> --json`.
+
 The agent flow at a glance:
 
 ```
-agent requests access  →  ward evaluates scope  →  you approve or deny
+agent runs with wait  →  ward evaluates scope  →  you approve or deny
             ↓
   ward injects only the approved env vars into the command
             ↓

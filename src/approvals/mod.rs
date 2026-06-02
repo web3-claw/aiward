@@ -30,6 +30,19 @@ pub enum ApprovalSource {
     PolicyDeny,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalChannel {
+    Dashboard,
+    TerminalApprove,
+    AgentMediatedCli,
+    LocalPrompt,
+    ManualAllow,
+    PolicyAuto,
+    PolicyDeny,
+    GrantReuse,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalDecision {

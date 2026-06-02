@@ -41,6 +41,14 @@ pub struct RegisteredProject {
     pub canonical_repo_path: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_common_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +100,10 @@ pub fn register_project(
         auto_bind_worktrees: true,
         canonical_repo_path,
         git_common_dir: git.common_dir,
+        workspace_root: None,
+        workspace_name: None,
+        app_slug: None,
+        parent_workspace: None,
     };
 
     registry
@@ -128,11 +140,33 @@ pub fn update_project_vault(project: &str, path: PathBuf, vault: PathBuf) -> Res
                 auto_bind_worktrees: true,
                 canonical_repo_path,
                 git_common_dir: git.common_dir,
+                workspace_root: None,
+                workspace_name: None,
+                app_slug: None,
+                parent_workspace: None,
             };
             registry.projects.insert(project.to_string(), registered);
         }
     }
     registry.active_project = Some(project.to_string());
+    save_registry(&registry)
+}
+
+pub fn update_project_workspace_metadata(
+    project: &str,
+    workspace_root: Option<PathBuf>,
+    workspace_name: Option<String>,
+    app_slug: Option<String>,
+    parent_workspace: Option<String>,
+) -> Result<()> {
+    let mut registry = load_registry()?;
+    let Some(registered) = registry.projects.get_mut(project) else {
+        anyhow::bail!("project {project} is not registered");
+    };
+    registered.workspace_root = workspace_root;
+    registered.workspace_name = workspace_name;
+    registered.app_slug = app_slug;
+    registered.parent_workspace = parent_workspace;
     save_registry(&registry)
 }
 
@@ -211,7 +245,14 @@ pub fn resolve_project(explicit_project: Option<&str>, cwd: &Path) -> Result<Res
         .projects
         .iter()
         .filter(|(_, registered)| cwd.starts_with(&registered.path))
-        .max_by_key(|(_, registered)| registered.path.components().count())
+        .max_by(|(left_name, left), (right_name, right)| {
+            left.path
+                .components()
+                .count()
+                .cmp(&right.path.components().count())
+                .then_with(|| left.git_remote.is_none().cmp(&right.git_remote.is_none()))
+                .then_with(|| left_name.cmp(right_name))
+        })
     {
         return Ok(ResolvedProject {
             name: name.clone(),
@@ -279,6 +320,10 @@ mod tests {
             auto_bind_worktrees: true,
             canonical_repo_path: None,
             git_common_dir: None,
+            workspace_root: None,
+            workspace_name: None,
+            app_slug: None,
+            parent_workspace: None,
             created_at: "2026-05-26T00:00:00Z".to_string(),
             last_used: None,
         }

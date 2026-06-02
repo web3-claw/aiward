@@ -2,6 +2,8 @@ use std::{
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
+    thread,
+    time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result};
@@ -12,14 +14,14 @@ use serde_json::Value;
 
 use crate::{
     agents, anomaly,
-    approvals::{self, ApprovalDecision, ApprovalScope},
+    approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
     broker, config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
-    modes, pending_requests,
+    modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
     recovery, registry,
     runner::{self, RunCommandRequest},
-    term, unlock, vault, workspace, worktrees,
+    term, unlock, vault, workspace, workspace_target, worktrees,
 };
 
 #[derive(Debug)]
@@ -117,6 +119,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: ProjectsCommand,
     },
+    /// Manage the local project config manifest.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage the current project's dotenv vault and locked .env file.
     Env {
         #[command(subcommand)]
@@ -124,6 +131,10 @@ pub enum Commands {
     },
     /// Request scoped secret access without running a command.
     Request {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
@@ -152,6 +163,10 @@ pub enum Commands {
     /// Create an approval grant directly for a known safe command.
     Allow {
         #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
         profile: Option<String>,
         #[arg(long, value_enum)]
         scope: Option<ApprovalScope>,
@@ -168,6 +183,11 @@ pub enum Commands {
     Grants {
         #[command(subcommand)]
         command: GrantsCommand,
+    },
+    /// Inspect and wait for dashboard approval notifications.
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
     },
     /// Approve a pending non-interactive request.
     Approve {
@@ -196,6 +216,8 @@ pub enum Commands {
         #[arg(long)]
         project: Option<String>,
         #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
         agent: Option<String>,
         #[arg(long)]
         agent_key_id: Option<String>,
@@ -215,6 +237,10 @@ pub enum Commands {
         json: bool,
         #[arg(long)]
         no_prompt: bool,
+        #[arg(long)]
+        wait_for_approval: bool,
+        #[arg(long, default_value = "30m")]
+        approval_timeout: String,
         #[arg(
             last = true,
             help = "Child command and args after --. Put all Ward flags before --."
@@ -223,6 +249,10 @@ pub enum Commands {
     },
     /// Run the dev profile.
     Dev {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         #[arg(long)]
         agent: Option<String>,
         #[arg(long)]
@@ -243,6 +273,10 @@ pub enum Commands {
     /// Run the migrate profile.
     Migrate {
         #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
         agent: Option<String>,
         #[arg(long)]
         agent_key_id: Option<String>,
@@ -260,7 +294,14 @@ pub enum Commands {
         no_prompt: bool,
     },
     /// Validate the current Ward setup.
-    Doctor,
+    Doctor {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        all: bool,
+    },
     /// Inspect and control the local Ward broker.
     Broker {
         #[command(subcommand)]
@@ -284,10 +325,21 @@ pub enum Commands {
         kind: Option<LogKind>,
     },
     /// Safely edit the encrypted env vault.
-    Edit,
+    Edit {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+    },
     /// Create a short-lived run unlock session.
     #[command(visible_alias = "resume")]
     Unlock {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = "8h")]
         ttl: String,
         /// Activate a named session mode after unlocking (must be pushed first via `ward modes push`).
@@ -308,6 +360,8 @@ pub enum Commands {
     Teardown {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         #[arg(long = "export", default_value = ".env.export")]
         export_path: PathBuf,
         #[arg(long)]
@@ -328,6 +382,12 @@ pub enum Commands {
     },
     /// Activate human mode for this terminal window.
     Human {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        all: bool,
         /// Unlock duration (e.g. 8h, 30m).
         #[arg(long, default_value = "8h")]
         ttl: String,
@@ -336,9 +396,15 @@ pub enum Commands {
     Rotate {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
     },
     /// Manage recovery keys for this project.
     Recovery {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         #[command(subcommand)]
         command: RecoveryCommand,
     },
@@ -383,6 +449,19 @@ pub enum ProjectsCommand {
     Use { project: String },
     /// Remove a project from the global registry.
     Remove { project: String },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Restore a missing .ward.json from the local private metadata backup.
+    Restore {
+        /// Overwrite an existing .ward.json.
+        #[arg(long)]
+        force: bool,
+        /// Print machine-readable restore status.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -468,6 +547,13 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show configured workspace app projects.
+    Projects {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run workspace-aware doctor diagnostics.
+    Doctor,
 }
 
 #[derive(Debug, Subcommand)]
@@ -476,23 +562,35 @@ pub enum EnvCommand {
     List {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        all: bool,
     },
     /// Set one encrypted env value with KEY=value syntax.
     Set {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         assignment: String,
     },
     /// Remove one encrypted env value.
     Unset {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         key: String,
     },
     /// Write plaintext .env for manual local development.
     Unlock {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        all: bool,
         #[arg(long, default_value = ".env")]
         output: PathBuf,
         #[arg(long)]
@@ -502,6 +600,8 @@ pub enum EnvCommand {
     Lock {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         #[arg(long, default_value = ".env")]
         source: PathBuf,
     },
@@ -509,6 +609,8 @@ pub enum EnvCommand {
     Export {
         #[arg(long)]
         project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
         #[arg(long)]
         output: Option<PathBuf>,
         #[arg(long)]
@@ -526,6 +628,23 @@ pub enum GrantsCommand {
     Revoke { grant_id: uuid::Uuid },
     /// Remove expired grants.
     Prune,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApprovalsCommand {
+    /// List pending approval notifications.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait until a pending approval is resolved.
+    Wait {
+        request_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "30m")]
+        timeout: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -561,7 +680,12 @@ pub enum LogsCommand {
 #[derive(Debug, Subcommand)]
 pub enum ModesCommand {
     /// List modes defined in .ward.modes.json.
-    List,
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+    },
     /// Push local .ward.modes.json to broker vault (PIN required).
     Push {
         /// Apply globally across all projects.
@@ -570,9 +694,17 @@ pub enum ModesCommand {
         /// Apply to a specific project by name.
         #[arg(long)]
         project: Option<String>,
+        /// Apply to a specific workspace app.
+        #[arg(long)]
+        app: Option<String>,
     },
     /// Show the active session mode (if any).
-    Status,
+    Status {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -643,8 +775,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => register(project, path, vault),
         Commands::Use { project } => use_project(&project),
         Commands::Projects { command } => projects_command(command),
+        Commands::Config { command } => config_command(command),
         Commands::Env { command } => env_command(command),
         Commands::Request {
+            project,
+            app,
             profile,
             agent,
             agent_key_id,
@@ -657,7 +792,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             env_names,
             json,
             no_prompt,
-        } => request(
+        } => request_for_target(
+            project,
+            app,
             profile,
             AgentContextOptions {
                 agent,
@@ -674,14 +811,19 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             no_prompt,
         ),
         Commands::Allow {
+            project,
+            app,
             profile,
             scope,
             agent,
             branch,
             command,
             env_names,
-        } => allow(profile, scope, agent, branch, command, env_names),
+        } => allow_for_target(
+            project, app, profile, scope, agent, branch, command, env_names,
+        ),
         Commands::Grants { command } => grants_command(command),
+        Commands::Approvals { command } => approvals_command(command),
         Commands::Approve {
             request_id,
             scope,
@@ -697,6 +839,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Run {
             profile,
             project,
+            app,
             agent,
             agent_key_id,
             worktree,
@@ -707,6 +850,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             env_names,
             json,
             no_prompt,
+            wait_for_approval,
+            approval_timeout,
             command,
         } => run_with_context(
             RunOptions {
@@ -719,6 +864,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 command,
                 json,
                 no_prompt,
+                wait_for_approval,
+                approval_timeout,
             },
             AgentContextOptions {
                 agent,
@@ -728,8 +875,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 commit,
                 branch,
             },
+            app,
         ),
         Commands::Dev {
+            project,
+            app,
             agent,
             agent_key_id,
             worktree,
@@ -741,7 +891,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => run_with_context(
             RunOptions {
                 profile: Some("dev".to_string()),
-                project: None,
+                project,
                 agent: agent.clone(),
                 branch: branch.clone(),
                 action: None,
@@ -749,6 +899,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 command: Vec::new(),
                 json,
                 no_prompt,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
             },
             AgentContextOptions {
                 agent,
@@ -758,8 +910,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 commit,
                 branch,
             },
+            app,
         ),
         Commands::Migrate {
+            project,
+            app,
             agent,
             agent_key_id,
             worktree,
@@ -771,7 +926,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => run_with_context(
             RunOptions {
                 profile: Some("migrate".to_string()),
-                project: None,
+                project,
                 agent: agent.clone(),
                 branch: branch.clone(),
                 action: None,
@@ -779,6 +934,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 command: Vec::new(),
                 json,
                 no_prompt,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
             },
             AgentContextOptions {
                 agent,
@@ -788,35 +945,49 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 commit,
                 branch,
             },
+            app,
         ),
-        Commands::Doctor => doctor(),
+        Commands::Doctor { project, app, all } => doctor_for_target(project, app, all),
         Commands::Broker { command } => broker_command(command),
         Commands::Worktrees { command } => worktrees_command(command),
         Commands::Workspace { command } => workspace_command(command),
         Commands::Logs { command, kind } => logs(command, kind),
-        Commands::Edit => edit(),
+        Commands::Edit { project, app } => edit(project, app),
         Commands::Unlock {
+            project,
+            app,
+            all,
             ttl,
             mode,
             verify_only,
-        } => unlock_vault(&ttl, mode.as_deref(), verify_only),
+        } => unlock_vault_for_target(project, app, all, &ttl, mode.as_deref(), verify_only),
         Commands::Modes { command } => modes_command(command),
         Commands::Lock => lock(),
         Commands::Teardown {
             project,
+            app,
             export_path,
             yes,
             restore_env,
-        } => teardown(project, export_path, yes, restore_env),
+        } => teardown(project, app, export_path, yes, restore_env),
         #[cfg(all(coverage, not(test)))]
         Commands::Coverage => coverage_exercise_cli_edges(),
         Commands::BrokerServe => broker::serve(),
         Commands::ShellInit { shell } => shell_init(shell.as_deref()),
-        Commands::Rotate { project } => rotate_vault(project.as_deref()),
-        Commands::Recovery { command } => recovery_command(command),
+        Commands::Rotate { project, app } => rotate_vault(project, app),
+        Commands::Recovery {
+            project,
+            app,
+            command,
+        } => recovery_command(project, app, command),
         Commands::Dashboard { command } => dashboard_command(command),
         Commands::DashboardServer { port, token } => crate::webui::serve_standalone(port, token),
-        Commands::Human { ttl } => crate::human::activate_human_mode(&ttl),
+        Commands::Human {
+            project,
+            app,
+            all,
+            ttl,
+        } => crate::human::activate_human_mode(project, app, all, &ttl),
         Commands::HumanGuardian {
             shell_pid,
             session_token,
@@ -849,6 +1020,12 @@ struct EnvFileEvent<'a> {
 
 #[derive(Serialize)]
 struct RequestEvent<'a> {
+    #[serde(rename = "correlationId")]
+    correlation_id: uuid::Uuid,
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
+    #[serde(rename = "expiresAt", skip_serializing_if = "Option::is_none")]
+    expires_at: Option<&'a chrono::DateTime<chrono::Utc>>,
     access: &'a AccessRequest,
     policy: &'a policy::PolicyEvaluation,
     git: &'a git_context::GitContext,
@@ -858,7 +1035,33 @@ struct RequestEvent<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RequestAuditSnapshot<'a> {
+    project: &'a str,
+    agent: &'a Option<String>,
+    branch: &'a Option<String>,
+    action: &'a Option<String>,
+    command: &'a str,
+    env: &'a [String],
+    requested_env: &'a [String],
+    matched_profile: &'a Option<String>,
+    matched_preset: &'a Option<String>,
+    matched_mode: &'a Option<String>,
+    policy_findings: &'a [detection::Finding],
+    git: &'a git_context::GitContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_context: Option<&'a context::VerifiedContext>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ApprovalEvent<'a> {
+    correlation_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
+    project: &'a str,
+    approval_channel: ApprovalChannel,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_snapshot: Option<RequestAuditSnapshot<'a>>,
     decision: &'a ApprovalDecision,
     persisted_grant: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -877,6 +1080,9 @@ struct ApprovalEvent<'a> {
 struct ExecutionStartedEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
+    correlation_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
     project: &'a str,
     agent: &'a Option<String>,
     branch: &'a Option<String>,
@@ -889,7 +1095,10 @@ struct ExecutionStartedEvent<'a> {
     policy_findings: &'a [detection::Finding],
     approval_scope: ApprovalScope,
     approval_source: approvals::ApprovalSource,
+    approval_channel: ApprovalChannel,
     grant_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_origin_request_id: Option<uuid::Uuid>,
     approval_receipt_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_key_id: Option<&'a str>,
@@ -902,6 +1111,9 @@ struct ExecutionStartedEvent<'a> {
 struct ExecutionEvent<'a> {
     #[serde(rename = "type")]
     event_type: &'static str,
+    correlation_id: uuid::Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<uuid::Uuid>,
     project: &'a str,
     agent: &'a Option<String>,
     branch: &'a Option<String>,
@@ -914,7 +1126,10 @@ struct ExecutionEvent<'a> {
     policy_findings: &'a [detection::Finding],
     approval_scope: ApprovalScope,
     approval_source: approvals::ApprovalSource,
+    approval_channel: ApprovalChannel,
     grant_id: Option<uuid::Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grant_origin_request_id: Option<uuid::Uuid>,
     approval_receipt_hash: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_key_id: Option<&'a str>,
@@ -999,6 +1214,14 @@ struct SetupOptions {
     no_unlock: bool,
 }
 
+const SETUP_GUIDED_BODY: &str = "Ward will encrypt your local env, create a vault, and prepare this project for safe human and agent access.";
+const WORKSPACE_SETUP_BODY: &str = "Ward detected a monorepo workspace. It will configure each app with its own encrypted vault and trust this workspace Git root for agent runs.";
+const WORKSPACE_SETUP_PROMPT_HELP: &str =
+    "Ward will create or refresh app-level .ward.json files, vaults, profiles, and workspace-root trust.";
+const RECOVERY_EXPORT_PROMPT: &str = "Export a recovery backup now?";
+const RECOVERY_EXPORT_HELP: &str =
+    "Store this somewhere safe, such as a USB drive or secure cloud backup.";
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceSetupResult {
@@ -1044,6 +1267,8 @@ struct RunOptions {
     command: Vec<String>,
     json: bool,
     no_prompt: bool,
+    wait_for_approval: bool,
+    approval_timeout: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1123,14 +1348,25 @@ struct InvalidInvocationResponse {
 #[serde(rename_all = "camelCase")]
 struct WorktreeRequiredResponse<'a> {
     status: &'static str,
+    approval_required: bool,
+    approval_type: &'static str,
     project: &'a str,
     worktree: &'a Path,
     git_remote: &'a str,
     branch: &'a str,
     commit: &'a str,
     reason: &'a str,
+    approval_options: Vec<WorktreeApprovalOption>,
     approve_command: String,
     deny_command: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeApprovalOption {
+    action: &'static str,
+    label: &'static str,
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -1164,6 +1400,11 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     let cwd = env::current_dir()?;
+    let auto_restored_config = if !config::config_path(&cwd).exists() {
+        config::restore_project_config_from_backup(&cwd, false)?
+    } else {
+        None
+    };
     if should_auto_route_workspace_setup(&options) {
         if let Some(discovery) = workspace::discover(&cwd)? {
             if discovery.app_candidates().next().is_some() {
@@ -1230,13 +1471,14 @@ fn setup(options: SetupOptions) -> Result<()> {
     config::ensure_gitignore(&cwd, commit_vault)?;
 
     // Print header before any prompts so PIN input is visually grouped below it.
-    term::header(&project_config.project);
+    term::guided_header("setup", &project_config.project, &cwd, SETUP_GUIDED_BODY);
 
     let mut imported = false;
     let mut locked_env = false;
     let mut setup_passphrase = None;
     let mut verified_env_keys = None;
     let mut recovery_plaintext = None;
+    term::section("Vault");
     if source_exists {
         if source_is_locked {
             if !vault_path.exists() {
@@ -1248,10 +1490,11 @@ fn setup(options: SetupOptions) -> Result<()> {
             }
             env_file::lock_env_file(&options.source, &vault_path)?;
             locked_env = true;
+            term::ok("locked .env marker refreshed");
         } else {
             let passphrase = vault::read_new_passphrase()?;
             term::blank();
-            let sp = term::spinner("Encrypting vault");
+            let sp = term::spinner("Encrypting local env");
             vault::import_env_file(&options.source, &vault_path, &passphrase)?;
             let plaintext = vault::decrypt_vault_file(&vault_path, &passphrase)?;
             verified_env_keys = Some(config::env_keys_from_dotenv_str(&plaintext)?);
@@ -1262,7 +1505,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                 env_file::lock_env_file(&options.source, &vault_path)?;
                 locked_env = true;
             }
-            term::done(sp, "Vault encrypted");
+            term::done(sp, ".env encrypted");
         }
     } else if !vault_path.exists() {
         let passphrase = vault::read_new_passphrase()?;
@@ -1277,6 +1520,11 @@ fn setup(options: SetupOptions) -> Result<()> {
         setup_passphrase = Some(passphrase);
         locked_env = true;
         term::done(sp, "Empty vault encrypted");
+    } else {
+        term::ok("encrypted vault found");
+    }
+    if locked_env && !source_is_locked {
+        term::ok("locked marker written");
     }
 
     if let Some(env_keys) = verified_env_keys.as_deref() {
@@ -1285,6 +1533,15 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     registry::update_project_vault(&project_config.project, cwd.clone(), vault_path.clone())?;
+    term::section("Project");
+    term::ok(".ward.json ready");
+    if let Some(restored) = auto_restored_config.as_ref() {
+        term::ok(&format!(
+            ".ward.json restored from local backup  {}",
+            term::short_path(&restored.backup_path)
+        ));
+    }
+    term::ok("project registered");
     term::ok(".gitignore updated");
     if env_example.is_some() {
         term::ok(".env.example created");
@@ -1317,10 +1574,13 @@ fn setup(options: SetupOptions) -> Result<()> {
     }
 
     let unlock_session = if options.no_unlock {
+        term::section("Session");
+        term::warn("session not started (--no-unlock)");
         None
     } else {
         let passphrase = setup_passphrase_final.as_deref().unwrap();
-        let sp = term::spinner("Starting broker session");
+        term::section("Session");
+        let sp = term::spinner("Starting protected session");
         match create_run_unlock_session(
             &project_config.project,
             &vault_path,
@@ -1330,15 +1590,15 @@ fn setup(options: SetupOptions) -> Result<()> {
         ) {
             Ok(session) => {
                 let expires = session.expires_at.format("%H:%M").to_string();
-                term::done(sp, &format!("Session unlocked · expires {}", expires));
+                term::done(sp, &format!("unlocked until {}", expires));
                 Some(session)
             }
             Err(error) => {
                 if error.to_string().contains("failed to decrypt vault") {
-                    term::warn_step(sp, "Broker unlock failed");
+                    term::warn_step(sp, "protected session failed");
                     return Err(error);
                 }
-                term::warn_step(sp, &format!("Broker unlock failed: {error}"));
+                term::warn_step(sp, &format!("protected session failed: {error}"));
                 term::info("Run `ward unlock` before running protected commands.");
                 None
             }
@@ -1363,6 +1623,7 @@ fn setup(options: SetupOptions) -> Result<()> {
 
     // Auto-create recovery key using the same PIN/passphrase — no extra prompt.
     if let Some(ref passphrase) = setup_passphrase_final {
+        term::section("Recovery");
         let sp = term::spinner("Creating recovery key");
         match recovery::create_recovery_files_with_material(
             &project_config.project,
@@ -1373,7 +1634,7 @@ fn setup(options: SetupOptions) -> Result<()> {
             Ok(recovery_file) => {
                 term::done(
                     sp,
-                    &format!("Recovery key created  {}", term::short_path(&recovery_file)),
+                    &format!("recovery key created  {}", term::short_path(&recovery_file)),
                 );
                 project_config.recovery_created = true;
                 let _ = config::write_project_config(&cwd, &project_config, true);
@@ -1383,12 +1644,11 @@ fn setup(options: SetupOptions) -> Result<()> {
                 {
                     term::blank();
                     let export = options.yes
-                        || inquire::Confirm::new(
-                            "Export a recovery backup now? (store it somewhere safe — USB, cloud backup)",
-                        )
-                        .with_default(true)
-                        .prompt()
-                        .unwrap_or(false);
+                        || inquire::Confirm::new(RECOVERY_EXPORT_PROMPT)
+                            .with_help_message(RECOVERY_EXPORT_HELP)
+                            .with_default(true)
+                            .prompt()
+                            .unwrap_or(false);
 
                     if export {
                         let dest = dirs::desktop_dir()
@@ -1402,7 +1662,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                             Ok(out_path) => {
                                 project_config.backup_exported = true;
                                 let _ = config::write_project_config(&cwd, &project_config, true);
-                                term::ok(&format!("Backup saved  {}", term::short_path(&out_path)));
+                                term::ok(&format!("backup saved  {}", term::short_path(&out_path)));
                                 #[cfg(not(test))]
                                 let _ = std::process::Command::new("open")
                                     .arg("-R")
@@ -1410,8 +1670,8 @@ fn setup(options: SetupOptions) -> Result<()> {
                                     .spawn();
                             }
                             Err(e) => {
-                                term::warn(&format!("Export failed — {e}"));
-                                term::info("Run `ward recovery export` manually.");
+                                term::warn(&format!("backup export failed — {e}"));
+                                term::info("Run `ward recovery export` when ready.");
                             }
                         }
                     } else {
@@ -1420,7 +1680,7 @@ fn setup(options: SetupOptions) -> Result<()> {
                 }
             }
             Err(error) => {
-                term::warn_step(sp, &format!("Recovery key creation failed: {error}"));
+                term::warn_step(sp, &format!("recovery key creation failed: {error}"));
                 term::info("Run `ward recovery create` manually.");
             }
         }
@@ -1438,9 +1698,15 @@ fn setup(options: SetupOptions) -> Result<()> {
     if options.keep_plaintext {
         term::warn("plaintext env was kept (--keep-plaintext)");
     }
+    term::section("Shell");
     if let Some(rc) = ensure_shell_integration() {
-        term::ok(&format!("Shell integration added to {}", rc.display()));
+        term::ok(&format!(
+            "shell integration installed  {}",
+            term::short_path(&rc)
+        ));
         prompt_shell_reload(&rc);
+    } else {
+        term::ok("shell integration ready");
     }
     Ok(())
 }
@@ -1607,11 +1873,47 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
     Ok(())
 }
 
+fn config_command(command: ConfigCommand) -> Result<()> {
+    match command {
+        ConfigCommand::Restore { force, json } => {
+            let cwd = env::current_dir()?;
+            match config::restore_project_config_from_backup(&cwd, force)? {
+                Some(restored) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&restored)?);
+                    } else {
+                        println!("Restored .ward.json for {}", restored.project);
+                        println!("Config: {}", restored.config_path.display());
+                        println!("Backup: {}", restored.backup_path.display());
+                    }
+                }
+                None => {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "notFound",
+                                "message": "No local .ward.json backup was found for this folder."
+                            }))?
+                        );
+                    } else {
+                        anyhow::bail!(
+                            "no local .ward.json backup found for {}; run ward setup to create a new config",
+                            cwd.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn workspace_command(command: WorkspaceCommand) -> Result<()> {
     match command {
         WorkspaceCommand::Discover { json } => {
             let cwd = env::current_dir()?;
-            let discovery = workspace::discover(&cwd)?
+            let discovery = workspace::discover_containing(&cwd)?
                 .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&discovery)?);
@@ -1619,8 +1921,47 @@ fn workspace_command(command: WorkspaceCommand) -> Result<()> {
                 print_workspace_discovery(&discovery);
             }
         }
+        WorkspaceCommand::Projects { json } => {
+            let cwd = env::current_dir()?;
+            let discovery = workspace::discover_containing(&cwd)?
+                .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
+            let targets = workspace_target::configured_workspace_targets(&discovery)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&targets_as_json(&targets))?
+                );
+            } else if targets.is_empty() {
+                term::warn("No configured Ward app projects found.");
+            } else {
+                for target in &targets {
+                    let app = target.app_slug.as_deref().unwrap_or(&target.name);
+                    println!("{app}\t{}\t{}", target.name, target.path.display());
+                }
+            }
+        }
+        WorkspaceCommand::Doctor => {
+            doctor_for_target(None, None, true)?;
+        }
     }
     Ok(())
+}
+
+fn targets_as_json(targets: &[workspace_target::WorkspaceTarget]) -> Vec<serde_json::Value> {
+    targets
+        .iter()
+        .map(|target| {
+            serde_json::json!({
+                "project": target.name,
+                "path": target.path,
+                "vault": target.vault,
+                "workspaceRoot": target.workspace_root,
+                "workspaceName": target.workspace_name,
+                "appSlug": target.app_slug,
+                "packageName": target.package_name,
+            })
+        })
+        .collect()
 }
 
 fn print_workspace_discovery(discovery: &workspace::WorkspaceDiscovery) {
@@ -1669,28 +2010,49 @@ fn setup_workspace_with_discovery(
         anyhow::bail!("choose either --remove-plaintext or --keep-plaintext");
     }
 
-    term::header(&format!("{} workspace", discovery.workspace_name));
-    print_workspace_discovery(&discovery);
-    term::blank();
+    term::guided_context_header(
+        "setup",
+        "Workspace",
+        &discovery.workspace_name,
+        &discovery.root,
+        WORKSPACE_SETUP_BODY,
+    );
+    print_workspace_setup_overview(&discovery);
 
+    let project_prefix = options
+        .project
+        .as_deref()
+        .unwrap_or(&discovery.workspace_name)
+        .to_string();
     let selected = selected_workspace_apps(&discovery, &apps, all, options.yes)?;
     if selected.is_empty() {
-        term::info("Run `ward setup --workspace --all` or `ward setup --workspace --app <name>` to configure app projects.");
+        let refreshed = trust_workspace_root_for_configured_apps(&discovery, &project_prefix)?;
+        if !refreshed.is_empty() {
+            let result = WorkspaceSetupResult {
+                workspace: discovery.workspace_name,
+                root: discovery.root,
+                configured: Vec::new(),
+                skipped: refreshed,
+            };
+            print_workspace_setup_result(&result);
+            return Ok(());
+        }
+        term::section("Next");
+        term::info("No ready app env files were found.");
+        term::next("add .env files to app folders, then run: ward setup --workspace --all");
+        term::next("or choose one app: ward setup --workspace --app <name>");
         return Ok(());
     }
 
     let passphrase = vault::read_existing_passphrase()?;
     let mut configured = Vec::new();
     let mut skipped = Vec::new();
-    let project_prefix = options
-        .project
-        .as_deref()
-        .unwrap_or(&discovery.workspace_name)
-        .to_string();
 
     for package in selected {
-        let project_name = format!("{project_prefix}:{}", package.slug);
+        let project_name = workspace_package_project_name(package, &project_prefix);
         if package.setup_status == workspace::WorkspaceSetupStatus::Configured {
+            trust_workspace_root_for_project(&project_name, &discovery.root)?;
+            workspace_target::register_workspace_metadata(&project_name, &discovery, package)?;
             skipped.push(WorkspaceSetupItem {
                 app: package.slug.clone(),
                 project: project_name,
@@ -1711,15 +2073,33 @@ fn setup_workspace_with_discovery(
             continue;
         }
 
-        let status =
-            broker::setup_project_with_passphrase(&package.path, Some(&project_name), &passphrase)?;
-        configured.push(WorkspaceSetupItem {
-            app: package.slug.clone(),
-            project: status.project,
-            path: status.path,
-            status: "configured".to_string(),
-            reason: None,
-        });
+        match broker::setup_project_with_passphrase(&package.path, Some(&project_name), &passphrase)
+        {
+            Ok(status) => {
+                trust_workspace_root_for_project(&status.project, &discovery.root)?;
+                workspace_target::register_workspace_metadata(
+                    &status.project,
+                    &discovery,
+                    package,
+                )?;
+                configured.push(WorkspaceSetupItem {
+                    app: package.slug.clone(),
+                    project: status.project,
+                    path: status.path,
+                    status: "configured".to_string(),
+                    reason: None,
+                });
+            }
+            Err(error) => {
+                skipped.push(WorkspaceSetupItem {
+                    app: package.slug.clone(),
+                    project: project_name,
+                    path: package.path.clone(),
+                    status: "failed".to_string(),
+                    reason: Some(error.to_string()),
+                });
+            }
+        }
     }
 
     let result = WorkspaceSetupResult {
@@ -1728,7 +2108,170 @@ fn setup_workspace_with_discovery(
         configured,
         skipped,
     };
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    print_workspace_setup_result(&result);
+    Ok(())
+}
+
+fn print_workspace_setup_overview(discovery: &workspace::WorkspaceDiscovery) {
+    let apps = discovery.app_candidates().collect::<Vec<_>>();
+    let ready_apps = apps.iter().filter(|package| package.can_setup()).count();
+    let configured_apps = apps
+        .iter()
+        .filter(|package| package.setup_status == workspace::WorkspaceSetupStatus::Configured)
+        .count();
+    let needs_env_apps = apps
+        .iter()
+        .filter(|package| package.setup_status == workspace::WorkspaceSetupStatus::NeedsEnv)
+        .count();
+    let library_count = discovery
+        .packages
+        .iter()
+        .filter(|package| !package.app_candidate)
+        .count();
+
+    term::section("Workspace");
+    if let Some(manager) = discovery.package_manager.as_deref() {
+        term::ok(&format!("package manager {manager}"));
+    }
+    if discovery.turborepo {
+        term::ok("turborepo detected");
+    }
+    term::ok(&format!("{} app project(s) detected", apps.len()));
+    if ready_apps > 0 {
+        term::ok(&format!("{ready_apps} app(s) ready to configure"));
+    }
+    if configured_apps > 0 {
+        term::ok(&format!("{configured_apps} app(s) already configured"));
+    }
+    if needs_env_apps > 0 {
+        term::warn(&format!(
+            "{needs_env_apps} app(s) need a real .env before setup"
+        ));
+    }
+    if library_count > 0 {
+        term::info(&format!("{library_count} package(s) skipped by default"));
+    }
+
+    term::section("Apps");
+    for package in &discovery.packages {
+        print_workspace_package_line(package);
+    }
+}
+
+fn print_workspace_package_line(package: &workspace::WorkspacePackage) {
+    let path = term::short_path(&package.relative_path);
+    if !package.app_candidate {
+        term::info(&format!("{}  package skipped  {}", package.slug, path));
+        return;
+    }
+
+    match package.setup_status {
+        workspace::WorkspaceSetupStatus::Configured => term::ok(&format!(
+            "{}  already configured  {}  {}",
+            package.slug, package.project_name, path
+        )),
+        workspace::WorkspaceSetupStatus::NeedsEnv => term::warn(&format!(
+            "{}  needs .env  {}  {}",
+            package.slug, package.project_name, path
+        )),
+        workspace::WorkspaceSetupStatus::NotConfigured => {
+            if package.env_status == workspace::WorkspaceEnvStatus::Present {
+                term::ok(&format!(
+                    "{}  .env ready  {}  {}",
+                    package.slug, package.project_name, path
+                ));
+            } else {
+                term::info(&format!(
+                    "{}  no .env  {}  {}",
+                    package.slug, package.project_name, path
+                ));
+            }
+        }
+    }
+}
+
+fn print_workspace_setup_result(result: &WorkspaceSetupResult) {
+    term::section("Setup");
+    if result.configured.is_empty() && result.skipped.is_empty() {
+        term::info("No app projects changed.");
+    }
+    for item in &result.configured {
+        term::ok(&format!("{} configured as {}", item.app, item.project));
+        term::info(&format!("path {}", term::short_path(&item.path)));
+    }
+    for item in &result.skipped {
+        match item.reason.as_deref() {
+            Some("workspace Git root trusted") => {
+                term::ok(&format!("{} refreshed as {}", item.app, item.project));
+                term::info("workspace Git root trusted");
+            }
+            Some("app already has .ward.json") => {
+                term::ok(&format!(
+                    "{} already configured as {}",
+                    item.app, item.project
+                ));
+                term::info("workspace Git root trusted");
+            }
+            Some(reason) => {
+                term::warn(&format!("{} skipped — {reason}", item.app));
+            }
+            None => {
+                term::info(&format!("{} skipped", item.app));
+            }
+        }
+    }
+
+    term::section("Next");
+    if !result.configured.is_empty() {
+        term::next("open the dashboard: ward dashboard start");
+        term::next("activate a protected terminal inside an app: ward human");
+    } else {
+        term::next("open the dashboard: ward dashboard start");
+    }
+}
+
+fn trust_workspace_root_for_configured_apps(
+    discovery: &workspace::WorkspaceDiscovery,
+    project_prefix: &str,
+) -> Result<Vec<WorkspaceSetupItem>> {
+    let mut refreshed = Vec::new();
+    for package in discovery
+        .app_candidates()
+        .filter(|package| package.setup_status == workspace::WorkspaceSetupStatus::Configured)
+    {
+        let project_name = workspace_package_project_name(package, project_prefix);
+        trust_workspace_root_for_project(&project_name, &discovery.root)?;
+        workspace_target::register_workspace_metadata(&project_name, discovery, package)?;
+        refreshed.push(WorkspaceSetupItem {
+            app: package.slug.clone(),
+            project: project_name,
+            path: package.path.clone(),
+            status: "configured".to_string(),
+            reason: Some("workspace Git root trusted".to_string()),
+        });
+    }
+    Ok(refreshed)
+}
+
+fn workspace_package_project_name(
+    package: &workspace::WorkspacePackage,
+    project_prefix: &str,
+) -> String {
+    config::read_project_config(&package.path)
+        .map(|config| config.project)
+        .unwrap_or_else(|_| format!("{project_prefix}:{}", package.slug))
+}
+
+fn trust_workspace_root_for_project(project: &str, workspace_root: &Path) -> Result<()> {
+    let git = git_context::collect_git_context(workspace_root);
+    let git_remote = git.remote.as_deref().unwrap_or_default();
+    worktrees::trust_worktree(
+        project,
+        workspace_root,
+        git_remote,
+        git.common_dir,
+        "workspace-root-setup",
+    )?;
     Ok(())
 }
 
@@ -1768,12 +2311,15 @@ fn selected_workspace_apps<'a>(
     }
     #[cfg(not(coverage))]
     {
-        let configure = inquire::Confirm::new(
-            "Workspace apps with .env files were detected. Configure them now?",
-        )
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
+        let prompt = format!(
+            "Configure {} ready workspace app(s) now?",
+            setup_capable.len()
+        );
+        let configure = inquire::Confirm::new(&prompt)
+            .with_help_message(WORKSPACE_SETUP_PROMPT_HELP)
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
         if configure {
             Ok(setup_capable)
         } else {
@@ -1912,22 +2458,30 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
 
 fn env_command(command: EnvCommand) -> Result<()> {
     match command {
-        EnvCommand::List { project } => {
+        EnvCommand::List { project, app, all } => {
             let passphrase = vault::read_existing_passphrase()?;
-            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
-            let names = with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::list_env_names(&resolved.vault, &passphrase)
-            })?;
-            for name in names {
-                println!("{name}");
+            let targets = resolve_env_targets_with_passphrase(project, app, all, &passphrase)?;
+            for target in targets {
+                let resolved = target.resolved_project();
+                let names = with_passphrase_vault_access(&resolved, &passphrase, || {
+                    env_file::list_env_names(&resolved.vault, &passphrase)
+                })?;
+                for name in names {
+                    if all {
+                        println!("{}\t{name}", resolved.name);
+                    } else {
+                        println!("{name}");
+                    }
+                }
             }
         }
         EnvCommand::Set {
             project,
+            app,
             assignment,
         } => {
             let passphrase = vault::read_existing_passphrase()?;
-            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let key = with_passphrase_vault_access(&resolved, &passphrase, || {
                 env_file::set_env_value(&resolved.vault, &passphrase, &assignment)
             })?;
@@ -1935,9 +2489,9 @@ fn env_command(command: EnvCommand) -> Result<()> {
             log_env_file_event("env.set", &resolved, None, Some(&key))?;
             println!("Set encrypted env {key}");
         }
-        EnvCommand::Unset { project, key } => {
+        EnvCommand::Unset { project, app, key } => {
             let passphrase = vault::read_existing_passphrase()?;
-            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let removed = with_passphrase_vault_access(&resolved, &passphrase, || {
                 env_file::unset_env_value(&resolved.vault, &passphrase, &key)
             })?;
@@ -1951,22 +2505,34 @@ fn env_command(command: EnvCommand) -> Result<()> {
         }
         EnvCommand::Unlock {
             project,
+            app,
+            all,
             output,
             force,
         } => {
+            if all && !force {
+                anyhow::bail!("ward env unlock --all requires --force");
+            }
             let passphrase = vault::read_existing_passphrase()?;
-            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
-            let output = project_relative_path(&resolved.path, output);
-            with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)
-            })?;
-            log_env_file_event("env.unlock", &resolved, Some(&output), None)?;
-            println!("Wrote plaintext env {}", output.display());
+            let targets = resolve_env_targets_with_passphrase(project, app, all, &passphrase)?;
+            for target in targets {
+                let resolved = target.resolved_project();
+                let output = project_relative_path(&resolved.path, output.clone());
+                with_passphrase_vault_access(&resolved, &passphrase, || {
+                    env_file::unlock_env_file(&output, &resolved.vault, &passphrase, force)
+                })?;
+                log_env_file_event("env.unlock", &resolved, Some(&output), None)?;
+                println!("Wrote plaintext env {}", output.display());
+            }
             println!("Run ward env lock when you are done.");
         }
-        EnvCommand::Lock { project, source } => {
+        EnvCommand::Lock {
+            project,
+            app,
+            source,
+        } => {
             let passphrase = vault::read_existing_passphrase()?;
-            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let source = project_relative_path(&resolved.path, source);
             with_passphrase_vault_access(&resolved, &passphrase, || {
                 env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)
@@ -1976,12 +2542,13 @@ fn env_command(command: EnvCommand) -> Result<()> {
         }
         EnvCommand::Export {
             project,
+            app,
             output,
             force,
             unsafe_stdout,
         } => {
             let passphrase = vault::read_existing_passphrase()?;
-            let resolved = resolve_env_project_with_passphrase(project.as_deref(), &passphrase)?;
+            let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             if unsafe_stdout {
                 let plaintext = with_passphrase_vault_access(&resolved, &passphrase, || {
                     let plaintext = vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
@@ -2008,11 +2575,17 @@ fn env_command(command: EnvCommand) -> Result<()> {
 }
 
 fn resolve_env_project_with_passphrase(
-    project: Option<&str>,
+    project: Option<String>,
+    app: Option<String>,
     passphrase: &str,
 ) -> Result<registry::ResolvedProject> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project_with_passphrase(project, &cwd, passphrase)?;
+    let target = workspace_target::resolve_one_with_passphrase(
+        &workspace_target::TargetSelector::one(project, app),
+        &cwd,
+        passphrase,
+    )?;
+    let resolved = target.resolved_project();
     if resolved.vault.exists() {
         registry::update_project_vault(
             &resolved.name,
@@ -2021,6 +2594,27 @@ fn resolve_env_project_with_passphrase(
         )?;
     }
     Ok(resolved)
+}
+
+fn resolve_env_targets_with_passphrase(
+    project: Option<String>,
+    app: Option<String>,
+    all: bool,
+    passphrase: &str,
+) -> Result<Vec<workspace_target::WorkspaceTarget>> {
+    let cwd = env::current_dir()?;
+    let selector = workspace_target::TargetSelector { project, app, all };
+    let targets = workspace_target::resolve_many_with_passphrase(&selector, &cwd, passphrase)?;
+    for target in &targets {
+        if target.vault.exists() {
+            registry::update_project_vault(
+                &target.name,
+                target.path.clone(),
+                target.vault.clone(),
+            )?;
+        }
+    }
+    Ok(targets)
 }
 
 fn project_relative_path(project_path: &Path, path: PathBuf) -> PathBuf {
@@ -2146,6 +2740,8 @@ fn require_agent_identity_for_non_human(agent: Option<&str>) -> Result<()> {
 fn enforce_worktree_for_no_prompt(
     resolved: &registry::ResolvedProject,
     verified: &context::VerifiedContext,
+    wait_for_approval: bool,
+    approval_timeout: &str,
 ) -> Result<bool> {
     let registry = registry::load_registry()?;
     let Some(registered) = registry.projects.get(&resolved.name) else {
@@ -2165,16 +2761,35 @@ fn enforce_worktree_for_no_prompt(
             Ok(true)
         }
         worktrees::WorktreeDecision::ApprovalRequired { request } => {
+            if wait_for_approval {
+                return wait_for_worktree_approval(resolved, verified, request, approval_timeout);
+            }
+            let approve_command = format!("ward worktrees approve {}", request.id);
+            let deny_command = format!("ward worktrees deny {}", request.id);
             let response = WorktreeRequiredResponse {
                 status: "worktree_approval_required",
+                approval_required: true,
+                approval_type: "worktreeBinding",
                 project: &resolved.name,
                 worktree: &request.path,
                 git_remote: &request.git_remote,
                 branch: &request.branch,
                 commit: &request.commit,
                 reason: &request.reason,
-                approve_command: format!("ward worktrees approve {}", request.id),
-                deny_command: format!("ward worktrees deny {}", request.id),
+                approval_options: vec![
+                    WorktreeApprovalOption {
+                        action: "approve",
+                        label: "Approve this worktree",
+                        command: approve_command.clone(),
+                    },
+                    WorktreeApprovalOption {
+                        action: "deny",
+                        label: "Deny this worktree",
+                        command: deny_command.clone(),
+                    },
+                ],
+                approve_command,
+                deny_command,
             };
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(false)
@@ -2192,6 +2807,48 @@ fn enforce_worktree_for_no_prompt(
     }
 }
 
+fn wait_for_worktree_approval(
+    resolved: &registry::ResolvedProject,
+    verified: &context::VerifiedContext,
+    request: worktrees::PendingWorktree,
+    approval_timeout: &str,
+) -> Result<bool> {
+    let timeout = unlock::parse_ttl(approval_timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    eprintln!(
+        "Ward is waiting for worktree approval {}. Open the dashboard notification center or run: ward worktrees approve {}",
+        request.id, request.id
+    );
+    loop {
+        if worktrees::is_known_worktree(&resolved.name, &request.path)? {
+            return Ok(true);
+        }
+        if worktrees::load_pending_worktree(request.id)?.is_none() {
+            let response = serde_json::json!({
+                "status": "worktree_denied",
+                "project": resolved.name,
+                "worktree": verified.worktree,
+                "requestId": request.id,
+            });
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(false);
+        }
+        if chrono::Utc::now() >= deadline {
+            let response = serde_json::json!({
+                "status": "approval_timeout",
+                "approvalType": "worktreeBinding",
+                "project": resolved.name,
+                "worktree": verified.worktree,
+                "requestId": request.id,
+            });
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(false);
+        }
+        thread::sleep(StdDuration::from_millis(500));
+    }
+}
+
+#[cfg(any(test, coverage))]
 fn request(
     profile: Option<String>,
     context_options: AgentContextOptions,
@@ -2201,8 +2858,34 @@ fn request(
     json: bool,
     no_prompt: bool,
 ) -> Result<()> {
+    request_for_target(
+        None,
+        None,
+        profile,
+        context_options,
+        action,
+        command,
+        env_names,
+        json,
+        no_prompt,
+    )
+}
+
+fn request_for_target(
+    project: Option<String>,
+    app: Option<String>,
+    profile: Option<String>,
+    context_options: AgentContextOptions,
+    action: Option<String>,
+    command: Option<String>,
+    env_names: Vec<String>,
+    json: bool,
+    no_prompt: bool,
+) -> Result<()> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
+    let target =
+        workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
+    let resolved = target.resolved_project();
     let config = config::read_project_config(&resolved.path)?;
     let git = git_context::collect_git_context(&cwd);
     let mut context_options = context_options;
@@ -2234,12 +2917,15 @@ fn request(
         else {
             return Ok(());
         };
-        if !enforce_worktree_for_no_prompt(&resolved, &verified_context)? {
+        if !enforce_worktree_for_no_prompt(&resolved, &verified_context, false, "30m")? {
             return Ok(());
         }
         let pending =
             create_run_pending_request(&access, &evaluation, &git, Some(verified_context))?;
         let request_event = RequestEvent {
+            correlation_id: pending.id,
+            request_id: Some(pending.id),
+            expires_at: Some(&pending.expires_at),
             access: &pending.access,
             policy: &pending.policy,
             git: &pending.git,
@@ -2251,6 +2937,7 @@ fn request(
         return Ok(());
     }
 
+    let correlation_id = uuid::Uuid::new_v4();
     let decision = decide_access(&access, &evaluation, true)?;
     let critical_confirmation = critical_confirmation_for_decision(&decision, &evaluation);
     let receipt_context = Some(grants::GrantReceiptContext::synthetic(
@@ -2263,12 +2950,21 @@ fn request(
         .and_then(|grant| grant.receipt.as_ref());
 
     let request_event = RequestEvent {
+        correlation_id,
+        request_id: None,
+        expires_at: None,
         access: &access,
         policy: &evaluation,
         git: &git,
         verified_context: None,
     };
+    let request_snapshot = request_audit_snapshot(&access, &evaluation, &git, None);
     let approval_event = ApprovalEvent {
+        correlation_id,
+        request_id: None,
+        project: &access.project,
+        approval_channel: approval_channel_for_source(decision.source),
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2278,7 +2974,9 @@ fn request(
         human_proof: approval_human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Requests, request_event)?;
-    audit_logs::append_event(LogKind::Approvals, &approval_event)?;
+    if should_log_approval_event(&decision) {
+        audit_logs::append_event(LogKind::Approvals, &approval_event)?;
+    }
 
     if json {
         println!("{}", serde_json::to_string_pretty(&approval_event)?);
@@ -2291,6 +2989,7 @@ fn request(
     Ok(())
 }
 
+#[cfg(any(test, coverage))]
 fn allow(
     profile: Option<String>,
     scope: Option<ApprovalScope>,
@@ -2299,8 +2998,25 @@ fn allow(
     command: Option<String>,
     env_names: Vec<String>,
 ) -> Result<()> {
+    allow_for_target(
+        None, None, profile, scope, agent, branch, command, env_names,
+    )
+}
+
+fn allow_for_target(
+    project: Option<String>,
+    app: Option<String>,
+    profile: Option<String>,
+    scope: Option<ApprovalScope>,
+    agent: Option<String>,
+    branch: Option<String>,
+    command: Option<String>,
+    env_names: Vec<String>,
+) -> Result<()> {
     let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(None, &cwd)?;
+    let target =
+        workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
+    let resolved = target.resolved_project();
     let config = config::read_project_config(&resolved.path)?;
     let resolved_profile = resolve_profile(
         &config,
@@ -2321,6 +3037,7 @@ fn allow(
 
     let git = git_context::collect_git_context(&cwd);
     let branch = branch.or(git.branch.clone());
+    let correlation_id = uuid::Uuid::new_v4();
     let access = AccessRequest {
         project: resolved.name,
         agent,
@@ -2343,7 +3060,13 @@ fn allow(
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&access, &grant);
     decision.source = approvals::ApprovalSource::ManualAllow;
+    let request_snapshot = request_audit_snapshot(&access, &evaluation, &git, None);
     let approval_event = ApprovalEvent {
+        correlation_id,
+        request_id: None,
+        project: &access.project,
+        approval_channel: ApprovalChannel::ManualAllow,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: Some(grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2402,6 +3125,67 @@ fn grants_command(command: GrantsCommand) -> Result<()> {
     Ok(())
 }
 
+fn approvals_command(command: ApprovalsCommand) -> Result<()> {
+    match command {
+        ApprovalsCommand::List { json } => {
+            let notifications = notifications::list_notifications()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&notifications)?);
+            } else if notifications.is_empty() {
+                println!("No pending Ward approval notifications.");
+            } else {
+                for notification in notifications {
+                    println!(
+                        "{} {:?} project={} risk={} {}",
+                        notification.id,
+                        notification.kind,
+                        notification.project,
+                        notification.risk,
+                        notification.command.as_deref().unwrap_or("")
+                    );
+                }
+            }
+            Ok(())
+        }
+        ApprovalsCommand::Wait {
+            request_id,
+            json,
+            timeout,
+        } => wait_for_approval_command(request_id, json, &timeout),
+    }
+}
+
+fn wait_for_approval_command(request_id: uuid::Uuid, json: bool, timeout: &str) -> Result<()> {
+    let timeout = unlock::parse_ttl(timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    loop {
+        if let Some(resolution) = pending_requests::load_resolution(request_id)? {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resolution)?);
+            } else {
+                println!(
+                    "Request {} {} for project {}",
+                    resolution.request_id, resolution.status, resolution.project
+                );
+            }
+            return Ok(());
+        }
+        if chrono::Utc::now() >= deadline {
+            let response = serde_json::json!({
+                "status": "approval_timeout",
+                "requestId": request_id,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("Timed out waiting for approval {request_id}");
+            }
+            return Ok(());
+        }
+        thread::sleep(StdDuration::from_millis(500));
+    }
+}
+
 fn approve(
     request_id: uuid::Uuid,
     scope: ApprovalScope,
@@ -2409,7 +3193,13 @@ fn approve(
     agent_mediated: bool,
     json: bool,
 ) -> Result<()> {
-    match approve_inner(request_id, scope, confirm_critical, agent_mediated) {
+    match approve_inner(
+        request_id,
+        scope,
+        confirm_critical,
+        agent_mediated,
+        approval_channel_for_terminal(agent_mediated),
+    ) {
         Ok(response) => {
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -2444,6 +3234,7 @@ struct ApproveJsonResponse {
     signer_key_id: Option<String>,
     signature_algorithm: Option<String>,
     approval_source: approvals::ApprovalSource,
+    approval_channel: ApprovalChannel,
 }
 
 fn approve_inner(
@@ -2451,6 +3242,7 @@ fn approve_inner(
     scope: ApprovalScope,
     confirm_critical: bool,
     agent_mediated: bool,
+    approval_channel: ApprovalChannel,
 ) -> Result<ApproveJsonResponse> {
     if scope == ApprovalScope::Deny {
         anyhow::bail!("use ward deny for denied requests");
@@ -2465,19 +3257,31 @@ fn approve_inner(
     } else {
         approvals::ApprovalSource::LocalTty
     };
-    let receipt_context = Some(grants::GrantReceiptContext {
+    let receipt_context = Some(grants::GrantReceiptContext::pending(
         request_id,
-        critical_confirmation: critical && confirm_critical,
-        verified_context: pending.verified_context.clone(),
-    });
+        critical && confirm_critical,
+        pending.verified_context.clone(),
+    ));
     let access = &pending.access;
     let vault = &resolved.vault;
     let grant = grants::persist_manual_grant(access, scope, source, vault, receipt_context)?;
     pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "approved", &pending.access.project)?;
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&pending.access, &grant);
     decision.source = source;
+    let request_snapshot = request_audit_snapshot(
+        &pending.access,
+        &pending.policy,
+        &pending.git,
+        pending.verified_context.as_ref(),
+    );
     let approval_event = ApprovalEvent {
+        correlation_id: request_id,
+        request_id: Some(request_id),
+        project: &pending.access.project,
+        approval_channel,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: Some(grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2496,7 +3300,23 @@ fn approve_inner(
         signer_key_id: receipt.map(|receipt| receipt.signer_key_id.clone()),
         signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.clone()),
         approval_source: source,
+        approval_channel,
     })
+}
+
+pub(crate) fn approve_request_from_dashboard(
+    request_id: uuid::Uuid,
+    scope: ApprovalScope,
+    confirm_critical: bool,
+) -> Result<Value> {
+    let response = approve_inner(
+        request_id,
+        scope,
+        confirm_critical,
+        true,
+        ApprovalChannel::Dashboard,
+    )?;
+    serde_json::to_value(response).context("failed to serialize approval response")
 }
 
 fn validate_pending_approval(
@@ -2522,6 +3342,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         }
         Err(error) => return Err(error),
     };
+    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
     let source = if agent_mediated {
         approvals::ApprovalSource::AgentMediated
     } else {
@@ -2535,7 +3356,19 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         source,
         grant_id: None,
     };
+    let approval_channel = approval_channel_for_terminal(agent_mediated);
+    let request_snapshot = request_audit_snapshot(
+        &pending.access,
+        &pending.policy,
+        &pending.git,
+        pending.verified_context.as_ref(),
+    );
     let approval_event = ApprovalEvent {
+        correlation_id: request_id,
+        request_id: Some(request_id),
+        project: &pending.access.project,
+        approval_channel,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: None,
         approval_receipt_hash: None,
@@ -2553,12 +3386,55 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
                 "requestId": request_id,
                 "project": pending.access.project,
                 "approvalSource": source,
+                "approvalChannel": approval_channel,
             }))?
         );
     } else {
         println!("Denied request {request_id}");
     }
     Ok(())
+}
+
+pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Value> {
+    let pending = pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
+    let source = approvals::ApprovalSource::AgentMediated;
+    let decision = ApprovalDecision {
+        approved: false,
+        scope: ApprovalScope::Deny,
+        approved_env: Vec::new(),
+        denied_env: pending.access.env.clone(),
+        source,
+        grant_id: None,
+    };
+    let request_snapshot = request_audit_snapshot(
+        &pending.access,
+        &pending.policy,
+        &pending.git,
+        pending.verified_context.as_ref(),
+    );
+    let approval_event = ApprovalEvent {
+        correlation_id: request_id,
+        request_id: Some(request_id),
+        project: &pending.access.project,
+        approval_channel: ApprovalChannel::Dashboard,
+        request_snapshot: Some(request_snapshot),
+        decision: &decision,
+        persisted_grant: None,
+        approval_receipt_hash: None,
+        signer_key_id: None,
+        signature_algorithm: None,
+        critical_confirmation: false,
+        human_proof: approval_human_proof(source),
+    };
+    audit_logs::append_event(LogKind::Approvals, approval_event)?;
+    Ok(serde_json::json!({
+        "status": "denied",
+        "requestId": request_id,
+        "project": pending.access.project,
+        "approvalSource": source,
+        "approvalChannel": ApprovalChannel::Dashboard,
+    }))
 }
 
 fn is_unlock_or_signing_error(error: &anyhow::Error) -> bool {
@@ -2611,15 +3487,28 @@ fn print_pending_request_error_json(request_id: uuid::Uuid, error: &anyhow::Erro
 
 #[cfg(any(test, coverage))]
 fn run(options: RunOptions) -> Result<()> {
-    run_with_context(options, AgentContextOptions::default())
+    run_with_context(options, AgentContextOptions::default(), None)
 }
 
-fn run_with_context(mut options: RunOptions, context_options: AgentContextOptions) -> Result<()> {
+fn run_with_context(
+    mut options: RunOptions,
+    context_options: AgentContextOptions,
+    app: Option<String>,
+) -> Result<()> {
     if reject_misplaced_run_flags(&options.command)? {
         return Ok(());
     }
-    let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(options.project.as_deref(), &cwd)?;
+    let invocation_cwd = env::current_dir()?;
+    let selector = workspace_target::TargetSelector::one(options.project.clone(), app);
+    let target = workspace_target::resolve_one(&selector, &invocation_cwd)?;
+    let explicit_target = options.project.is_some() || selector.app.is_some();
+    let profile_command = options.profile.is_some() && options.command.is_empty();
+    let cwd = if explicit_target && profile_command {
+        target.path.clone()
+    } else {
+        invocation_cwd
+    };
+    let resolved = target.resolved_project();
     let config = config::read_project_config(&resolved.path)?;
     let git = git_context::collect_git_context(&cwd);
     let branch = options.branch.or(git.branch.clone());
@@ -2683,6 +3572,8 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
     };
     let evaluation = evaluate_access(&config, &access);
     let mut verified_context = None;
+    let mut correlation_id = uuid::Uuid::new_v4();
+    let mut linked_request_id = None;
     let decision = if human_terminal && !options.no_prompt {
         ApprovalDecision {
             approved: true,
@@ -2699,26 +3590,93 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         let Some(context) = verified_no_prompt_context(&cwd, &resolved, &context_options)? else {
             return Ok(());
         };
-        if !enforce_worktree_for_no_prompt(&resolved, &context)? {
+        if !enforce_worktree_for_no_prompt(
+            &resolved,
+            &context,
+            options.wait_for_approval,
+            &options.approval_timeout,
+        )? {
             return Ok(());
         }
         verified_context = Some(context);
-        let Some(decision) =
-            non_interactive_decision_with_context(&access, &evaluation, verified_context.as_ref())?
-        else {
-            let pending =
-                create_run_pending_request(&access, &evaluation, &git, verified_context.clone())?;
-            let request_event = RequestEvent {
-                access: &pending.access,
-                policy: &pending.policy,
-                git: &pending.git,
-                verified_context: pending.verified_context.as_ref(),
-            };
-            audit_logs::append_event(LogKind::Requests, request_event)?;
-            print_run_approval_required(&pending)?;
-            return Ok(());
+        let decision = match non_interactive_decision_with_context(
+            &access,
+            &evaluation,
+            verified_context.as_ref(),
+        )? {
+            Some(decision) => decision,
+            None => {
+                let pending = create_run_pending_request(
+                    &access,
+                    &evaluation,
+                    &git,
+                    verified_context.clone(),
+                )?;
+                let request_event = RequestEvent {
+                    correlation_id: pending.id,
+                    request_id: Some(pending.id),
+                    expires_at: Some(&pending.expires_at),
+                    access: &pending.access,
+                    policy: &pending.policy,
+                    git: &pending.git,
+                    verified_context: pending.verified_context.as_ref(),
+                };
+                audit_logs::append_event(LogKind::Requests, request_event)?;
+                if options.wait_for_approval {
+                    correlation_id = pending.id;
+                    linked_request_id = Some(pending.id);
+                    let Some(decision) = wait_for_run_approval(
+                        &pending,
+                        &access,
+                        &evaluation,
+                        verified_context.as_ref(),
+                        &options.approval_timeout,
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    decision
+                } else {
+                    print_run_approval_required(&pending)?;
+                    return Ok(());
+                }
+            }
         };
         if !decision.approved {
+            let request_event = RequestEvent {
+                correlation_id,
+                request_id: linked_request_id,
+                expires_at: None,
+                access: &access,
+                policy: &evaluation,
+                git: &git,
+                verified_context: verified_context.as_ref(),
+            };
+            let request_snapshot =
+                request_audit_snapshot(&access, &evaluation, &git, verified_context.as_ref());
+            let approval_event = ApprovalEvent {
+                correlation_id,
+                request_id: linked_request_id,
+                project: &access.project,
+                approval_channel: approval_channel_for_source(decision.source),
+                request_snapshot: Some(request_snapshot),
+                decision: &decision,
+                persisted_grant: None,
+                approval_receipt_hash: None,
+                signer_key_id: None,
+                signature_algorithm: None,
+                critical_confirmation: false,
+                human_proof: approval_human_proof(decision.source),
+            };
+            audit_logs::append_event(LogKind::Requests, request_event)?;
+            audit_logs::append_event(LogKind::Approvals, approval_event)?;
+            create_run_block_notification(
+                notifications::NotificationKind::PolicyDenied,
+                &access,
+                &evaluation,
+                "Ward policy denied this request.",
+                None,
+            )?;
             print_run_denied(&access, &evaluation)?;
             return Ok(());
         }
@@ -2729,6 +3687,7 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
     let critical_confirmation = critical_confirmation_for_decision(&decision, &evaluation);
     let receipt_context = Some(grants::GrantReceiptContext {
         request_id: uuid::Uuid::new_v4(),
+        pending_request: false,
         critical_confirmation,
         verified_context: verified_context.clone(),
     });
@@ -2739,12 +3698,23 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         .and_then(|grant| grant.receipt.as_ref());
 
     let request_event = RequestEvent {
+        correlation_id,
+        request_id: linked_request_id,
+        expires_at: None,
         access: &access,
         policy: &evaluation,
         git: &git,
         verified_context: verified_context.as_ref(),
     };
+    let request_snapshot =
+        request_audit_snapshot(&access, &evaluation, &git, verified_context.as_ref());
+    let approval_channel = approval_channel_for_source(decision.source);
     let approval_event = ApprovalEvent {
+        correlation_id,
+        request_id: linked_request_id,
+        project: &access.project,
+        approval_channel,
+        request_snapshot: Some(request_snapshot),
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2754,16 +3724,21 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         human_proof: approval_human_proof(decision.source),
     };
     audit_logs::append_event(LogKind::Requests, request_event)?;
-    audit_logs::append_event(LogKind::Approvals, approval_event)?;
+    if should_log_approval_event(&decision) {
+        audit_logs::append_event(LogKind::Approvals, approval_event)?;
+    }
 
     if !decision.approved {
         anyhow::bail!("Ward access denied");
     }
 
     let grant_id = effective_grant_id(&decision, persisted_grant.as_ref());
+    let grant_origin_request_id = grant_origin_request_id(&decision);
     let approval_receipt_hash = grant_receipt_hash(&decision, persisted_grant.as_ref())?;
     let started_event = ExecutionStartedEvent {
         event_type: "execution.started",
+        correlation_id,
+        request_id: linked_request_id,
         project: &resolved.name,
         agent: &access.agent,
         branch: &access.branch,
@@ -2776,7 +3751,9 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         policy_findings: &evaluation.findings,
         approval_scope: decision.scope,
         approval_source: decision.source,
+        approval_channel,
         grant_id,
+        grant_origin_request_id,
         approval_receipt_hash: approval_receipt_hash.as_deref(),
         agent_key_id: verified_agent_key_id(verified_context.as_ref()),
         verified_context: verified_context.as_ref(),
@@ -2810,28 +3787,22 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         let context = verified_context
             .as_ref()
             .expect("verified in no-prompt mode");
-        let proof_payload =
-            serde_json::to_string(&execute_payload).expect("execution payload should serialize");
-        let proof = agents::sign_payload(&resolved.name, &context.agent, &proof_payload)?;
-        match broker::execute(
-            &resolved.name,
-            &resolved.vault,
+        let Some(outcome) = execute_no_prompt_with_optional_wait(
+            &resolved,
             &cwd,
-            decision.approved_env.clone(),
-            command_args,
-            broker::ExecuteAuthorization::Agent { proof },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if let Some(missing_env) = broker_vault_key_missing_envs(&error) {
-                    print_run_vault_key_missing(&access, &evaluation, missing_env)?;
-                    return Ok(());
-                }
-                let reason = error.to_string();
-                print_run_unlock_required(&access, &evaluation, Some(&reason))?;
-                return Ok(());
-            }
-        }
+            &decision,
+            &command_args,
+            execute_payload,
+            context,
+            &access,
+            &evaluation,
+            options.wait_for_approval,
+            &options.approval_timeout,
+        )?
+        else {
+            return Ok(());
+        };
+        outcome
     } else {
         match broker::execute(
             &resolved.name,
@@ -2894,6 +3865,8 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
 
     let execution_event = ExecutionEvent {
         event_type: "execution.finished",
+        correlation_id,
+        request_id: linked_request_id,
         project: &resolved.name,
         agent: &access.agent,
         branch: &access.branch,
@@ -2906,7 +3879,9 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         policy_findings: &evaluation.findings,
         approval_scope: decision.scope,
         approval_source: decision.source,
+        approval_channel,
         grant_id,
+        grant_origin_request_id,
         approval_receipt_hash: approval_receipt_hash.as_deref(),
         agent_key_id: verified_agent_key_id(verified_context.as_ref()),
         verified_context: verified_context.as_ref(),
@@ -2951,8 +3926,88 @@ fn reject_misplaced_run_flags(command: &[String]) -> Result<bool> {
     Ok(true)
 }
 
+#[cfg(any(test, coverage))]
 fn doctor() -> Result<()> {
+    doctor_for_target(None, None, false)
+}
+
+fn doctor_for_target(project: Option<String>, app: Option<String>, all: bool) -> Result<()> {
     let cwd = env::current_dir()?;
+    let selector = workspace_target::TargetSelector { project, app, all };
+    if selector.all {
+        return doctor_workspace(&cwd);
+    }
+    if selector.project.is_some() || selector.app.is_some() {
+        let target = workspace_target::resolve_one(&selector, &cwd)?;
+        return doctor_project_at(target.path);
+    }
+    if config::find_project_root(&cwd).is_none() && workspace::discover_containing(&cwd)?.is_some()
+    {
+        return doctor_workspace(&cwd);
+    }
+    doctor_project_at(cwd)
+}
+
+fn doctor_workspace(cwd: &Path) -> Result<()> {
+    let discovery = workspace::discover_containing(cwd)?
+        .context("no workspace manifest found; expected pnpm-workspace.yaml, package.json workspaces, or turbo.json")?;
+    term::guided_context_header(
+        "doctor",
+        "Workspace",
+        &discovery.workspace_name,
+        &discovery.root,
+        "Ward found a monorepo workspace. App folders are checked as separate Ward projects.",
+    );
+    let targets = workspace_target::configured_workspace_targets(&discovery)?;
+    term::section("workspace");
+    term::ok(&format!(
+        "{} app package(s) detected",
+        discovery.app_candidates().count()
+    ));
+    if let Some(manager) = discovery.package_manager.as_deref() {
+        term::info(&format!("package manager {manager}"));
+    }
+    if discovery.turborepo {
+        term::ok("turborepo detected");
+    }
+    term::section("apps");
+    if targets.is_empty() {
+        term::warn("no configured Ward app projects found");
+        term::next("run: ward setup --workspace --all");
+        return Ok(());
+    }
+    let broker_status = broker::status().ok();
+    for target in targets {
+        let cfg_status = if config::config_path(&target.path).is_file() {
+            "config ok"
+        } else {
+            "config missing"
+        };
+        let vault_status = if target.vault.exists() {
+            "vault ok"
+        } else {
+            "vault missing"
+        };
+        let session = broker_status
+            .as_ref()
+            .map(|status| {
+                status.sessions.iter().any(|session| {
+                    session.project == target.name && same_path(&session.vault, &target.vault)
+                })
+            })
+            .unwrap_or(false);
+        let session_status = if session { "session active" } else { "locked" };
+        let app = target.app_slug.as_deref().unwrap_or(&target.name);
+        term::info(&format!(
+            "{app}  {}  {cfg_status}  {vault_status}  {session_status}",
+            target.name
+        ));
+    }
+    term::blank();
+    Ok(())
+}
+
+fn doctor_project_at(cwd: PathBuf) -> Result<()> {
     let config_path = config::config_path(&cwd);
     let plaintext_env = cwd.join(".env");
     let project_name = cwd
@@ -2967,7 +4022,17 @@ fn doctor() -> Result<()> {
     term::section("config");
 
     if !config_path.exists() {
-        term::fail(".ward.json missing — run ward setup");
+        match config::find_project_config_backup_for_path(&cwd)? {
+            Some((backup_path, backup)) => {
+                term::warn(&format!(
+                    ".ward.json missing but recoverable for {}",
+                    backup.project
+                ));
+                term::info(&format!("backup {}", term::short_path(&backup_path)));
+                term::info("run ward config restore, or rerun ward setup to restore automatically");
+            }
+            None => term::fail(".ward.json missing — run ward setup"),
+        }
         term::blank();
         return Ok(());
     }
@@ -2985,6 +4050,17 @@ fn doctor() -> Result<()> {
                     "vault not found  {}",
                     term::short_path(&vault_path)
                 ));
+            }
+            match config::find_project_config_backup_for_path(&cwd)? {
+                Some((backup_path, _)) => {
+                    term::ok(&format!(
+                        "config backup  {}",
+                        term::short_path(&backup_path)
+                    ));
+                }
+                None => {
+                    term::warn("config backup missing — rerun ward setup to refresh metadata");
+                }
             }
         }
         Err(e) => {
@@ -3332,10 +4408,15 @@ fn render_log_events(events: &[Value]) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
-fn edit() -> Result<()> {
+fn edit(project: Option<String>, app: Option<String>) -> Result<()> {
     let cwd = env::current_dir()?;
     let passphrase = vault::read_existing_passphrase()?;
-    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
+    let target = workspace_target::resolve_one_with_passphrase(
+        &workspace_target::TargetSelector::one(project, app),
+        &cwd,
+        &passphrase,
+    )?;
+    let resolved = target.resolved_project();
     with_passphrase_vault_access(&resolved, &passphrase, || {
         vault::edit_vault_file(&resolved.vault, &passphrase)
     })?;
@@ -3435,41 +4516,70 @@ pub(crate) fn create_run_unlock_session(
     Ok(session)
 }
 
+#[cfg(any(test, coverage))]
 fn unlock_vault(ttl: &str, mode: Option<&str>, verify_only: bool) -> Result<()> {
+    unlock_vault_for_target(None, None, false, ttl, mode, verify_only)
+}
+
+fn unlock_vault_for_target(
+    project: Option<String>,
+    app: Option<String>,
+    all: bool,
+    ttl: &str,
+    mode: Option<&str>,
+    verify_only: bool,
+) -> Result<()> {
     let cwd = env::current_dir()?;
     if verify_only {
         if mode.is_some() {
             anyhow::bail!("--verify-only cannot be combined with --mode");
         }
-        let resolved = registry::resolve_project(None, &cwd)?;
-        match broker::active_session_expiry(&resolved.name, &resolved.vault)? {
-            Some(expires_at) => {
-                println!("Broker session active until {}.", expires_at.to_rfc3339());
-                return Ok(());
+        let selector = workspace_target::TargetSelector { project, app, all };
+        let targets = workspace_target::resolve_many(&selector, &cwd)?;
+        for target in targets {
+            let resolved = target.resolved_project();
+            match broker::active_session_expiry(&resolved.name, &resolved.vault)? {
+                Some(expires_at) => {
+                    println!(
+                        "{} broker session active until {}.",
+                        resolved.name,
+                        expires_at.to_rfc3339()
+                    );
+                }
+                None => anyhow::bail!(
+                    "broker has no active session for {}; run ward unlock --ttl 8h",
+                    resolved.name
+                ),
             }
-            None => anyhow::bail!(
-                "broker has no active session for {}; run ward unlock --ttl 8h",
-                resolved.name
-            ),
         }
+        return Ok(());
     }
     let passphrase = vault::read_existing_passphrase()?;
-    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
-    registry::update_project_vault(
-        &resolved.name,
-        resolved.path.clone(),
-        resolved.vault.clone(),
-    )?;
-    let session =
-        create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, mode)?;
-    if let Some(mode_name) = mode {
-        println!(
-            "Vault unlocked with mode '{}' until {}.",
-            mode_name,
-            session.expires_at.to_rfc3339()
-        );
-    } else {
-        println!("Vault unlocked until {}.", session.expires_at.to_rfc3339());
+    let selector = workspace_target::TargetSelector { project, app, all };
+    let targets = workspace_target::resolve_many_with_passphrase(&selector, &cwd, &passphrase)?;
+    for target in targets {
+        let resolved = target.resolved_project();
+        registry::update_project_vault(
+            &resolved.name,
+            resolved.path.clone(),
+            resolved.vault.clone(),
+        )?;
+        let session =
+            create_run_unlock_session(&resolved.name, &resolved.vault, &passphrase, ttl, mode)?;
+        if let Some(mode_name) = mode {
+            println!(
+                "{} vault unlocked with mode '{}' until {}.",
+                resolved.name,
+                mode_name,
+                session.expires_at.to_rfc3339()
+            );
+        } else {
+            println!(
+                "{} vault unlocked until {}.",
+                resolved.name,
+                session.expires_at.to_rfc3339()
+            );
+        }
     }
     Ok(())
 }
@@ -3492,13 +4602,18 @@ fn lock() -> Result<()> {
     Ok(())
 }
 
-fn rotate_vault(project_override: Option<&str>) -> Result<()> {
+fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
     let cwd = env::current_dir()?;
-    let mut config = config::read_project_config(&cwd)?;
-    let project_name = project_override.unwrap_or(&config.project).to_string();
-    config.project = project_name.clone();
-
     let passphrase = vault::read_existing_passphrase()?;
+    let target = workspace_target::resolve_one_with_passphrase(
+        &workspace_target::TargetSelector::one(project, app),
+        &cwd,
+        &passphrase,
+    )?;
+    let cwd = target.path.clone();
+    let mut config = config::read_project_config(&cwd)?;
+    let project_name = target.name.clone();
+    config.project = project_name.clone();
 
     // Find current vault — may be legacy static or already dynamic.
     let old_vault = config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase);
@@ -3563,12 +4678,22 @@ fn prompt_drag_drop_path() -> Result<std::path::PathBuf> {
     Ok(path)
 }
 
-fn recovery_command(command: RecoveryCommand) -> Result<()> {
+fn recovery_command(
+    project: Option<String>,
+    app: Option<String>,
+    command: RecoveryCommand,
+) -> Result<()> {
     match command {
         RecoveryCommand::Export { output } => {
             let cwd = env::current_dir()?;
-            let mut config = config::read_project_config(&cwd)?;
             let passphrase = vault::read_existing_passphrase()?;
+            let target = workspace_target::resolve_one_with_passphrase(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+                &passphrase,
+            )?;
+            let cwd = target.path;
+            let mut config = config::read_project_config(&cwd)?;
 
             let dest = output.unwrap_or_else(|| {
                 dirs::desktop_dir()
@@ -3593,8 +4718,14 @@ fn recovery_command(command: RecoveryCommand) -> Result<()> {
         }
         RecoveryCommand::Create => {
             let cwd = env::current_dir()?;
-            let mut config = config::read_project_config(&cwd)?;
             let passphrase = vault::read_existing_passphrase()?;
+            let target = workspace_target::resolve_one_with_passphrase(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+                &passphrase,
+            )?;
+            let cwd = target.path;
+            let mut config = config::read_project_config(&cwd)?;
             let vault_path = config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase);
             let plaintext = decrypt_vault_for_recovery(&config.project, &vault_path, &passphrase)?;
 
@@ -3612,8 +4743,14 @@ fn recovery_command(command: RecoveryCommand) -> Result<()> {
         }
         RecoveryCommand::Restore { path } => {
             let cwd = env::current_dir()?;
-            let mut config = config::read_project_config(&cwd)?;
             let passphrase = vault::read_existing_passphrase()?;
+            let target = workspace_target::resolve_one_with_passphrase(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+                &passphrase,
+            )?;
+            let cwd = target.path;
+            let mut config = config::read_project_config(&cwd)?;
             let vault_path = config::resolve_vault_path_with_passphrase(&cwd, &config, &passphrase);
 
             if let Some(source) = path {
@@ -3669,7 +4806,8 @@ fn decrypt_vault_for_recovery(
 fn prompt_shell_reload(_rc: &Path) {
     #[cfg(not(coverage))]
     {
-        let reload = inquire::Confirm::new("Reload shell now to activate ward hooks?")
+        let reload = inquire::Confirm::new("Reload your shell now to activate Ward hooks?")
+            .with_help_message("After reload, run ward human to protect this terminal.")
             .with_default(true)
             .prompt()
             .unwrap_or(false);
@@ -3678,21 +4816,15 @@ fn prompt_shell_reload(_rc: &Path) {
             crate::fs_util::ensure_private_dir(&broker::run_dir()).ok();
             fs::write(&marker, "").ok();
             // Fallback if the ward() shell function isn't installed yet.
-            println!();
-            println!("  Run this to reload and activate:");
-            println!("    exec $SHELL  &&  ward human");
+            term::next("reload with: exec $SHELL && ward human");
         } else {
-            println!();
-            println!("  When ready, reload your shell:");
-            println!("    exec $SHELL  &&  ward human");
+            term::next("when ready: exec $SHELL && ward human");
         }
     }
     #[cfg(coverage)]
     {
         let _ = rc;
-        println!();
-        println!("  Reload your shell and activate human mode:");
-        println!("    exec $SHELL  &&  ward human");
+        term::next("reload with: exec $SHELL && ward human");
     }
 }
 
@@ -3949,15 +5081,62 @@ fn posix_init_code(
     out.push_str("  done\n");
     out.push_str("  return 1\n");
     out.push_str("}\n");
+    out.push_str("__ward_workspace_root() {\n");
+    out.push_str("  __ward_dir=\"$PWD\"\n");
+    out.push_str("  while [ -n \"$__ward_dir\" ]; do\n");
+    out.push_str("    if [ -f \"$__ward_dir/pnpm-workspace.yaml\" ] || [ -f \"$__ward_dir/turbo.json\" ]; then\n");
+    out.push_str("      printf '%s\\n' \"$__ward_dir\"\n");
+    out.push_str("      return 0\n");
+    out.push_str("    fi\n");
+    out.push_str("    if [ \"$__ward_dir\" = \"/\" ]; then\n");
+    out.push_str("      break\n");
+    out.push_str("    fi\n");
+    out.push_str("    __ward_dir=$(dirname \"$__ward_dir\")\n");
+    out.push_str("  done\n");
+    out.push_str("  return 1\n");
+    out.push_str("}\n");
+    out.push_str("__ward_app_from_command() {\n");
+    out.push_str("  case \"$1\" in\n");
+    out.push_str("    pnpm|npm|yarn|bun)\n");
+    out.push_str("      shift\n");
+    out.push_str("      while [ $# -gt 0 ]; do\n");
+    out.push_str("        case \"$1\" in\n");
+    out.push_str("          --filter|--workspace)\n");
+    out.push_str("            shift\n");
+    out.push_str("            [ -n \"$1\" ] && printf '%s\\n' \"$1\" && return 0\n");
+    out.push_str("            ;;\n");
+    out.push_str("          --filter=*|--workspace=*)\n");
+    out.push_str("            printf '%s\\n' \"${1#*=}\"\n");
+    out.push_str("            return 0\n");
+    out.push_str("            ;;\n");
+    out.push_str("        esac\n");
+    out.push_str("        shift\n");
+    out.push_str("      done\n");
+    out.push_str("      ;;\n");
+    out.push_str("  esac\n");
+    out.push_str("  return 1\n");
+    out.push_str("}\n");
     out.push_str("__ward_wrap() {\n");
     out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
-    out.push_str("  if [ -z \"$__ward_root\" ]; then\n");
+    out.push_str("  __ward_workspace=\"$(__ward_workspace_root)\"\n");
+    out.push_str("  if [ -z \"$__ward_root\" ] && [ -z \"$__ward_workspace\" ]; then\n");
     out.push_str("    command \"$@\"\n");
     out.push_str("    return $?\n");
     out.push_str("  fi\n");
     out.push_str(&format!("  if [ -S \"{sock_path}\" ]; then\n"));
+    out.push_str("    if [ -n \"$__ward_root\" ]; then\n");
     out.push_str("    WARD_HUMAN_SHELL_PID=$$ command ward run -- \"$@\"\n");
     out.push_str("    return $?\n");
+    out.push_str("    fi\n");
+    out.push_str("    __ward_app=\"$(__ward_app_from_command \"$@\")\"\n");
+    out.push_str("    if [ -n \"$__ward_app\" ]; then\n");
+    out.push_str(
+        "      WARD_HUMAN_SHELL_PID=$$ command ward run --app \"$__ward_app\" -- \"$@\"\n",
+    );
+    out.push_str("      return $?\n");
+    out.push_str("    fi\n");
+    out.push_str("    printf '%s\\n' 'Ward could not map this workspace-root command to one app; rerun with ward run --app <app> -- <command>' >&2\n");
+    out.push_str("    return 126\n");
     out.push_str("  fi\n");
     out.push_str(
         "  printf '%s\\n' 'Ward human mode is not active for this terminal; run ward human' >&2\n",
@@ -4006,7 +5185,8 @@ fn zsh_prompt_badge_code(sock_path: &str) -> String {
     out.push_str("__WARD_LOCKED_BADGE='%F{244}ward:locked%f'\n");
     out.push_str("__ward_prompt_badge() {\n");
     out.push_str("  __ward_root=\"$(__ward_project_root)\"\n");
-    out.push_str("  if [ -z \"$__ward_root\" ]; then\n");
+    out.push_str("  __ward_workspace=\"$(__ward_workspace_root)\"\n");
+    out.push_str("  if [ -z \"$__ward_root\" ] && [ -z \"$__ward_workspace\" ]; then\n");
     out.push_str("    return 0\n");
     out.push_str("  fi\n");
     out.push_str(&format!("  if [ -S \"{sock_path}\" ]; then\n"));
@@ -4067,19 +5247,70 @@ fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
     out.push_str("    end\n");
     out.push_str("    return 1\n");
     out.push_str("end\n");
+    out.push_str("function __ward_workspace_root\n");
+    out.push_str("    set dir (pwd)\n");
+    out.push_str("    while test -n \"$dir\"\n");
+    out.push_str(
+        "        if test -f \"$dir/pnpm-workspace.yaml\"; or test -f \"$dir/turbo.json\"\n",
+    );
+    out.push_str("            echo $dir\n");
+    out.push_str("            return 0\n");
+    out.push_str("        end\n");
+    out.push_str("        if test \"$dir\" = \"/\"\n");
+    out.push_str("            break\n");
+    out.push_str("        end\n");
+    out.push_str("        set dir (dirname \"$dir\")\n");
+    out.push_str("    end\n");
+    out.push_str("    return 1\n");
+    out.push_str("end\n");
+    out.push_str("function __ward_app_from_command\n");
+    out.push_str("    switch $argv[1]\n");
+    out.push_str("        case pnpm npm yarn bun\n");
+    out.push_str("            set args $argv[2..-1]\n");
+    out.push_str("            set i 1\n");
+    out.push_str("            while test $i -le (count $args)\n");
+    out.push_str("                set arg $args[$i]\n");
+    out.push_str(
+        "                if test \"$arg\" = \"--filter\"; or test \"$arg\" = \"--workspace\"\n",
+    );
+    out.push_str("                    set i (math $i + 1)\n");
+    out.push_str(
+        "                    test $i -le (count $args); and echo $args[$i]; and return 0\n",
+    );
+    out.push_str("                else if string match -q -- '--filter=*' $arg; or string match -q -- '--workspace=*' $arg\n");
+    out.push_str("                    string replace -r '^[^=]+=' '' $arg\n");
+    out.push_str("                    return 0\n");
+    out.push_str("                end\n");
+    out.push_str("                set i (math $i + 1)\n");
+    out.push_str("            end\n");
+    out.push_str("    end\n");
+    out.push_str("    return 1\n");
+    out.push_str("end\n");
     out.push_str("function __ward_wrap\n");
     // Use $fish_pid directly — it's the fish shell PID, matching getppid() in child processes.
     out.push_str(&format!(
         "    set sock \"{sock_dir}/human-$fish_pid/guardian.sock\"\n"
     ));
     out.push_str("    set project_root (__ward_project_root)\n");
-    out.push_str("    if test -z \"$project_root\"\n");
+    out.push_str("    set workspace_root (__ward_workspace_root)\n");
+    out.push_str("    if test -z \"$project_root\"; and test -z \"$workspace_root\"\n");
     out.push_str("        command $argv\n");
     out.push_str("        return $status\n");
     out.push_str("    end\n");
     out.push_str("    if test -S $sock\n");
+    out.push_str("        if test -n \"$project_root\"\n");
     out.push_str("        env WARD_HUMAN_SHELL_PID=$fish_pid command ward run -- $argv\n");
     out.push_str("        return $status\n");
+    out.push_str("        end\n");
+    out.push_str("        set app (__ward_app_from_command $argv)\n");
+    out.push_str("        if test -n \"$app\"\n");
+    out.push_str(
+        "            env WARD_HUMAN_SHELL_PID=$fish_pid command ward run --app \"$app\" -- $argv\n",
+    );
+    out.push_str("            return $status\n");
+    out.push_str("        end\n");
+    out.push_str("        echo 'Ward could not map this workspace-root command to one app; rerun with ward run --app <app> -- <command>' >&2\n");
+    out.push_str("        return 126\n");
     out.push_str("    else\n");
     out.push_str(
         "        echo 'Ward human mode is not active for this terminal; run ward human' >&2\n",
@@ -4109,9 +5340,13 @@ fn fish_init_code(ward_home: &std::path::Path, cmds: &[&str]) -> String {
 
 fn modes_command(command: ModesCommand) -> Result<()> {
     match command {
-        ModesCommand::List => {
+        ModesCommand::List { project, app } => {
             let cwd = env::current_dir()?;
-            let resolved = registry::resolve_project(None, &cwd)?;
+            let target = workspace_target::resolve_one(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+            )?;
+            let resolved = target.resolved_project();
             let modes = modes::load_local_modes(&resolved.path)?;
             if modes.is_empty() {
                 println!("No modes defined in .ward.modes.json");
@@ -4128,9 +5363,14 @@ fn modes_command(command: ModesCommand) -> Result<()> {
             }
             Ok(())
         }
-        ModesCommand::Push { project, .. } => {
+        ModesCommand::Push {
+            project,
+            app,
+            global: _,
+        } => {
             let cwd = env::current_dir()?;
-            let initial = registry::resolve_project(project.as_deref(), &cwd)?;
+            let selector = workspace_target::TargetSelector::one(project, app);
+            let initial = workspace_target::resolve_one(&selector, &cwd)?.resolved_project();
             let modes_path = modes::local_modes_path(&initial.path);
             let local_modes = modes::load_local_modes(&initial.path)?;
             if local_modes.is_empty() {
@@ -4138,7 +5378,8 @@ fn modes_command(command: ModesCommand) -> Result<()> {
             }
             let passphrase = vault::read_existing_passphrase()?;
             let resolved =
-                registry::resolve_project_with_passphrase(project.as_deref(), &cwd, &passphrase)?;
+                workspace_target::resolve_one_with_passphrase(&selector, &cwd, &passphrase)?
+                    .resolved_project();
             // Validate passphrase by decrypting the vault
             with_passphrase_vault_access(&resolved, &passphrase, || {
                 vault::decrypt_vault_file(&resolved.vault, &passphrase)
@@ -4152,9 +5393,13 @@ fn modes_command(command: ModesCommand) -> Result<()> {
             );
             Ok(())
         }
-        ModesCommand::Status => {
+        ModesCommand::Status { project, app } => {
             let cwd = env::current_dir()?;
-            let resolved = registry::resolve_project(None, &cwd)?;
+            let target = workspace_target::resolve_one(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+            )?;
+            let resolved = target.resolved_project();
             match broker::status() {
                 Ok(status) => {
                     let session = status.sessions.iter().find(|s| s.project == resolved.name);
@@ -4172,6 +5417,7 @@ fn modes_command(command: ModesCommand) -> Result<()> {
 
 fn teardown(
     project: Option<String>,
+    app: Option<String>,
     export_path: PathBuf,
     yes: bool,
     restore_env: bool,
@@ -4180,7 +5426,8 @@ fn teardown(
         anyhow::bail!("teardown requires --yes");
     }
     let cwd = env::current_dir()?;
-    let initial = registry::resolve_project(project.as_deref(), &cwd)?;
+    let selector = workspace_target::TargetSelector::one(project, app);
+    let initial = workspace_target::resolve_one(&selector, &cwd)?.resolved_project();
     let export_path = if restore_env && export_path == PathBuf::from(".env.export") {
         PathBuf::from(".env")
     } else {
@@ -4198,8 +5445,8 @@ fn teardown(
     let passphrase = vault::read_existing_passphrase().context(
         "teardown requires the vault PIN/passphrase even with --yes; run from an interactive terminal or set the unsafe test passphrase only in tests",
     )?;
-    let resolved =
-        registry::resolve_project_with_passphrase(project.as_deref(), &cwd, &passphrase)?;
+    let resolved = workspace_target::resolve_one_with_passphrase(&selector, &cwd, &passphrase)?
+        .resolved_project();
     with_passphrase_vault_access(&resolved, &passphrase, || {
         env_file::export_env_file(&output, &resolved.vault, &passphrase, true)
     })?;
@@ -4454,6 +5701,64 @@ fn evaluate_access(
     policy::evaluate_request(config, access, None, findings)
 }
 
+fn request_audit_snapshot<'a>(
+    access: &'a AccessRequest,
+    evaluation: &'a policy::PolicyEvaluation,
+    git: &'a git_context::GitContext,
+    verified_context: Option<&'a context::VerifiedContext>,
+) -> RequestAuditSnapshot<'a> {
+    RequestAuditSnapshot {
+        project: &access.project,
+        agent: &access.agent,
+        branch: &access.branch,
+        action: &access.action,
+        command: &access.command,
+        env: &access.env,
+        requested_env: &evaluation.requested_env,
+        matched_profile: &evaluation.matched_profile,
+        matched_preset: &evaluation.matched_preset,
+        matched_mode: &evaluation.matched_mode,
+        policy_findings: &evaluation.findings,
+        git,
+        verified_context,
+    }
+}
+
+fn approval_channel_for_source(source: approvals::ApprovalSource) -> ApprovalChannel {
+    match source {
+        approvals::ApprovalSource::LocalTty => ApprovalChannel::LocalPrompt,
+        approvals::ApprovalSource::ManualAllow => ApprovalChannel::ManualAllow,
+        approvals::ApprovalSource::AgentMediated => ApprovalChannel::AgentMediatedCli,
+        approvals::ApprovalSource::Grant => ApprovalChannel::GrantReuse,
+        approvals::ApprovalSource::PolicyAuto => ApprovalChannel::PolicyAuto,
+        approvals::ApprovalSource::PolicyDeny => ApprovalChannel::PolicyDeny,
+    }
+}
+
+fn approval_channel_for_terminal(agent_mediated: bool) -> ApprovalChannel {
+    if agent_mediated {
+        ApprovalChannel::AgentMediatedCli
+    } else {
+        ApprovalChannel::TerminalApprove
+    }
+}
+
+fn grant_origin_request_id(decision: &ApprovalDecision) -> Option<uuid::Uuid> {
+    if decision.source != approvals::ApprovalSource::Grant {
+        return None;
+    }
+    let grant_id = decision.grant_id?;
+    grants::load_grants()
+        .ok()?
+        .into_iter()
+        .find(|grant| grant.id == grant_id)
+        .and_then(|grant| grant.request_id)
+}
+
+fn should_log_approval_event(decision: &ApprovalDecision) -> bool {
+    decision.source != approvals::ApprovalSource::Grant
+}
+
 fn approval_human_proof(source: approvals::ApprovalSource) -> Option<&'static str> {
     match source {
         approvals::ApprovalSource::AgentMediated => Some("external-agent-ui"),
@@ -4692,6 +5997,198 @@ fn print_run_denied(access: &AccessRequest, evaluation: &policy::PolicyEvaluatio
     Ok(())
 }
 
+fn wait_for_run_approval(
+    pending: &pending_requests::PendingRequest,
+    access: &AccessRequest,
+    evaluation: &policy::PolicyEvaluation,
+    verified_context: Option<&context::VerifiedContext>,
+    approval_timeout: &str,
+) -> Result<Option<ApprovalDecision>> {
+    let timeout = unlock::parse_ttl(approval_timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    eprintln!(
+        "Ward is waiting for approval {}. Open the dashboard notification center or run: ward approve {} --scope session --agent-mediated --json",
+        pending.id, pending.id
+    );
+
+    loop {
+        if let Some(resolution) = pending_requests::load_resolution(pending.id)? {
+            if resolution.status == "denied" {
+                print_run_wait_denied(pending.id, access)?;
+                return Ok(None);
+            }
+            if resolution.status == "approved" {
+                if let Some(decision) =
+                    non_interactive_decision_with_context(access, evaluation, verified_context)?
+                {
+                    return Ok(Some(decision));
+                }
+            }
+        }
+
+        if !pending_requests::pending_request_path(pending.id).exists() {
+            if let Some(decision) =
+                non_interactive_decision_with_context(access, evaluation, verified_context)?
+            {
+                return Ok(Some(decision));
+            }
+        }
+
+        if chrono::Utc::now() >= deadline {
+            print_run_wait_timeout(Some(pending.id), access, "run")?;
+            return Ok(None);
+        }
+
+        thread::sleep(StdDuration::from_millis(500));
+    }
+}
+
+fn execute_no_prompt_with_optional_wait(
+    resolved: &registry::ResolvedProject,
+    cwd: &Path,
+    decision: &ApprovalDecision,
+    command_args: &[String],
+    mut execute_payload: broker::ExecuteAuthorizationPayload,
+    context: &context::VerifiedContext,
+    access: &AccessRequest,
+    evaluation: &policy::PolicyEvaluation,
+    wait_for_approval: bool,
+    approval_timeout: &str,
+) -> Result<Option<runner::RunCommandOutcome>> {
+    let timeout = unlock::parse_ttl(approval_timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    let mut unlock_notification = None;
+
+    loop {
+        execute_payload.expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+        execute_payload.nonce = uuid::Uuid::new_v4().to_string();
+        let proof_payload =
+            serde_json::to_string(&execute_payload).expect("execution payload should serialize");
+        let proof = agents::sign_payload(&resolved.name, &context.agent, &proof_payload)?;
+
+        match broker::execute(
+            &resolved.name,
+            &resolved.vault,
+            cwd,
+            decision.approved_env.clone(),
+            command_args.to_vec(),
+            broker::ExecuteAuthorization::Agent { proof },
+        ) {
+            Ok(outcome) => {
+                if let Some(notification_id) = unlock_notification.take() {
+                    notifications::remove_block_notification(notification_id)?;
+                }
+                return Ok(Some(outcome));
+            }
+            Err(error) => {
+                if let Some(missing_env) = broker_vault_key_missing_envs(&error) {
+                    create_run_block_notification(
+                        notifications::NotificationKind::VaultKeyMissing,
+                        access,
+                        evaluation,
+                        "The approved request references env names that are not present in the vault.",
+                        Some(
+                            "ward env unlock, add the missing key, then run ward env lock",
+                        ),
+                    )?;
+                    print_run_vault_key_missing(access, evaluation, missing_env)?;
+                    return Ok(None);
+                }
+                if broker_execution_rejection_is_authoritative(&error) {
+                    return Err(error).context("broker rejected no-prompt execution");
+                }
+                if !wait_for_approval {
+                    let reason = error.to_string();
+                    print_run_unlock_required(access, evaluation, Some(&reason))?;
+                    return Ok(None);
+                }
+
+                if unlock_notification.is_none() {
+                    let notification = create_run_block_notification(
+                        notifications::NotificationKind::UnlockRequired,
+                        access,
+                        evaluation,
+                        "This request is waiting for the vault to be unlocked before it can run.",
+                        Some("ward unlock --ttl 8h"),
+                    )?;
+                    unlock_notification = Some(notification.id);
+                    eprintln!(
+                        "Ward is waiting for unlock before running this command. Run: ward unlock --ttl 8h"
+                    );
+                }
+
+                if chrono::Utc::now() >= deadline {
+                    if let Some(notification_id) = unlock_notification.take() {
+                        notifications::remove_block_notification(notification_id)?;
+                    }
+                    print_run_wait_timeout(None, access, "unlock")?;
+                    return Ok(None);
+                }
+
+                if broker::active_session_expiry(&resolved.name, &resolved.vault)?.is_some() {
+                    if let Some(notification_id) = unlock_notification.take() {
+                        notifications::remove_block_notification(notification_id)?;
+                    }
+                    continue;
+                }
+
+                thread::sleep(StdDuration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn create_run_block_notification(
+    kind: notifications::NotificationKind,
+    access: &AccessRequest,
+    evaluation: &policy::PolicyEvaluation,
+    message: &str,
+    fix_command: Option<&str>,
+) -> Result<notifications::BlockNotification> {
+    notifications::create_block_notification(
+        kind,
+        &access.project,
+        access.agent.as_deref(),
+        Some(&access.command),
+        &access.env,
+        &evaluation.findings,
+        run_risk_summary(evaluation),
+        message,
+        fix_command,
+    )
+}
+
+fn print_run_wait_denied(request_id: uuid::Uuid, access: &AccessRequest) -> Result<()> {
+    let response = serde_json::json!({
+        "status": "denied",
+        "approvalRequired": false,
+        "unlockRequired": false,
+        "requestId": request_id,
+        "project": access.project,
+        "command": access.command,
+    });
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn print_run_wait_timeout(
+    request_id: Option<uuid::Uuid>,
+    access: &AccessRequest,
+    approval_type: &str,
+) -> Result<()> {
+    let mut response = serde_json::json!({
+        "status": "approval_timeout",
+        "approvalType": approval_type,
+        "project": access.project,
+        "command": access.command,
+    });
+    if let Some(request_id) = request_id {
+        response["requestId"] = serde_json::json!(request_id);
+    }
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
 fn broker_vault_key_missing_envs(error: &anyhow::Error) -> Option<Vec<String>> {
     let broker_error = error.downcast_ref::<broker::BrokerError>()?;
     if broker_error.reason() != "vault_key_missing" {
@@ -4859,6 +6356,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
 
     let absolute_export = EnvCommand::Export {
         project: None,
+        app: None,
         output: Some(project.path().join(".env.absolute.export")),
         force: false,
         unsafe_stdout: false,
@@ -4866,6 +6364,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     env_command(absolute_export)?;
     let stdout_export = EnvCommand::Export {
         project: None,
+        app: None,
         output: None,
         force: false,
         unsafe_stdout: true,
@@ -5019,7 +6518,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     let unregistered_context =
         verified_worktree(project.path().to_path_buf(), "https://example.test/demo");
     let unregistered_allowed =
-        enforce_worktree_for_no_prompt(&unregistered, &unregistered_context)?;
+        enforce_worktree_for_no_prompt(&unregistered, &unregistered_context, false, "30m")?;
     assert!(unregistered_allowed);
     let autobind_root = tempfile::tempdir()?;
     let autobind_worktree = autobind_root.path().join("agent-wt");
@@ -5029,17 +6528,20 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     let missing_worktree = missing_root.join("child");
     let _ = worktrees::allow_root("coverage-main", &missing_root)?;
     let autobind_context = verified_worktree(autobind_worktree, "https://example.test/demo");
-    let autobind_allowed = enforce_worktree_for_no_prompt(&resolved_main, &autobind_context)?;
+    let autobind_allowed =
+        enforce_worktree_for_no_prompt(&resolved_main, &autobind_context, false, "30m")?;
     assert!(autobind_allowed);
     let missing_autobind_context = verified_worktree(missing_worktree, "https://example.test/demo");
-    let _ = enforce_worktree_for_no_prompt(&resolved_main, &missing_autobind_context)?;
+    let _ =
+        enforce_worktree_for_no_prompt(&resolved_main, &missing_autobind_context, false, "30m")?;
     let _ = worktrees::remove_root("coverage-main", &missing_root)?;
     let approval_worktree = tempfile::tempdir()?;
     let approval_context = verified_worktree(
         approval_worktree.path().to_path_buf(),
         "https://example.test/demo",
     );
-    let approval_allowed = enforce_worktree_for_no_prompt(&resolved_main, &approval_context)?;
+    let approval_allowed =
+        enforce_worktree_for_no_prompt(&resolved_main, &approval_context, false, "30m")?;
     assert!(!approval_allowed);
     let registered_for_worktree = registry::load_registry()?
         .projects
@@ -5100,7 +6602,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         denied_worktree.path().to_path_buf(),
         "https://example.test/other",
     );
-    let denied_allowed = enforce_worktree_for_no_prompt(&resolved_main, &denied_context)?;
+    let denied_allowed =
+        enforce_worktree_for_no_prompt(&resolved_main, &denied_context, false, "30m")?;
     assert!(!denied_allowed);
     registry
         .projects
@@ -5142,6 +6645,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         json: false,
         no_prompt: true,
+        wait_for_approval: false,
+        approval_timeout: "30m".to_string(),
     });
     assert!(no_json.is_err());
     let critical_run = RunOptions {
@@ -5154,6 +6659,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         command: vec!["sh".to_string(), "-c".to_string(), "printenv".to_string()],
         json: true,
         no_prompt: true,
+        wait_for_approval: false,
+        approval_timeout: "30m".to_string(),
     };
     run(critical_run)?;
     let grant_source = approvals::ApprovalSource::ManualAllow;
@@ -5205,6 +6712,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     .is_err());
     let context_receipt = grants::GrantReceiptContext {
         request_id: uuid::Uuid::new_v4(),
+        pending_request: false,
         critical_confirmation: false,
         verified_context: Some(auto_context.clone()),
     };
@@ -5233,6 +6741,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         json: true,
         no_prompt: true,
+        wait_for_approval: false,
+        approval_timeout: "30m".to_string(),
     };
     run(unlocked_run)?;
     let suspicious_session = ApprovalDecision {
@@ -5811,6 +7321,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             json: false,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap_err()
         .to_string();
@@ -5826,6 +7338,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
 
@@ -5847,6 +7361,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "false".to_string()],
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
 
@@ -6303,36 +7819,48 @@ mod tests {
         .unwrap();
 
         for command in [
-            EnvCommand::List { project: None },
+            EnvCommand::List {
+                project: None,
+                app: None,
+                all: false,
+            },
             EnvCommand::Set {
                 project: None,
+                app: None,
                 assignment: "OPENAI_API_KEY=sk-test".to_string(),
             },
             EnvCommand::Unset {
                 project: None,
+                app: None,
                 key: "OPENAI_API_KEY".to_string(),
             },
             EnvCommand::Unset {
                 project: None,
+                app: None,
                 key: "MISSING_ENV".to_string(),
             },
             EnvCommand::Unlock {
                 project: None,
+                app: None,
+                all: false,
                 output: ".env.manual".into(),
                 force: false,
             },
             EnvCommand::Lock {
                 project: None,
+                app: None,
                 source: ".env.manual".into(),
             },
             EnvCommand::Export {
                 project: None,
+                app: None,
                 output: None,
                 force: true,
                 unsafe_stdout: false,
             },
             EnvCommand::Export {
                 project: None,
+                app: None,
                 output: Some(".env.dispatch.export".into()),
                 force: false,
                 unsafe_stdout: false,
@@ -6357,6 +7885,8 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Allow {
+                project: None,
+                app: None,
                 profile: Some("dev".to_string()),
                 scope: Some(ApprovalScope::Always),
                 agent: Some("codex".to_string()),
@@ -6370,6 +7900,7 @@ mod tests {
             command: Commands::Run {
                 profile: Some("dev".to_string()),
                 project: None,
+                app: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: agent_context.agent_key_id.clone(),
                 worktree: agent_context.worktree.clone(),
@@ -6380,12 +7911,16 @@ mod tests {
                 env_names: Vec::new(),
                 json: true,
                 no_prompt: true,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: Vec::new(),
             },
         })
         .unwrap();
         dispatch(Cli {
             command: Commands::Request {
+                project: None,
+                app: None,
                 profile: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: None,
@@ -6404,6 +7939,7 @@ mod tests {
         dispatch(Cli {
             command: Commands::Teardown {
                 project: None,
+                app: None,
                 export_path: ".env.final".into(),
                 yes: true,
                 restore_env: false,
@@ -6696,6 +8232,8 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Request {
+                project: None,
+                app: None,
                 profile: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: agent_context.agent_key_id.clone(),
@@ -6736,6 +8274,8 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Allow {
+                project: None,
+                app: None,
                 profile: None,
                 scope: Some(ApprovalScope::Always),
                 agent: Some("codex".to_string()),
@@ -6783,6 +8323,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "false".to_string()],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .is_err());
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
@@ -6809,6 +8351,7 @@ mod tests {
             command: Commands::Run {
                 profile: None,
                 project: None,
+                app: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: None,
                 worktree: None,
@@ -6819,12 +8362,17 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 json: false,
                 no_prompt: false,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             },
         })
         .unwrap();
         dispatch(Cli {
             command: Commands::Unlock {
+                project: None,
+                app: None,
+                all: false,
                 ttl: "1h".to_string(),
                 mode: None,
                 verify_only: false,
@@ -6835,6 +8383,7 @@ mod tests {
             command: Commands::Run {
                 profile: None,
                 project: None,
+                app: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: None,
                 worktree: None,
@@ -6845,6 +8394,8 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 json: false,
                 no_prompt: false,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             },
         })
@@ -6864,6 +8415,8 @@ mod tests {
             ],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
@@ -6878,6 +8431,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap_err();
         assert_eq!(
@@ -6887,6 +8442,8 @@ mod tests {
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
         dispatch(Cli {
             command: Commands::Dev {
+                project: None,
+                app: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: None,
                 worktree: None,
@@ -6900,6 +8457,8 @@ mod tests {
         .unwrap();
         dispatch(Cli {
             command: Commands::Migrate {
+                project: None,
+                app: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: None,
                 worktree: None,
@@ -6915,6 +8474,7 @@ mod tests {
             command: Commands::Run {
                 profile: None,
                 project: None,
+                app: None,
                 agent: Some("codex".to_string()),
                 agent_key_id: None,
                 worktree: None,
@@ -6925,6 +8485,8 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 json: false,
                 no_prompt: false,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             },
         })
@@ -7010,12 +8572,19 @@ mod tests {
         make_executable(&editor);
         std::env::set_var("EDITOR", &editor);
         dispatch(Cli {
-            command: Commands::Edit,
+            command: Commands::Edit {
+                project: None,
+                app: None,
+            },
         })
         .unwrap();
 
         dispatch(Cli {
-            command: Commands::Doctor,
+            command: Commands::Doctor {
+                project: None,
+                app: None,
+                all: false,
+            },
         })
         .unwrap();
         dispatch(Cli {
@@ -7097,6 +8666,8 @@ mod tests {
             ],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
         std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "deny");
@@ -7576,6 +9147,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             created_at: now,
             expires_at: None,
+            request_id: None,
             project: "demo".to_string(),
             agent: None,
             branch: None,
@@ -7841,6 +9413,7 @@ mod tests {
             id: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             expires_at: None,
+            request_id: None,
             project: access.project.clone(),
             agent: access.agent.clone(),
             branch: access.branch.clone(),
@@ -7902,6 +9475,7 @@ mod tests {
             "logs",
             "unlock",
             "workspace",
+            "config",
         ] {
             let rendered = command
                 .find_subcommand_mut(subcommand)
@@ -8048,6 +9622,8 @@ mod tests {
             vec!["ward", "grants", "list"],
             vec!["ward", "grants", "revoke", &request_id],
             vec!["ward", "grants", "prune"],
+            vec!["ward", "config", "restore"],
+            vec!["ward", "config", "restore", "--force", "--json"],
             vec![
                 "ward",
                 "approve",
@@ -8183,6 +9759,8 @@ mod tests {
             format!(
                 "{:?}",
                 Commands::Request {
+                    project: None,
+                    app: None,
                     profile: None,
                     agent: Some("codex".to_string()),
                     agent_key_id: None,
@@ -8200,6 +9778,8 @@ mod tests {
             format!(
                 "{:?}",
                 Commands::Allow {
+                    project: None,
+                    app: None,
                     profile: None,
                     scope: Some(ApprovalScope::Always),
                     agent: Some("codex".to_string()),
@@ -8237,6 +9817,7 @@ mod tests {
                 Commands::Run {
                     profile: None,
                     project: Some("demo".to_string()),
+                    app: None,
                     agent: Some("codex".to_string()),
                     agent_key_id: None,
                     worktree: None,
@@ -8247,6 +9828,8 @@ mod tests {
                     env_names: vec!["DATABASE_URL".to_string()],
                     json: false,
                     no_prompt: false,
+                    wait_for_approval: false,
+                    approval_timeout: "30m".to_string(),
                     command: vec!["pnpm".to_string(), "dev".to_string()],
                 }
             ),
@@ -8276,7 +9859,18 @@ mod tests {
             ),
             format!(
                 "{:?}",
+                Commands::Config {
+                    command: ConfigCommand::Restore {
+                        force: true,
+                        json: true,
+                    },
+                }
+            ),
+            format!(
+                "{:?}",
                 Commands::Dev {
+                    project: None,
+                    app: None,
                     agent: Some("codex".to_string()),
                     agent_key_id: None,
                     worktree: None,
@@ -8290,6 +9884,8 @@ mod tests {
             format!(
                 "{:?}",
                 Commands::Migrate {
+                    project: None,
+                    app: None,
                     agent: Some("codex".to_string()),
                     agent_key_id: None,
                     worktree: None,
@@ -8300,7 +9896,14 @@ mod tests {
                     no_prompt: false,
                 }
             ),
-            format!("{:?}", Commands::Doctor),
+            format!(
+                "{:?}",
+                Commands::Doctor {
+                    project: None,
+                    app: None,
+                    all: false
+                }
+            ),
             format!(
                 "{:?}",
                 Commands::Logs {
@@ -8310,10 +9913,19 @@ mod tests {
                     kind: Some(LogKind::Requests),
                 }
             ),
-            format!("{:?}", Commands::Edit),
+            format!(
+                "{:?}",
+                Commands::Edit {
+                    project: None,
+                    app: None
+                }
+            ),
             format!(
                 "{:?}",
                 Commands::Unlock {
+                    project: None,
+                    app: None,
+                    all: false,
                     ttl: "1h".to_string(),
                     mode: None,
                     verify_only: false,
@@ -8367,10 +9979,21 @@ mod tests {
             format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 28);
+        assert_eq!(commands.len(), 29);
         for value in commands {
             assert!(!value.is_empty());
         }
+    }
+
+    #[test]
+    fn setup_wizard_copy_is_product_ready() {
+        assert!(SETUP_GUIDED_BODY.contains("encrypt your local env"));
+        assert!(SETUP_GUIDED_BODY.contains("safe human and agent access"));
+        assert!(WORKSPACE_SETUP_BODY.contains("monorepo workspace"));
+        assert!(WORKSPACE_SETUP_PROMPT_HELP.contains("workspace-root trust"));
+        assert_eq!(RECOVERY_EXPORT_PROMPT, "Export a recovery backup now?");
+        assert!(RECOVERY_EXPORT_HELP.contains("USB drive"));
+        assert!(RECOVERY_EXPORT_HELP.contains("secure cloud backup"));
     }
 
     #[cfg(unix)]

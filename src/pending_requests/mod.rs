@@ -29,6 +29,15 @@ pub struct PendingRequest {
     pub verified_context: Option<VerifiedContext>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingRequestResolution {
+    pub request_id: uuid::Uuid,
+    pub status: String,
+    pub project: String,
+    pub resolved_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingRequestResponse<'a> {
@@ -50,7 +59,7 @@ pub struct PendingRequestResponse<'a> {
     pub deny_command: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApprovalCommand {
     pub scope: ApprovalScope,
@@ -115,11 +124,61 @@ pub fn load_pending_request(id: uuid::Uuid) -> Result<PendingRequest> {
     Ok(pending)
 }
 
+pub fn list_pending_requests() -> Result<Vec<PendingRequest>> {
+    let dir = requests_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut requests = Vec::new();
+    for entry in fs::read_dir(&dir).context(format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let contents =
+            fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
+        let pending = serde_json::from_str::<PendingRequest>(&contents)
+            .context(format!("failed to parse {}", path.display()))?;
+        if pending.expires_at > Utc::now() {
+            requests.push(pending);
+        }
+    }
+    requests.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(requests)
+}
+
 pub fn consume_pending_request(id: uuid::Uuid) -> Result<PendingRequest> {
     let pending = load_pending_request(id)?;
     let path = request_path(id);
     fs::remove_file(&path).context(format!("failed to remove {}", path.display()))?;
     Ok(pending)
+}
+
+pub fn record_resolution(id: uuid::Uuid, status: &str, project: &str) -> Result<()> {
+    let resolution = PendingRequestResolution {
+        request_id: id,
+        status: status.to_string(),
+        project: project.to_string(),
+        resolved_at: Utc::now(),
+    };
+    let path = resolution_path(id);
+    fs_util::ensure_private_parent_dir(&path)?;
+    let contents =
+        serde_json::to_string_pretty(&resolution).expect("resolution serialization is infallible");
+    fs_util::write_private_file(&path, format!("{contents}\n").as_bytes())
+}
+
+pub fn load_resolution(id: uuid::Uuid) -> Result<Option<PendingRequestResolution>> {
+    let path = resolution_path(id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents =
+        fs::read_to_string(&path).context(format!("failed to read {}", path.display()))?;
+    serde_json::from_str::<PendingRequestResolution>(&contents)
+        .map(Some)
+        .context(format!("failed to parse {}", path.display()))
 }
 
 pub fn remove_project_requests(project: &str) -> Result<usize> {
@@ -183,6 +242,10 @@ fn write_pending_request(pending: &PendingRequest) -> Result<()> {
 
 fn request_path(id: uuid::Uuid) -> PathBuf {
     requests_dir().join(format!("{id}.json"))
+}
+
+fn resolution_path(id: uuid::Uuid) -> PathBuf {
+    requests_dir().join("resolved").join(format!("{id}.json"))
 }
 
 fn critical_confirmation(pending: &PendingRequest) -> CriticalConfirmation {

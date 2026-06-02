@@ -23,12 +23,13 @@ use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
-    broker,
+    approvals, broker,
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
+    notifications,
     registry::{self, RegisteredProject},
-    workspace,
+    workspace, worktrees,
 };
 
 const DEFAULT_PORT: u16 = 7777;
@@ -359,8 +360,18 @@ fn handle(mut req: tiny_http::Request, token: &str) {
         return;
     }
 
+    if method == Method::Get && path == "/favicon.png" {
+        serve_png(req, WARD_FAVICON_LIGHT_PNG);
+        return;
+    }
+
     if method == Method::Get && path == "/favicon.svg" {
         serve_svg(req, WARD_LOGO_DARK_SVG);
+        return;
+    }
+
+    if method == Method::Get && path == "/assets/ward-logo-dark.png" {
+        serve_png(req, WARD_LOGO_DARK_PNG);
         return;
     }
 
@@ -380,6 +391,12 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             let project = query_param(&query, "project");
             respond_json_result(req, Ok(load_all_events(project.as_deref())))
         }
+        (Method::Get, "/api/notifications") => {
+            respond_json_result(req, notifications::list_notifications())
+        }
+        (Method::Get, "/api/notifications/stream") => {
+            respond_notifications_stream(req);
+        }
         (Method::Get, "/api/dashboard/status") => respond_json_result(req, dashboard_status()),
         (Method::Post, "/api/projects/pick-folder") => {
             let result = pick_project_folder(&mut req);
@@ -390,7 +407,13 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             respond_project_setup_result(req, result);
         }
         (Method::Post, _) => {
-            if let Some(project) = profiles_collection_route(&path) {
+            if let Some((request_id, action)) = approval_action_route(&path) {
+                let result = approval_action(&mut req, request_id, &action);
+                respond_approval_result(req, result);
+            } else if let Some((request_id, action)) = worktree_action_route(&path) {
+                let result = worktree_action(request_id, &action);
+                respond_json_result(req, result);
+            } else if let Some(project) = profiles_collection_route(&path) {
                 let result = create_profile_policy(&project, &mut req);
                 respond_json_result(req, result);
             } else if let Some((project, profile)) = profile_env_route(&path) {
@@ -453,6 +476,20 @@ fn serve_svg(req: tiny_http::Request, svg: &'static str) {
     let _ = req.respond(response);
 }
 
+fn serve_png(req: tiny_http::Request, body: &'static [u8]) {
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes("Content-Type", "image/png").unwrap(),
+            Header::from_bytes("Cache-Control", "public, max-age=86400").unwrap(),
+        ],
+        Cursor::new(body),
+        Some(body.len()),
+        None,
+    );
+    let _ = req.respond(response);
+}
+
 fn respond_json_result<T: Serialize>(req: tiny_http::Request, result: Result<T>) {
     match result {
         Ok(value) => respond_json(req, StatusCode(200), &value),
@@ -495,6 +532,35 @@ fn respond_project_setup_result(
     }
 }
 
+fn respond_approval_result(req: tiny_http::Request, result: Result<Value>) {
+    match result {
+        Ok(value) => respond_json(req, StatusCode(200), &value),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("signing_key_unavailable")
+                || message.contains("unlock_required")
+                || message.contains("missing broker unlock session")
+                || message.contains("expired broker unlock session")
+                || message.contains("Ward broker is unavailable")
+            {
+                StatusCode(423)
+            } else {
+                StatusCode(500)
+            };
+            respond_json(
+                req,
+                status,
+                &json!({
+                    "error": "approval_failed",
+                    "message": message,
+                    "unlockRequired": status.0 == 423,
+                    "fixCommand": "ward unlock --ttl 8h"
+                }),
+            );
+        }
+    }
+}
+
 fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value: &T) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let response = Response::new(
@@ -504,6 +570,27 @@ fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value
             Header::from_bytes("Cache-Control", "no-cache").unwrap(),
         ],
         Cursor::new(body.clone()),
+        Some(body.len()),
+        None,
+    );
+    let _ = req.respond(response);
+}
+
+fn respond_notifications_stream(req: tiny_http::Request) {
+    let payload = match notifications::list_notifications() {
+        Ok(notifications) => json!({ "notifications": notifications }),
+        Err(error) => {
+            json!({ "error": "notification_stream_failed", "message": error.to_string() })
+        }
+    };
+    let body = format!("retry: 2000\nevent: notifications\ndata: {payload}\n\n");
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes("Content-Type", "text/event-stream").unwrap(),
+            Header::from_bytes("Cache-Control", "no-cache").unwrap(),
+        ],
+        Cursor::new(body.clone().into_bytes()),
         Some(body.len()),
         None,
     );
@@ -562,7 +649,7 @@ fn authorized(req: &tiny_http::Request, query: &str, token: &str) -> bool {
 fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        (key == name).then(|| value.to_string())
+        (url_decode(key) == name).then(|| url_decode(value))
     })
 }
 
@@ -606,6 +693,32 @@ fn profile_env_route(path: &str) -> Option<(String, String)> {
     }
 }
 
+fn approval_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "approvals", request_id, action] if *action == "approve" || *action == "deny" => {
+            Some((
+                uuid::Uuid::parse_str(request_id).ok()?,
+                (*action).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn worktree_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "worktrees", request_id, action] if *action == "approve" || *action == "deny" => {
+            Some((
+                uuid::Uuid::parse_str(request_id).ok()?,
+                (*action).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn url_decode(value: &str) -> String {
     let mut out = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
@@ -634,6 +747,69 @@ fn url_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardApprovalRequest {
+    #[serde(default)]
+    scope: Option<approvals::ApprovalScope>,
+    #[serde(default)]
+    confirm_critical: bool,
+}
+
+fn approval_action(
+    req: &mut tiny_http::Request,
+    request_id: uuid::Uuid,
+    action: &str,
+) -> Result<Value> {
+    match action {
+        "approve" => {
+            let body = read_optional_body(req)?;
+            let request = if body.trim().is_empty() {
+                DashboardApprovalRequest {
+                    scope: Some(approvals::ApprovalScope::Session),
+                    confirm_critical: false,
+                }
+            } else {
+                serde_json::from_str::<DashboardApprovalRequest>(&body)
+                    .context("failed to parse approval JSON request")?
+            };
+            crate::cli::approve_request_from_dashboard(
+                request_id,
+                request.scope.unwrap_or(approvals::ApprovalScope::Session),
+                request.confirm_critical,
+            )
+        }
+        "deny" => crate::cli::deny_request_from_dashboard(request_id),
+        _ => anyhow::bail!("unknown approval action: {action}"),
+    }
+}
+
+fn worktree_action(request_id: uuid::Uuid, action: &str) -> Result<Value> {
+    match action {
+        "approve" => {
+            let Some(known) = worktrees::approve_pending(request_id)? else {
+                anyhow::bail!("pending worktree request not found: {request_id}");
+            };
+            Ok(json!({
+                "status": "approved",
+                "requestId": request_id,
+                "worktree": known.path,
+                "matchKind": known.match_kind,
+            }))
+        }
+        "deny" => {
+            if !worktrees::deny_pending(request_id)? {
+                anyhow::bail!("pending worktree request not found: {request_id}");
+            }
+            Ok(json!({
+                "status": "denied",
+                "requestId": request_id,
+            }))
+        }
+        _ => anyhow::bail!("unknown worktree action: {action}"),
+    }
 }
 
 fn update_profile_env(
@@ -957,18 +1133,18 @@ fn dashboard_status() -> Result<DashboardStatus> {
 fn dashboard_projects() -> Result<Vec<ProjectView>> {
     let registry = registry::list_projects()?;
     let broker_status = broker::status().ok();
-    let mut projects = registry
-        .projects
-        .iter()
-        .map(|(name, project)| {
-            project_view(
-                name,
-                project,
-                registry.active_project.as_deref(),
-                broker_status.as_ref(),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut projects = Vec::new();
+    for (name, project) in &registry.projects {
+        if should_hide_invalid_workspace_root(project) {
+            continue;
+        }
+        projects.push(project_view(
+            name,
+            project,
+            registry.active_project.as_deref(),
+            broker_status.as_ref(),
+        )?);
+    }
     append_discovered_workspace_apps(&mut projects, &registry, broker_status.as_ref())?;
     projects.sort_by(|left, right| {
         left.workspace_root
@@ -977,6 +1153,14 @@ fn dashboard_projects() -> Result<Vec<ProjectView>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(projects)
+}
+
+fn should_hide_invalid_workspace_root(project: &RegisteredProject) -> bool {
+    !config::config_path(&project.path).is_file()
+        && workspace::discover(&project.path)
+            .ok()
+            .flatten()
+            .is_some_and(|discovery| discovery.app_candidates().next().is_some())
 }
 
 fn project_view(
@@ -1031,8 +1215,8 @@ fn project_view(
         config_status,
         setup_status: "configured".to_string(),
         setup_available: false,
-        workspace_root: None,
-        parent_project: None,
+        workspace_root: project.workspace_root.clone(),
+        parent_project: project.parent_workspace.clone(),
         package_name: None,
         package_kind: None,
         profiles,
@@ -1204,6 +1388,7 @@ fn infer_event_project(
     for path in [
         vec!["project"],
         vec!["access", "project"],
+        vec!["verifiedContext", "project"],
         vec!["payload", "project"],
     ] {
         if let Some(project) = nested_str(payload, &path) {
@@ -1522,6 +1707,8 @@ fn command_line(pid: u32) -> Option<String> {
 const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
 const WARD_LOGO_DARK_SVG: &str = include_str!("../assets/ward-logo-dark.svg");
 const WARD_LOGO_TRANSPARENT_SVG: &str = include_str!("../assets/ward-logo-transparent.svg");
+const WARD_LOGO_DARK_PNG: &[u8] = include_bytes!("../assets/ward-logo-dark.png");
+const WARD_FAVICON_LIGHT_PNG: &[u8] = include_bytes!("../assets/ward-favicon-light.png");
 
 #[allow(dead_code)]
 const LEGACY_OVERVIEW_HTML: &str = r##"<!doctype html>
@@ -1976,6 +2163,15 @@ mod tests {
         assert!(is_dashboard_page_route("/logs"));
         assert!(is_dashboard_page_route("/projects/demo/logs"));
         assert!(profile_env_route("/api/projects/demo").is_none());
+        let request_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            approval_action_route(&format!("/api/approvals/{request_id}/approve")),
+            Some((request_id, "approve".to_string()))
+        );
+        assert_eq!(
+            worktree_action_route(&format!("/api/worktrees/{request_id}/deny")),
+            Some((request_id, "deny".to_string()))
+        );
     }
 
     #[test]
@@ -1996,10 +2192,16 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("splitter"));
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
-        assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.svg\""));
-        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-transparent.svg"));
+        assert!(DASHBOARD_HTML.contains("notifications-btn"));
+        assert!(DASHBOARD_HTML.contains("/api/notifications/stream"));
+        assert!(DASHBOARD_HTML.contains("/api/approvals/"));
+        assert!(DASHBOARD_HTML.contains("/api/worktrees/"));
+        assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
+        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
         assert!(WARD_LOGO_DARK_SVG.contains("<rect"));
         assert!(WARD_LOGO_TRANSPARENT_SVG.contains("<svg"));
+        assert!(WARD_LOGO_DARK_PNG.starts_with(b"\x89PNG"));
+        assert!(WARD_FAVICON_LIGHT_PNG.starts_with(b"\x89PNG"));
         assert!(!DASHBOARD_HTML.contains("<select"));
     }
 
@@ -2173,6 +2375,70 @@ mod tests {
 
     #[test]
     #[serial]
+    fn dashboard_projects_hide_invalid_workspace_root_registry_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"cms-core","packageManager":"pnpm@9.15.9"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("turbo.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - \"apps/*\"\n",
+        )
+        .unwrap();
+        let app = root.path().join("apps/aiward");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"name":"@cms-app/aiward","scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        std::fs::write(app.join(".env.example"), "DATABASE_URI=\nPAYLOAD_SECRET=\n").unwrap();
+        let cfg = config::ProjectConfig::default_for_dir(&app, Some("cms-core:ward".to_string()))
+            .unwrap();
+        config::write_project_config(&app, &cfg, true).unwrap();
+
+        registry::register_project(
+            "cms-core:ward-root".to_string(),
+            root.path().to_path_buf(),
+            root.path().join(".env.vault"),
+        )
+        .unwrap();
+        registry::register_project(
+            "cms-core:ward".to_string(),
+            app.clone(),
+            app.join(".env.vault"),
+        )
+        .unwrap();
+        registry::update_project_workspace_metadata(
+            "cms-core:ward",
+            Some(root.path().to_path_buf()),
+            Some("cms-core".to_string()),
+            Some("aiward".to_string()),
+            Some("cms-core".to_string()),
+        )
+        .unwrap();
+
+        let projects = dashboard_projects().unwrap();
+        let names = projects
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"cms-core:ward-root"));
+        assert!(names.contains(&"cms-core:ward"));
+        let child = projects
+            .iter()
+            .find(|project| project.name == "cms-core:ward")
+            .unwrap();
+        assert_eq!(child.parent_project.as_deref(), Some("cms-core"));
+    }
+
+    #[test]
+    #[serial]
     fn logs_api_filters_by_project_and_uses_old_kind_labels() {
         let home = tempfile::tempdir().unwrap();
         let _guard = WardHomeGuard::set(home.path());
@@ -2188,6 +2454,46 @@ mod tests {
         assert_eq!(events[0]["_kind"], "request");
         assert_eq!(events[0]["payload"]["project"], "demo");
         assert_eq!(events[0]["payload"]["requestedEnv"][0], "PAYLOAD_SECRET");
+    }
+
+    #[test]
+    #[serial]
+    fn logs_api_accepts_encoded_monorepo_project_names() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        logs::append_event(
+            LogKind::Executions,
+            json!({ "project": "cms-core:ward", "requestedCommand": "pnpm dev" }),
+        )
+        .unwrap();
+
+        let project = query_param("project=cms-core%3Award", "project").unwrap();
+        let events = load_all_events(Some(&project));
+        assert_eq!(project, "cms-core:ward");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["_kind"], "execution");
+        assert_eq!(events[0]["_project"], "cms-core:ward");
+    }
+
+    #[test]
+    #[serial]
+    fn logs_api_infers_project_from_verified_context() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        logs::append_event(
+            LogKind::Requests,
+            json!({
+                "verifiedContext": {
+                    "project": "cms-core:ward",
+                    "worktree": "/tmp/cms-core"
+                }
+            }),
+        )
+        .unwrap();
+
+        let events = load_all_events(Some("cms-core:ward"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["_project"], "cms-core:ward");
     }
 
     #[test]
