@@ -529,7 +529,13 @@ fn setup_workspace_selected_app_creates_child_project_and_resolution_prefers_it(
         .args(["setup", "--workspace", "--app", "core-workbench"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cms-core:core-workbench"));
+        .stderr(
+            predicate::str::contains("Workspace: cms-core")
+                .and(predicate::str::contains(
+                    "core-workbench configured as cms-core:core-workbench",
+                ))
+                .and(predicate::str::contains("open the dashboard")),
+        );
 
     let app = root.path().join("apps/core-workbench");
     assert!(app.join(".ward.json").exists());
@@ -592,9 +598,17 @@ fn setup_yes_auto_detects_workspace_apps_from_monorepo_root() {
         .args(["setup", "--yes"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("cms-core:core-workbench"))
-        .stdout(predicate::str::contains("cms-core:creativestudio"))
-        .stdout(predicate::str::contains("cms-core:ambienta"));
+        .stderr(
+            predicate::str::contains("Workspace: cms-core")
+                .and(predicate::str::contains("2 app(s) ready to configure"))
+                .and(predicate::str::contains("ambienta  needs .env"))
+                .and(predicate::str::contains(
+                    "core-workbench configured as cms-core:core-workbench",
+                ))
+                .and(predicate::str::contains(
+                    "creativestudio configured as cms-core:creativestudio",
+                )),
+        );
 
     assert!(!root.path().join(".ward.json").exists());
     assert!(!root.path().join("apps/ambienta/.ward.json").exists());

@@ -878,6 +878,7 @@ struct RequestEvent<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ApprovalEvent<'a> {
+    project: &'a str,
     decision: &'a ApprovalDecision,
     persisted_grant: Option<uuid::Uuid>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1019,6 +1020,9 @@ struct SetupOptions {
 }
 
 const SETUP_GUIDED_BODY: &str = "Ward will encrypt your local env, create a vault, and prepare this project for safe human and agent access.";
+const WORKSPACE_SETUP_BODY: &str = "Ward detected a monorepo workspace. It will configure each app with its own encrypted vault and trust this workspace Git root for agent runs.";
+const WORKSPACE_SETUP_PROMPT_HELP: &str =
+    "Ward will create or refresh app-level .ward.json files, vaults, profiles, and workspace-root trust.";
 const RECOVERY_EXPORT_PROMPT: &str = "Export a recovery backup now?";
 const RECOVERY_EXPORT_HELP: &str =
     "Store this somewhere safe, such as a USB drive or secure cloud backup.";
@@ -1770,9 +1774,14 @@ fn setup_workspace_with_discovery(
         anyhow::bail!("choose either --remove-plaintext or --keep-plaintext");
     }
 
-    term::header(&format!("{} workspace", discovery.workspace_name));
-    print_workspace_discovery(&discovery);
-    term::blank();
+    term::guided_context_header(
+        "setup",
+        "Workspace",
+        &discovery.workspace_name,
+        &discovery.root,
+        WORKSPACE_SETUP_BODY,
+    );
+    print_workspace_setup_overview(&discovery);
 
     let project_prefix = options
         .project
@@ -1789,10 +1798,13 @@ fn setup_workspace_with_discovery(
                 configured: Vec::new(),
                 skipped: refreshed,
             };
-            println!("{}", serde_json::to_string_pretty(&result)?);
+            print_workspace_setup_result(&result);
             return Ok(());
         }
-        term::info("Run `ward setup --workspace --all` or `ward setup --workspace --app <name>` to configure app projects.");
+        term::section("Next");
+        term::info("No ready app env files were found.");
+        term::next("add .env files to app folders, then run: ward setup --workspace --all");
+        term::next("or choose one app: ward setup --workspace --app <name>");
         return Ok(());
     }
 
@@ -1842,8 +1854,126 @@ fn setup_workspace_with_discovery(
         configured,
         skipped,
     };
-    println!("{}", serde_json::to_string_pretty(&result)?);
+    print_workspace_setup_result(&result);
     Ok(())
+}
+
+fn print_workspace_setup_overview(discovery: &workspace::WorkspaceDiscovery) {
+    let apps = discovery.app_candidates().collect::<Vec<_>>();
+    let ready_apps = apps.iter().filter(|package| package.can_setup()).count();
+    let configured_apps = apps
+        .iter()
+        .filter(|package| package.setup_status == workspace::WorkspaceSetupStatus::Configured)
+        .count();
+    let needs_env_apps = apps
+        .iter()
+        .filter(|package| package.setup_status == workspace::WorkspaceSetupStatus::NeedsEnv)
+        .count();
+    let library_count = discovery
+        .packages
+        .iter()
+        .filter(|package| !package.app_candidate)
+        .count();
+
+    term::section("Workspace");
+    if let Some(manager) = discovery.package_manager.as_deref() {
+        term::ok(&format!("package manager {manager}"));
+    }
+    if discovery.turborepo {
+        term::ok("turborepo detected");
+    }
+    term::ok(&format!("{} app project(s) detected", apps.len()));
+    if ready_apps > 0 {
+        term::ok(&format!("{ready_apps} app(s) ready to configure"));
+    }
+    if configured_apps > 0 {
+        term::ok(&format!("{configured_apps} app(s) already configured"));
+    }
+    if needs_env_apps > 0 {
+        term::warn(&format!(
+            "{needs_env_apps} app(s) need a real .env before setup"
+        ));
+    }
+    if library_count > 0 {
+        term::info(&format!("{library_count} package(s) skipped by default"));
+    }
+
+    term::section("Apps");
+    for package in &discovery.packages {
+        print_workspace_package_line(package);
+    }
+}
+
+fn print_workspace_package_line(package: &workspace::WorkspacePackage) {
+    let path = term::short_path(&package.relative_path);
+    if !package.app_candidate {
+        term::info(&format!("{}  package skipped  {}", package.slug, path));
+        return;
+    }
+
+    match package.setup_status {
+        workspace::WorkspaceSetupStatus::Configured => term::ok(&format!(
+            "{}  already configured  {}  {}",
+            package.slug, package.project_name, path
+        )),
+        workspace::WorkspaceSetupStatus::NeedsEnv => term::warn(&format!(
+            "{}  needs .env  {}  {}",
+            package.slug, package.project_name, path
+        )),
+        workspace::WorkspaceSetupStatus::NotConfigured => {
+            if package.env_status == workspace::WorkspaceEnvStatus::Present {
+                term::ok(&format!(
+                    "{}  .env ready  {}  {}",
+                    package.slug, package.project_name, path
+                ));
+            } else {
+                term::info(&format!(
+                    "{}  no .env  {}  {}",
+                    package.slug, package.project_name, path
+                ));
+            }
+        }
+    }
+}
+
+fn print_workspace_setup_result(result: &WorkspaceSetupResult) {
+    term::section("Setup");
+    if result.configured.is_empty() && result.skipped.is_empty() {
+        term::info("No app projects changed.");
+    }
+    for item in &result.configured {
+        term::ok(&format!("{} configured as {}", item.app, item.project));
+        term::info(&format!("path {}", term::short_path(&item.path)));
+    }
+    for item in &result.skipped {
+        match item.reason.as_deref() {
+            Some("workspace Git root trusted") => {
+                term::ok(&format!("{} refreshed as {}", item.app, item.project));
+                term::info("workspace Git root trusted");
+            }
+            Some("app already has .ward.json") => {
+                term::ok(&format!(
+                    "{} already configured as {}",
+                    item.app, item.project
+                ));
+                term::info("workspace Git root trusted");
+            }
+            Some(reason) => {
+                term::warn(&format!("{} skipped — {reason}", item.app));
+            }
+            None => {
+                term::info(&format!("{} skipped", item.app));
+            }
+        }
+    }
+
+    term::section("Next");
+    if !result.configured.is_empty() {
+        term::next("open the dashboard: ward dashboard start");
+        term::next("activate a protected terminal inside an app: ward human");
+    } else {
+        term::next("open the dashboard: ward dashboard start");
+    }
 }
 
 fn trust_workspace_root_for_configured_apps(
@@ -1926,12 +2056,15 @@ fn selected_workspace_apps<'a>(
     }
     #[cfg(not(coverage))]
     {
-        let configure = inquire::Confirm::new(
-            "Workspace apps with .env files were detected. Configure them now?",
-        )
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
+        let prompt = format!(
+            "Configure {} ready workspace app(s) now?",
+            setup_capable.len()
+        );
+        let configure = inquire::Confirm::new(&prompt)
+            .with_help_message(WORKSPACE_SETUP_PROMPT_HELP)
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false);
         if configure {
             Ok(setup_capable)
         } else {
@@ -2443,6 +2576,7 @@ fn request(
         verified_context: None,
     };
     let approval_event = ApprovalEvent {
+        project: &access.project,
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2518,6 +2652,7 @@ fn allow(
     let mut decision = grants::approval_from_grant(&access, &grant);
     decision.source = approvals::ApprovalSource::ManualAllow;
     let approval_event = ApprovalEvent {
+        project: &access.project,
         decision: &decision,
         persisted_grant: Some(grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2652,6 +2787,7 @@ fn approve_inner(
     let mut decision = grants::approval_from_grant(&pending.access, &grant);
     decision.source = source;
     let approval_event = ApprovalEvent {
+        project: &pending.access.project,
         decision: &decision,
         persisted_grant: Some(grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -2710,6 +2846,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         grant_id: None,
     };
     let approval_event = ApprovalEvent {
+        project: &pending.access.project,
         decision: &decision,
         persisted_grant: None,
         approval_receipt_hash: None,
@@ -2919,6 +3056,7 @@ fn run_with_context(mut options: RunOptions, context_options: AgentContextOption
         verified_context: verified_context.as_ref(),
     };
     let approval_event = ApprovalEvent {
+        project: &access.project,
         decision: &decision,
         persisted_grant: persisted_grant.as_ref().map(|grant| grant.id),
         approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
@@ -8579,6 +8717,8 @@ mod tests {
     fn setup_wizard_copy_is_product_ready() {
         assert!(SETUP_GUIDED_BODY.contains("encrypt your local env"));
         assert!(SETUP_GUIDED_BODY.contains("safe human and agent access"));
+        assert!(WORKSPACE_SETUP_BODY.contains("monorepo workspace"));
+        assert!(WORKSPACE_SETUP_PROMPT_HELP.contains("workspace-root trust"));
         assert_eq!(RECOVERY_EXPORT_PROMPT, "Export a recovery backup now?");
         assert!(RECOVERY_EXPORT_HELP.contains("USB drive"));
         assert!(RECOVERY_EXPORT_HELP.contains("secure cloud backup"));

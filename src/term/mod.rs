@@ -22,14 +22,37 @@ pub fn guided_header(command: &str, project: &str, path: &std::path::Path, body:
     eprint!("{}", render_guided_header(command, project, path, body));
 }
 
+pub fn guided_context_header(
+    command: &str,
+    label: &str,
+    name: &str,
+    path: &std::path::Path,
+    body: &str,
+) {
+    eprint!(
+        "{}",
+        render_guided_context_header(command, label, name, path, body)
+    );
+}
+
 pub fn render_guided_header(
     command: &str,
     project: &str,
     path: &std::path::Path,
     body: &str,
 ) -> String {
+    render_guided_context_header(command, "Project", project, path, body)
+}
+
+pub fn render_guided_context_header(
+    command: &str,
+    label: &str,
+    name: &str,
+    path: &std::path::Path,
+    body: &str,
+) -> String {
     format!(
-        "\n{PAD}◬ ward {command}\n{PAD}Project: {project}\n{PAD}Path: {}\n\n{PAD}{body}\n\n",
+        "\n{PAD}◬ ward {command}\n{PAD}{label}: {name}\n{PAD}Path: {}\n\n{PAD}{body}\n\n",
         short_path(path)
     )
 }
@@ -124,6 +147,21 @@ mod tests {
         assert!(rendered.contains("Project: demo"));
         assert!(rendered.contains("Path: …/me/demo"));
         assert!(rendered.contains("encrypt your local env"));
+    }
+
+    #[test]
+    fn guided_context_header_supports_workspace_label() {
+        let rendered = render_guided_context_header(
+            "setup",
+            "Workspace",
+            "cms-core",
+            std::path::Path::new("/Users/me/cms-core"),
+            "Ward detected a monorepo workspace.",
+        );
+
+        assert!(rendered.contains("◬ ward setup"));
+        assert!(rendered.contains("Workspace: cms-core"));
+        assert!(rendered.contains("Path: …/me/cms-core"));
     }
 
     #[test]

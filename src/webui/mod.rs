@@ -359,8 +359,18 @@ fn handle(mut req: tiny_http::Request, token: &str) {
         return;
     }
 
+    if method == Method::Get && path == "/favicon.png" {
+        serve_png(req, WARD_FAVICON_LIGHT_PNG);
+        return;
+    }
+
     if method == Method::Get && path == "/favicon.svg" {
         serve_svg(req, WARD_LOGO_DARK_SVG);
+        return;
+    }
+
+    if method == Method::Get && path == "/assets/ward-logo-light.png" {
+        serve_png(req, WARD_LOGO_LIGHT_PNG);
         return;
     }
 
@@ -444,6 +454,20 @@ fn serve_svg(req: tiny_http::Request, svg: &'static str) {
         StatusCode(200),
         vec![
             Header::from_bytes("Content-Type", "image/svg+xml; charset=utf-8").unwrap(),
+            Header::from_bytes("Cache-Control", "public, max-age=86400").unwrap(),
+        ],
+        Cursor::new(body),
+        Some(body.len()),
+        None,
+    );
+    let _ = req.respond(response);
+}
+
+fn serve_png(req: tiny_http::Request, body: &'static [u8]) {
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes("Content-Type", "image/png").unwrap(),
             Header::from_bytes("Cache-Control", "public, max-age=86400").unwrap(),
         ],
         Cursor::new(body),
@@ -562,7 +586,7 @@ fn authorized(req: &tiny_http::Request, query: &str, token: &str) -> bool {
 fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        (key == name).then(|| value.to_string())
+        (url_decode(key) == name).then(|| url_decode(value))
     })
 }
 
@@ -1204,6 +1228,7 @@ fn infer_event_project(
     for path in [
         vec!["project"],
         vec!["access", "project"],
+        vec!["verifiedContext", "project"],
         vec!["payload", "project"],
     ] {
         if let Some(project) = nested_str(payload, &path) {
@@ -1522,6 +1547,8 @@ fn command_line(pid: u32) -> Option<String> {
 const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
 const WARD_LOGO_DARK_SVG: &str = include_str!("../assets/ward-logo-dark.svg");
 const WARD_LOGO_TRANSPARENT_SVG: &str = include_str!("../assets/ward-logo-transparent.svg");
+const WARD_LOGO_LIGHT_PNG: &[u8] = include_bytes!("../assets/ward-logo-light.png");
+const WARD_FAVICON_LIGHT_PNG: &[u8] = include_bytes!("../assets/ward-favicon-light.png");
 
 #[allow(dead_code)]
 const LEGACY_OVERVIEW_HTML: &str = r##"<!doctype html>
@@ -1996,10 +2023,12 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("splitter"));
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
-        assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.svg\""));
-        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-transparent.svg"));
+        assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
+        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-light.png"));
         assert!(WARD_LOGO_DARK_SVG.contains("<rect"));
         assert!(WARD_LOGO_TRANSPARENT_SVG.contains("<svg"));
+        assert!(WARD_LOGO_LIGHT_PNG.starts_with(b"\x89PNG"));
+        assert!(WARD_FAVICON_LIGHT_PNG.starts_with(b"\x89PNG"));
         assert!(!DASHBOARD_HTML.contains("<select"));
     }
 
@@ -2188,6 +2217,46 @@ mod tests {
         assert_eq!(events[0]["_kind"], "request");
         assert_eq!(events[0]["payload"]["project"], "demo");
         assert_eq!(events[0]["payload"]["requestedEnv"][0], "PAYLOAD_SECRET");
+    }
+
+    #[test]
+    #[serial]
+    fn logs_api_accepts_encoded_monorepo_project_names() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        logs::append_event(
+            LogKind::Executions,
+            json!({ "project": "cms-core:ward", "requestedCommand": "pnpm dev" }),
+        )
+        .unwrap();
+
+        let project = query_param("project=cms-core%3Award", "project").unwrap();
+        let events = load_all_events(Some(&project));
+        assert_eq!(project, "cms-core:ward");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["_kind"], "execution");
+        assert_eq!(events[0]["_project"], "cms-core:ward");
+    }
+
+    #[test]
+    #[serial]
+    fn logs_api_infers_project_from_verified_context() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        logs::append_event(
+            LogKind::Requests,
+            json!({
+                "verifiedContext": {
+                    "project": "cms-core:ward",
+                    "worktree": "/tmp/cms-core"
+                }
+            }),
+        )
+        .unwrap();
+
+        let events = load_all_events(Some("cms-core:ward"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["_project"], "cms-core:ward");
     }
 
     #[test]
