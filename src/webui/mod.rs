@@ -23,12 +23,13 @@ use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
-    broker,
+    approvals, broker,
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
+    notifications,
     registry::{self, RegisteredProject},
-    workspace,
+    workspace, worktrees,
 };
 
 const DEFAULT_PORT: u16 = 7777;
@@ -390,6 +391,12 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             let project = query_param(&query, "project");
             respond_json_result(req, Ok(load_all_events(project.as_deref())))
         }
+        (Method::Get, "/api/notifications") => {
+            respond_json_result(req, notifications::list_notifications())
+        }
+        (Method::Get, "/api/notifications/stream") => {
+            respond_notifications_stream(req);
+        }
         (Method::Get, "/api/dashboard/status") => respond_json_result(req, dashboard_status()),
         (Method::Post, "/api/projects/pick-folder") => {
             let result = pick_project_folder(&mut req);
@@ -400,7 +407,13 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             respond_project_setup_result(req, result);
         }
         (Method::Post, _) => {
-            if let Some(project) = profiles_collection_route(&path) {
+            if let Some((request_id, action)) = approval_action_route(&path) {
+                let result = approval_action(&mut req, request_id, &action);
+                respond_approval_result(req, result);
+            } else if let Some((request_id, action)) = worktree_action_route(&path) {
+                let result = worktree_action(request_id, &action);
+                respond_json_result(req, result);
+            } else if let Some(project) = profiles_collection_route(&path) {
                 let result = create_profile_policy(&project, &mut req);
                 respond_json_result(req, result);
             } else if let Some((project, profile)) = profile_env_route(&path) {
@@ -519,6 +532,35 @@ fn respond_project_setup_result(
     }
 }
 
+fn respond_approval_result(req: tiny_http::Request, result: Result<Value>) {
+    match result {
+        Ok(value) => respond_json(req, StatusCode(200), &value),
+        Err(error) => {
+            let message = error.to_string();
+            let status = if message.contains("signing_key_unavailable")
+                || message.contains("unlock_required")
+                || message.contains("missing broker unlock session")
+                || message.contains("expired broker unlock session")
+                || message.contains("Ward broker is unavailable")
+            {
+                StatusCode(423)
+            } else {
+                StatusCode(500)
+            };
+            respond_json(
+                req,
+                status,
+                &json!({
+                    "error": "approval_failed",
+                    "message": message,
+                    "unlockRequired": status.0 == 423,
+                    "fixCommand": "ward unlock --ttl 8h"
+                }),
+            );
+        }
+    }
+}
+
 fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value: &T) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let response = Response::new(
@@ -528,6 +570,27 @@ fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value
             Header::from_bytes("Cache-Control", "no-cache").unwrap(),
         ],
         Cursor::new(body.clone()),
+        Some(body.len()),
+        None,
+    );
+    let _ = req.respond(response);
+}
+
+fn respond_notifications_stream(req: tiny_http::Request) {
+    let payload = match notifications::list_notifications() {
+        Ok(notifications) => json!({ "notifications": notifications }),
+        Err(error) => {
+            json!({ "error": "notification_stream_failed", "message": error.to_string() })
+        }
+    };
+    let body = format!("retry: 2000\nevent: notifications\ndata: {payload}\n\n");
+    let response = Response::new(
+        StatusCode(200),
+        vec![
+            Header::from_bytes("Content-Type", "text/event-stream").unwrap(),
+            Header::from_bytes("Cache-Control", "no-cache").unwrap(),
+        ],
+        Cursor::new(body.clone().into_bytes()),
         Some(body.len()),
         None,
     );
@@ -630,6 +693,32 @@ fn profile_env_route(path: &str) -> Option<(String, String)> {
     }
 }
 
+fn approval_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "approvals", request_id, action] if *action == "approve" || *action == "deny" => {
+            Some((
+                uuid::Uuid::parse_str(request_id).ok()?,
+                (*action).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn worktree_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "worktrees", request_id, action] if *action == "approve" || *action == "deny" => {
+            Some((
+                uuid::Uuid::parse_str(request_id).ok()?,
+                (*action).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn url_decode(value: &str) -> String {
     let mut out = Vec::with_capacity(value.len());
     let bytes = value.as_bytes();
@@ -658,6 +747,69 @@ fn url_decode(value: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardApprovalRequest {
+    #[serde(default)]
+    scope: Option<approvals::ApprovalScope>,
+    #[serde(default)]
+    confirm_critical: bool,
+}
+
+fn approval_action(
+    req: &mut tiny_http::Request,
+    request_id: uuid::Uuid,
+    action: &str,
+) -> Result<Value> {
+    match action {
+        "approve" => {
+            let body = read_optional_body(req)?;
+            let request = if body.trim().is_empty() {
+                DashboardApprovalRequest {
+                    scope: Some(approvals::ApprovalScope::Session),
+                    confirm_critical: false,
+                }
+            } else {
+                serde_json::from_str::<DashboardApprovalRequest>(&body)
+                    .context("failed to parse approval JSON request")?
+            };
+            crate::cli::approve_request_from_dashboard(
+                request_id,
+                request.scope.unwrap_or(approvals::ApprovalScope::Session),
+                request.confirm_critical,
+            )
+        }
+        "deny" => crate::cli::deny_request_from_dashboard(request_id),
+        _ => anyhow::bail!("unknown approval action: {action}"),
+    }
+}
+
+fn worktree_action(request_id: uuid::Uuid, action: &str) -> Result<Value> {
+    match action {
+        "approve" => {
+            let Some(known) = worktrees::approve_pending(request_id)? else {
+                anyhow::bail!("pending worktree request not found: {request_id}");
+            };
+            Ok(json!({
+                "status": "approved",
+                "requestId": request_id,
+                "worktree": known.path,
+                "matchKind": known.match_kind,
+            }))
+        }
+        "deny" => {
+            if !worktrees::deny_pending(request_id)? {
+                anyhow::bail!("pending worktree request not found: {request_id}");
+            }
+            Ok(json!({
+                "status": "denied",
+                "requestId": request_id,
+            }))
+        }
+        _ => anyhow::bail!("unknown worktree action: {action}"),
+    }
 }
 
 fn update_profile_env(
@@ -2011,6 +2163,15 @@ mod tests {
         assert!(is_dashboard_page_route("/logs"));
         assert!(is_dashboard_page_route("/projects/demo/logs"));
         assert!(profile_env_route("/api/projects/demo").is_none());
+        let request_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            approval_action_route(&format!("/api/approvals/{request_id}/approve")),
+            Some((request_id, "approve".to_string()))
+        );
+        assert_eq!(
+            worktree_action_route(&format!("/api/worktrees/{request_id}/deny")),
+            Some((request_id, "deny".to_string()))
+        );
     }
 
     #[test]
@@ -2031,6 +2192,10 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("splitter"));
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
+        assert!(DASHBOARD_HTML.contains("notifications-btn"));
+        assert!(DASHBOARD_HTML.contains("/api/notifications/stream"));
+        assert!(DASHBOARD_HTML.contains("/api/approvals/"));
+        assert!(DASHBOARD_HTML.contains("/api/worktrees/"));
         assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
         assert!(DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
         assert!(WARD_LOGO_DARK_SVG.contains("<rect"));

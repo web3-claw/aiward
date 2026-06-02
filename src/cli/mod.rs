@@ -2,6 +2,8 @@ use std::{
     env, fs,
     io::IsTerminal,
     path::{Path, PathBuf},
+    thread,
+    time::Duration as StdDuration,
 };
 
 use anyhow::{Context, Result};
@@ -15,7 +17,7 @@ use crate::{
     approvals::{self, ApprovalDecision, ApprovalScope},
     broker, config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
-    modes, pending_requests,
+    modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
     recovery, registry,
     runner::{self, RunCommandRequest},
@@ -182,6 +184,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: GrantsCommand,
     },
+    /// Inspect and wait for dashboard approval notifications.
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
     /// Approve a pending non-interactive request.
     Approve {
         request_id: uuid::Uuid,
@@ -230,6 +237,10 @@ pub enum Commands {
         json: bool,
         #[arg(long)]
         no_prompt: bool,
+        #[arg(long)]
+        wait_for_approval: bool,
+        #[arg(long, default_value = "30m")]
+        approval_timeout: String,
         #[arg(
             last = true,
             help = "Child command and args after --. Put all Ward flags before --."
@@ -620,6 +631,23 @@ pub enum GrantsCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ApprovalsCommand {
+    /// List pending approval notifications.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait until a pending approval is resolved.
+    Wait {
+        request_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value = "30m")]
+        timeout: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum LogsCommand {
     /// Decrypt and print one encrypted log kind.
     View {
@@ -795,6 +823,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             project, app, profile, scope, agent, branch, command, env_names,
         ),
         Commands::Grants { command } => grants_command(command),
+        Commands::Approvals { command } => approvals_command(command),
         Commands::Approve {
             request_id,
             scope,
@@ -821,6 +850,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             env_names,
             json,
             no_prompt,
+            wait_for_approval,
+            approval_timeout,
             command,
         } => run_with_context(
             RunOptions {
@@ -833,6 +864,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 command,
                 json,
                 no_prompt,
+                wait_for_approval,
+                approval_timeout,
             },
             AgentContextOptions {
                 agent,
@@ -866,6 +899,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 command: Vec::new(),
                 json,
                 no_prompt,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
             },
             AgentContextOptions {
                 agent,
@@ -899,6 +934,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                 command: Vec::new(),
                 json,
                 no_prompt,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
             },
             AgentContextOptions {
                 agent,
@@ -1187,6 +1224,8 @@ struct RunOptions {
     command: Vec<String>,
     json: bool,
     no_prompt: bool,
+    wait_for_approval: bool,
+    approval_timeout: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2658,6 +2697,8 @@ fn require_agent_identity_for_non_human(agent: Option<&str>) -> Result<()> {
 fn enforce_worktree_for_no_prompt(
     resolved: &registry::ResolvedProject,
     verified: &context::VerifiedContext,
+    wait_for_approval: bool,
+    approval_timeout: &str,
 ) -> Result<bool> {
     let registry = registry::load_registry()?;
     let Some(registered) = registry.projects.get(&resolved.name) else {
@@ -2677,6 +2718,9 @@ fn enforce_worktree_for_no_prompt(
             Ok(true)
         }
         worktrees::WorktreeDecision::ApprovalRequired { request } => {
+            if wait_for_approval {
+                return wait_for_worktree_approval(resolved, verified, request, approval_timeout);
+            }
             let approve_command = format!("ward worktrees approve {}", request.id);
             let deny_command = format!("ward worktrees deny {}", request.id);
             let response = WorktreeRequiredResponse {
@@ -2717,6 +2761,47 @@ fn enforce_worktree_for_no_prompt(
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(false)
         }
+    }
+}
+
+fn wait_for_worktree_approval(
+    resolved: &registry::ResolvedProject,
+    verified: &context::VerifiedContext,
+    request: worktrees::PendingWorktree,
+    approval_timeout: &str,
+) -> Result<bool> {
+    let timeout = unlock::parse_ttl(approval_timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    eprintln!(
+        "Ward is waiting for worktree approval {}. Open the dashboard notification center or run: ward worktrees approve {}",
+        request.id, request.id
+    );
+    loop {
+        if worktrees::is_known_worktree(&resolved.name, &request.path)? {
+            return Ok(true);
+        }
+        if worktrees::load_pending_worktree(request.id)?.is_none() {
+            let response = serde_json::json!({
+                "status": "worktree_denied",
+                "project": resolved.name,
+                "worktree": verified.worktree,
+                "requestId": request.id,
+            });
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(false);
+        }
+        if chrono::Utc::now() >= deadline {
+            let response = serde_json::json!({
+                "status": "approval_timeout",
+                "approvalType": "worktreeBinding",
+                "project": resolved.name,
+                "worktree": verified.worktree,
+                "requestId": request.id,
+            });
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            return Ok(false);
+        }
+        thread::sleep(StdDuration::from_millis(500));
     }
 }
 
@@ -2789,7 +2874,7 @@ fn request_for_target(
         else {
             return Ok(());
         };
-        if !enforce_worktree_for_no_prompt(&resolved, &verified_context)? {
+        if !enforce_worktree_for_no_prompt(&resolved, &verified_context, false, "30m")? {
             return Ok(());
         }
         let pending =
@@ -2977,6 +3062,67 @@ fn grants_command(command: GrantsCommand) -> Result<()> {
     Ok(())
 }
 
+fn approvals_command(command: ApprovalsCommand) -> Result<()> {
+    match command {
+        ApprovalsCommand::List { json } => {
+            let notifications = notifications::list_notifications()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&notifications)?);
+            } else if notifications.is_empty() {
+                println!("No pending Ward approval notifications.");
+            } else {
+                for notification in notifications {
+                    println!(
+                        "{} {:?} project={} risk={} {}",
+                        notification.id,
+                        notification.kind,
+                        notification.project,
+                        notification.risk,
+                        notification.command.as_deref().unwrap_or("")
+                    );
+                }
+            }
+            Ok(())
+        }
+        ApprovalsCommand::Wait {
+            request_id,
+            json,
+            timeout,
+        } => wait_for_approval_command(request_id, json, &timeout),
+    }
+}
+
+fn wait_for_approval_command(request_id: uuid::Uuid, json: bool, timeout: &str) -> Result<()> {
+    let timeout = unlock::parse_ttl(timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    loop {
+        if let Some(resolution) = pending_requests::load_resolution(request_id)? {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resolution)?);
+            } else {
+                println!(
+                    "Request {} {} for project {}",
+                    resolution.request_id, resolution.status, resolution.project
+                );
+            }
+            return Ok(());
+        }
+        if chrono::Utc::now() >= deadline {
+            let response = serde_json::json!({
+                "status": "approval_timeout",
+                "requestId": request_id,
+            });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("Timed out waiting for approval {request_id}");
+            }
+            return Ok(());
+        }
+        thread::sleep(StdDuration::from_millis(500));
+    }
+}
+
 fn approve(
     request_id: uuid::Uuid,
     scope: ApprovalScope,
@@ -3049,6 +3195,7 @@ fn approve_inner(
     let vault = &resolved.vault;
     let grant = grants::persist_manual_grant(access, scope, source, vault, receipt_context)?;
     pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "approved", &pending.access.project)?;
     let receipt = grant.receipt.as_ref();
     let mut decision = grants::approval_from_grant(&pending.access, &grant);
     decision.source = source;
@@ -3075,6 +3222,15 @@ fn approve_inner(
     })
 }
 
+pub(crate) fn approve_request_from_dashboard(
+    request_id: uuid::Uuid,
+    scope: ApprovalScope,
+    confirm_critical: bool,
+) -> Result<Value> {
+    let response = approve_inner(request_id, scope, confirm_critical, true)?;
+    serde_json::to_value(response).context("failed to serialize approval response")
+}
+
 fn validate_pending_approval(
     pending: &pending_requests::PendingRequest,
     scope: ApprovalScope,
@@ -3098,6 +3254,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         }
         Err(error) => return Err(error),
     };
+    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
     let source = if agent_mediated {
         approvals::ApprovalSource::AgentMediated
     } else {
@@ -3136,6 +3293,37 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         println!("Denied request {request_id}");
     }
     Ok(())
+}
+
+pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Value> {
+    let pending = pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
+    let source = approvals::ApprovalSource::AgentMediated;
+    let decision = ApprovalDecision {
+        approved: false,
+        scope: ApprovalScope::Deny,
+        approved_env: Vec::new(),
+        denied_env: pending.access.env.clone(),
+        source,
+        grant_id: None,
+    };
+    let approval_event = ApprovalEvent {
+        project: &pending.access.project,
+        decision: &decision,
+        persisted_grant: None,
+        approval_receipt_hash: None,
+        signer_key_id: None,
+        signature_algorithm: None,
+        critical_confirmation: false,
+        human_proof: approval_human_proof(source),
+    };
+    audit_logs::append_event(LogKind::Approvals, approval_event)?;
+    Ok(serde_json::json!({
+        "status": "denied",
+        "requestId": request_id,
+        "project": pending.access.project,
+        "approvalSource": source,
+    }))
 }
 
 fn is_unlock_or_signing_error(error: &anyhow::Error) -> bool {
@@ -3289,26 +3477,61 @@ fn run_with_context(
         let Some(context) = verified_no_prompt_context(&cwd, &resolved, &context_options)? else {
             return Ok(());
         };
-        if !enforce_worktree_for_no_prompt(&resolved, &context)? {
+        if !enforce_worktree_for_no_prompt(
+            &resolved,
+            &context,
+            options.wait_for_approval,
+            &options.approval_timeout,
+        )? {
             return Ok(());
         }
         verified_context = Some(context);
-        let Some(decision) =
-            non_interactive_decision_with_context(&access, &evaluation, verified_context.as_ref())?
-        else {
-            let pending =
-                create_run_pending_request(&access, &evaluation, &git, verified_context.clone())?;
-            let request_event = RequestEvent {
-                access: &pending.access,
-                policy: &pending.policy,
-                git: &pending.git,
-                verified_context: pending.verified_context.as_ref(),
-            };
-            audit_logs::append_event(LogKind::Requests, request_event)?;
-            print_run_approval_required(&pending)?;
-            return Ok(());
+        let decision = match non_interactive_decision_with_context(
+            &access,
+            &evaluation,
+            verified_context.as_ref(),
+        )? {
+            Some(decision) => decision,
+            None => {
+                let pending = create_run_pending_request(
+                    &access,
+                    &evaluation,
+                    &git,
+                    verified_context.clone(),
+                )?;
+                let request_event = RequestEvent {
+                    access: &pending.access,
+                    policy: &pending.policy,
+                    git: &pending.git,
+                    verified_context: pending.verified_context.as_ref(),
+                };
+                audit_logs::append_event(LogKind::Requests, request_event)?;
+                if options.wait_for_approval {
+                    let Some(decision) = wait_for_run_approval(
+                        &pending,
+                        &access,
+                        &evaluation,
+                        verified_context.as_ref(),
+                        &options.approval_timeout,
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    decision
+                } else {
+                    print_run_approval_required(&pending)?;
+                    return Ok(());
+                }
+            }
         };
         if !decision.approved {
+            create_run_block_notification(
+                notifications::NotificationKind::PolicyDenied,
+                &access,
+                &evaluation,
+                "Ward policy denied this request.",
+                None,
+            )?;
             print_run_denied(&access, &evaluation)?;
             return Ok(());
         }
@@ -3401,28 +3624,22 @@ fn run_with_context(
         let context = verified_context
             .as_ref()
             .expect("verified in no-prompt mode");
-        let proof_payload =
-            serde_json::to_string(&execute_payload).expect("execution payload should serialize");
-        let proof = agents::sign_payload(&resolved.name, &context.agent, &proof_payload)?;
-        match broker::execute(
-            &resolved.name,
-            &resolved.vault,
+        let Some(outcome) = execute_no_prompt_with_optional_wait(
+            &resolved,
             &cwd,
-            decision.approved_env.clone(),
-            command_args,
-            broker::ExecuteAuthorization::Agent { proof },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if let Some(missing_env) = broker_vault_key_missing_envs(&error) {
-                    print_run_vault_key_missing(&access, &evaluation, missing_env)?;
-                    return Ok(());
-                }
-                let reason = error.to_string();
-                print_run_unlock_required(&access, &evaluation, Some(&reason))?;
-                return Ok(());
-            }
-        }
+            &decision,
+            &command_args,
+            execute_payload,
+            context,
+            &access,
+            &evaluation,
+            options.wait_for_approval,
+            &options.approval_timeout,
+        )?
+        else {
+            return Ok(());
+        };
+        outcome
     } else {
         match broker::execute(
             &resolved.name,
@@ -5555,6 +5772,198 @@ fn print_run_denied(access: &AccessRequest, evaluation: &policy::PolicyEvaluatio
     Ok(())
 }
 
+fn wait_for_run_approval(
+    pending: &pending_requests::PendingRequest,
+    access: &AccessRequest,
+    evaluation: &policy::PolicyEvaluation,
+    verified_context: Option<&context::VerifiedContext>,
+    approval_timeout: &str,
+) -> Result<Option<ApprovalDecision>> {
+    let timeout = unlock::parse_ttl(approval_timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    eprintln!(
+        "Ward is waiting for approval {}. Open the dashboard notification center or run: ward approve {} --scope session --agent-mediated --json",
+        pending.id, pending.id
+    );
+
+    loop {
+        if let Some(resolution) = pending_requests::load_resolution(pending.id)? {
+            if resolution.status == "denied" {
+                print_run_wait_denied(pending.id, access)?;
+                return Ok(None);
+            }
+            if resolution.status == "approved" {
+                if let Some(decision) =
+                    non_interactive_decision_with_context(access, evaluation, verified_context)?
+                {
+                    return Ok(Some(decision));
+                }
+            }
+        }
+
+        if !pending_requests::pending_request_path(pending.id).exists() {
+            if let Some(decision) =
+                non_interactive_decision_with_context(access, evaluation, verified_context)?
+            {
+                return Ok(Some(decision));
+            }
+        }
+
+        if chrono::Utc::now() >= deadline {
+            print_run_wait_timeout(Some(pending.id), access, "run")?;
+            return Ok(None);
+        }
+
+        thread::sleep(StdDuration::from_millis(500));
+    }
+}
+
+fn execute_no_prompt_with_optional_wait(
+    resolved: &registry::ResolvedProject,
+    cwd: &Path,
+    decision: &ApprovalDecision,
+    command_args: &[String],
+    mut execute_payload: broker::ExecuteAuthorizationPayload,
+    context: &context::VerifiedContext,
+    access: &AccessRequest,
+    evaluation: &policy::PolicyEvaluation,
+    wait_for_approval: bool,
+    approval_timeout: &str,
+) -> Result<Option<runner::RunCommandOutcome>> {
+    let timeout = unlock::parse_ttl(approval_timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    let mut unlock_notification = None;
+
+    loop {
+        execute_payload.expires_at = chrono::Utc::now() + chrono::Duration::seconds(60);
+        execute_payload.nonce = uuid::Uuid::new_v4().to_string();
+        let proof_payload =
+            serde_json::to_string(&execute_payload).expect("execution payload should serialize");
+        let proof = agents::sign_payload(&resolved.name, &context.agent, &proof_payload)?;
+
+        match broker::execute(
+            &resolved.name,
+            &resolved.vault,
+            cwd,
+            decision.approved_env.clone(),
+            command_args.to_vec(),
+            broker::ExecuteAuthorization::Agent { proof },
+        ) {
+            Ok(outcome) => {
+                if let Some(notification_id) = unlock_notification.take() {
+                    notifications::remove_block_notification(notification_id)?;
+                }
+                return Ok(Some(outcome));
+            }
+            Err(error) => {
+                if let Some(missing_env) = broker_vault_key_missing_envs(&error) {
+                    create_run_block_notification(
+                        notifications::NotificationKind::VaultKeyMissing,
+                        access,
+                        evaluation,
+                        "The approved request references env names that are not present in the vault.",
+                        Some(
+                            "ward env unlock, add the missing key, then run ward env lock",
+                        ),
+                    )?;
+                    print_run_vault_key_missing(access, evaluation, missing_env)?;
+                    return Ok(None);
+                }
+                if broker_execution_rejection_is_authoritative(&error) {
+                    return Err(error).context("broker rejected no-prompt execution");
+                }
+                if !wait_for_approval {
+                    let reason = error.to_string();
+                    print_run_unlock_required(access, evaluation, Some(&reason))?;
+                    return Ok(None);
+                }
+
+                if unlock_notification.is_none() {
+                    let notification = create_run_block_notification(
+                        notifications::NotificationKind::UnlockRequired,
+                        access,
+                        evaluation,
+                        "This request is waiting for the vault to be unlocked before it can run.",
+                        Some("ward unlock --ttl 8h"),
+                    )?;
+                    unlock_notification = Some(notification.id);
+                    eprintln!(
+                        "Ward is waiting for unlock before running this command. Run: ward unlock --ttl 8h"
+                    );
+                }
+
+                if chrono::Utc::now() >= deadline {
+                    if let Some(notification_id) = unlock_notification.take() {
+                        notifications::remove_block_notification(notification_id)?;
+                    }
+                    print_run_wait_timeout(None, access, "unlock")?;
+                    return Ok(None);
+                }
+
+                if broker::active_session_expiry(&resolved.name, &resolved.vault)?.is_some() {
+                    if let Some(notification_id) = unlock_notification.take() {
+                        notifications::remove_block_notification(notification_id)?;
+                    }
+                    continue;
+                }
+
+                thread::sleep(StdDuration::from_millis(500));
+            }
+        }
+    }
+}
+
+fn create_run_block_notification(
+    kind: notifications::NotificationKind,
+    access: &AccessRequest,
+    evaluation: &policy::PolicyEvaluation,
+    message: &str,
+    fix_command: Option<&str>,
+) -> Result<notifications::BlockNotification> {
+    notifications::create_block_notification(
+        kind,
+        &access.project,
+        access.agent.as_deref(),
+        Some(&access.command),
+        &access.env,
+        &evaluation.findings,
+        run_risk_summary(evaluation),
+        message,
+        fix_command,
+    )
+}
+
+fn print_run_wait_denied(request_id: uuid::Uuid, access: &AccessRequest) -> Result<()> {
+    let response = serde_json::json!({
+        "status": "denied",
+        "approvalRequired": false,
+        "unlockRequired": false,
+        "requestId": request_id,
+        "project": access.project,
+        "command": access.command,
+    });
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+fn print_run_wait_timeout(
+    request_id: Option<uuid::Uuid>,
+    access: &AccessRequest,
+    approval_type: &str,
+) -> Result<()> {
+    let mut response = serde_json::json!({
+        "status": "approval_timeout",
+        "approvalType": approval_type,
+        "project": access.project,
+        "command": access.command,
+    });
+    if let Some(request_id) = request_id {
+        response["requestId"] = serde_json::json!(request_id);
+    }
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
 fn broker_vault_key_missing_envs(error: &anyhow::Error) -> Option<Vec<String>> {
     let broker_error = error.downcast_ref::<broker::BrokerError>()?;
     if broker_error.reason() != "vault_key_missing" {
@@ -5884,7 +6293,7 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     let unregistered_context =
         verified_worktree(project.path().to_path_buf(), "https://example.test/demo");
     let unregistered_allowed =
-        enforce_worktree_for_no_prompt(&unregistered, &unregistered_context)?;
+        enforce_worktree_for_no_prompt(&unregistered, &unregistered_context, false, "30m")?;
     assert!(unregistered_allowed);
     let autobind_root = tempfile::tempdir()?;
     let autobind_worktree = autobind_root.path().join("agent-wt");
@@ -5894,17 +6303,20 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
     let missing_worktree = missing_root.join("child");
     let _ = worktrees::allow_root("coverage-main", &missing_root)?;
     let autobind_context = verified_worktree(autobind_worktree, "https://example.test/demo");
-    let autobind_allowed = enforce_worktree_for_no_prompt(&resolved_main, &autobind_context)?;
+    let autobind_allowed =
+        enforce_worktree_for_no_prompt(&resolved_main, &autobind_context, false, "30m")?;
     assert!(autobind_allowed);
     let missing_autobind_context = verified_worktree(missing_worktree, "https://example.test/demo");
-    let _ = enforce_worktree_for_no_prompt(&resolved_main, &missing_autobind_context)?;
+    let _ =
+        enforce_worktree_for_no_prompt(&resolved_main, &missing_autobind_context, false, "30m")?;
     let _ = worktrees::remove_root("coverage-main", &missing_root)?;
     let approval_worktree = tempfile::tempdir()?;
     let approval_context = verified_worktree(
         approval_worktree.path().to_path_buf(),
         "https://example.test/demo",
     );
-    let approval_allowed = enforce_worktree_for_no_prompt(&resolved_main, &approval_context)?;
+    let approval_allowed =
+        enforce_worktree_for_no_prompt(&resolved_main, &approval_context, false, "30m")?;
     assert!(!approval_allowed);
     let registered_for_worktree = registry::load_registry()?
         .projects
@@ -5965,7 +6377,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         denied_worktree.path().to_path_buf(),
         "https://example.test/other",
     );
-    let denied_allowed = enforce_worktree_for_no_prompt(&resolved_main, &denied_context)?;
+    let denied_allowed =
+        enforce_worktree_for_no_prompt(&resolved_main, &denied_context, false, "30m")?;
     assert!(!denied_allowed);
     registry
         .projects
@@ -6007,6 +6420,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         json: false,
         no_prompt: true,
+        wait_for_approval: false,
+        approval_timeout: "30m".to_string(),
     });
     assert!(no_json.is_err());
     let critical_run = RunOptions {
@@ -6019,6 +6434,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         command: vec!["sh".to_string(), "-c".to_string(), "printenv".to_string()],
         json: true,
         no_prompt: true,
+        wait_for_approval: false,
+        approval_timeout: "30m".to_string(),
     };
     run(critical_run)?;
     let grant_source = approvals::ApprovalSource::ManualAllow;
@@ -6098,6 +6515,8 @@ pub fn coverage_exercise_cli_edges() -> Result<()> {
         command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         json: true,
         no_prompt: true,
+        wait_for_approval: false,
+        approval_timeout: "30m".to_string(),
     };
     run(unlocked_run)?;
     let suspicious_session = ApprovalDecision {
@@ -6676,6 +7095,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             json: false,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap_err()
         .to_string();
@@ -6691,6 +7112,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
 
@@ -6712,6 +7135,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "false".to_string()],
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
 
@@ -7260,6 +7685,8 @@ mod tests {
                 env_names: Vec::new(),
                 json: true,
                 no_prompt: true,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: Vec::new(),
             },
         })
@@ -7670,6 +8097,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "false".to_string()],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .is_err());
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
@@ -7707,6 +8136,8 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 json: false,
                 no_prompt: false,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             },
         })
@@ -7737,6 +8168,8 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 json: false,
                 no_prompt: false,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             },
         })
@@ -7756,6 +8189,8 @@ mod tests {
             ],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
         std::env::remove_var("WARD_UNSAFE_TEST_APPROVAL");
@@ -7770,6 +8205,8 @@ mod tests {
             command: vec!["sh".to_string(), "-c".to_string(), "exit 7".to_string()],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap_err();
         assert_eq!(
@@ -7822,6 +8259,8 @@ mod tests {
                 env_names: vec!["DATABASE_URL".to_string()],
                 json: false,
                 no_prompt: false,
+                wait_for_approval: false,
+                approval_timeout: "30m".to_string(),
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
             },
         })
@@ -8001,6 +8440,8 @@ mod tests {
             ],
             json: false,
             no_prompt: false,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
         })
         .unwrap();
         std::env::set_var("WARD_UNSAFE_TEST_APPROVAL", "deny");
@@ -9159,6 +9600,8 @@ mod tests {
                     env_names: vec!["DATABASE_URL".to_string()],
                     json: false,
                     no_prompt: false,
+                    wait_for_approval: false,
+                    approval_timeout: "30m".to_string(),
                     command: vec!["pnpm".to_string(), "dev".to_string()],
                 }
             ),

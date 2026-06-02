@@ -16,6 +16,7 @@ pub mod human;
 pub(crate) mod key_store;
 pub mod logs;
 pub mod modes;
+pub mod notifications;
 pub mod pending_requests;
 pub mod policy;
 pub mod recovery;

@@ -111,6 +111,41 @@ pub fn list_project(project: &str) -> Result<ProjectWorktrees> {
     Ok(state.projects.remove(project).unwrap_or_default())
 }
 
+pub fn list_pending_worktrees() -> Result<Vec<PendingWorktree>> {
+    let state = load_state()?;
+    let mut pending = state
+        .projects
+        .values()
+        .flat_map(|project| project.pending.iter().cloned())
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(pending)
+}
+
+pub fn load_pending_worktree(id: uuid::Uuid) -> Result<Option<PendingWorktree>> {
+    Ok(list_pending_worktrees()?
+        .into_iter()
+        .find(|pending| pending.id == id))
+}
+
+pub fn is_known_worktree(project: &str, path: &Path) -> Result<bool> {
+    let state = load_state()?;
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok(state
+        .projects
+        .get(project)
+        .map(|project_state| {
+            project_state.known_worktrees.iter().any(|known| {
+                known
+                    .path
+                    .canonicalize()
+                    .unwrap_or_else(|_| known.path.clone())
+                    == path
+            })
+        })
+        .unwrap_or(false))
+}
+
 pub fn trust_worktree(
     project: &str,
     path: &Path,

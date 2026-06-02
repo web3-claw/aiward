@@ -6,6 +6,8 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Command as StdCommand,
+    thread,
+    time::{Duration, Instant},
 };
 use ward::{
     approvals::ApprovalScope,
@@ -2552,6 +2554,74 @@ fn no_prompt_request_and_run_return_worktree_approval_required() {
 }
 
 #[test]
+fn no_prompt_run_waits_for_approval_and_resumes_after_cli_approve() {
+    let fixture = TestProject::new();
+    fixture.setup_yes();
+    let context = fixture.context_args("codex", "feature/wait");
+    let output_path = fixture.project_dir.path().join("wait.out");
+    let ward_bin = assert_cmd::cargo::cargo_bin("ward");
+
+    let mut args = vec![
+        "run".to_string(),
+        "--wait-for-approval".to_string(),
+        "--approval-timeout".to_string(),
+        "1m".to_string(),
+    ];
+    args.extend(context);
+    args.extend([
+        "--action".to_string(),
+        "Run command after dashboard approval".to_string(),
+        "--env".to_string(),
+        "DATABASE_URL".to_string(),
+        "--json".to_string(),
+        "--no-prompt".to_string(),
+        "--".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        "printf waited > wait.out".to_string(),
+    ]);
+
+    let child = StdCommand::new(&ward_bin)
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .args(&args)
+        .spawn()
+        .unwrap();
+
+    let request_id =
+        wait_for_single_pending_request(fixture.ward_home.path(), Duration::from_secs(10));
+    let approval = StdCommand::new(&ward_bin)
+        .current_dir(fixture.project_dir.path())
+        .env("WARD_HOME", fixture.ward_home.path())
+        .env("WARD_UNSAFE_TEST_KEYRING", "1")
+        .args([
+            "approve",
+            &request_id.to_string(),
+            "--scope",
+            "once",
+            "--agent-mediated",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        approval.status.success(),
+        "approval failed: {}",
+        String::from_utf8_lossy(&approval.stderr)
+    );
+
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "waited run failed stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(output_path).unwrap(), "waited");
+}
+
+#[test]
 fn no_prompt_context_accepts_explicit_empty_remote_and_redacts_mismatch() {
     let fixture = TestProject::new();
     fixture.setup_yes();
@@ -4426,6 +4496,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             env_names: Vec::new(),
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
             command: Vec::new(),
         },
     })
@@ -4497,6 +4569,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
             env_names: vec!["DATABASE_URL".to_string()],
             json: true,
             no_prompt: true,
+            wait_for_approval: false,
+            approval_timeout: "30m".to_string(),
             command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
         },
     })
@@ -4574,6 +4648,32 @@ struct ContextParts {
     git_remote: String,
     commit: String,
     branch: String,
+}
+
+fn wait_for_single_pending_request(home: &Path, timeout: Duration) -> uuid::Uuid {
+    let deadline = Instant::now() + timeout;
+    let requests_dir = home.join("requests");
+    loop {
+        if requests_dir.exists() {
+            if let Some(request_id) = std::fs::read_dir(&requests_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+                .and_then(|path| {
+                    path.file_stem()
+                        .and_then(|value| value.to_str())
+                        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+                })
+            {
+                return request_id;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("timed out waiting for pending Ward request");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn context_parts_for_path(path: &Path, branch: &str) -> ContextParts {

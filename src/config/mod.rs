@@ -459,7 +459,7 @@ Use profiles where available:
 
 ```bash
 ward request --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
-ward run --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
+ward run --profile dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --wait-for-approval --approval-timeout 30m --json --no-prompt
 ward dev --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
 ward migrate --agent <agent-name> --worktree <absolute-path> --git-remote <remote-url-or-empty> --commit <sha> --branch <branch> --json --no-prompt
 ```
@@ -482,6 +482,12 @@ For repositories with no `origin` remote, pass `--git-remote ""` explicitly.
 In monorepos, `--worktree` must be the Git top-level path from
 `git rev-parse --show-toplevel`, not the child app folder, even when the Ward
 project lives inside `apps/<name>`.
+
+For commands that should continue after a human approval, prefer
+`ward run --wait-for-approval --approval-timeout 30m --json --no-prompt`.
+Ward will create a dashboard notification and keep the original process alive
+until the request is approved, denied, unlocked, or timed out. Do not end the
+task just because Ward is waiting.
 
 Manual request template:
 
@@ -570,6 +576,8 @@ ward run \
   --commit <sha> \
   --action "<why this command needs secrets>" \
   --env <ENV_NAME> \
+  --wait-for-approval \
+  --approval-timeout 30m \
   --json \
   --no-prompt \
   -- <command> <args>

@@ -250,6 +250,12 @@ The dashboard never displays or edits secret values. It can add/register
 projects and edit profile policies by env name only. Monorepo app projects
 appear alongside regular projects once detected or configured.
 
+The header notification center shows anything currently blocking an agent:
+run approvals, critical confirmations, worktree bindings, unlock-required
+states, missing vault keys, and policy denials. For approvable requests, the
+dashboard uses the same signed grant logic as `ward approve`; it also shows
+copyable CLI commands as a fallback.
+
 ---
 
 ## Audit logs
@@ -288,10 +294,21 @@ Generated agent instructions tell Codex, Claude Code, and other agents to show
 that as a structured approve/deny choice with the exact path, branch, commit,
 remote, and reason. Agents must not approve that trust binding themselves.
 
+For commands that should continue after approval, agents should use:
+
+```bash
+ward run --wait-for-approval --approval-timeout 30m --json --no-prompt -- <command>
+```
+
+When Ward blocks, this creates a dashboard notification and keeps the original
+process alive until the human approves, denies, unlocks, or the timeout expires.
+The lower-level tools are `ward approvals list --json` and
+`ward approvals wait <request-id> --json`.
+
 The agent flow at a glance:
 
 ```
-agent requests access  →  ward evaluates scope  →  you approve or deny
+agent runs with wait  →  ward evaluates scope  →  you approve or deny
             ↓
   ward injects only the approved env vars into the command
             ↓
