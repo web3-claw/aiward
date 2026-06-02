@@ -302,6 +302,10 @@ mod tests {
             auto_bind_worktrees: true,
             canonical_repo_path: None,
             git_common_dir: None,
+            workspace_root: None,
+            workspace_name: None,
+            app_slug: None,
+            parent_workspace: None,
         }
     }
 

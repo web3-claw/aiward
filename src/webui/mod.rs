@@ -369,8 +369,8 @@ fn handle(mut req: tiny_http::Request, token: &str) {
         return;
     }
 
-    if method == Method::Get && path == "/assets/ward-logo-light.png" {
-        serve_png(req, WARD_LOGO_LIGHT_PNG);
+    if method == Method::Get && path == "/assets/ward-logo-dark.png" {
+        serve_png(req, WARD_LOGO_DARK_PNG);
         return;
     }
 
@@ -981,18 +981,18 @@ fn dashboard_status() -> Result<DashboardStatus> {
 fn dashboard_projects() -> Result<Vec<ProjectView>> {
     let registry = registry::list_projects()?;
     let broker_status = broker::status().ok();
-    let mut projects = registry
-        .projects
-        .iter()
-        .map(|(name, project)| {
-            project_view(
-                name,
-                project,
-                registry.active_project.as_deref(),
-                broker_status.as_ref(),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut projects = Vec::new();
+    for (name, project) in &registry.projects {
+        if should_hide_invalid_workspace_root(project) {
+            continue;
+        }
+        projects.push(project_view(
+            name,
+            project,
+            registry.active_project.as_deref(),
+            broker_status.as_ref(),
+        )?);
+    }
     append_discovered_workspace_apps(&mut projects, &registry, broker_status.as_ref())?;
     projects.sort_by(|left, right| {
         left.workspace_root
@@ -1001,6 +1001,14 @@ fn dashboard_projects() -> Result<Vec<ProjectView>> {
             .then_with(|| left.name.cmp(&right.name))
     });
     Ok(projects)
+}
+
+fn should_hide_invalid_workspace_root(project: &RegisteredProject) -> bool {
+    !config::config_path(&project.path).is_file()
+        && workspace::discover(&project.path)
+            .ok()
+            .flatten()
+            .is_some_and(|discovery| discovery.app_candidates().next().is_some())
 }
 
 fn project_view(
@@ -1055,8 +1063,8 @@ fn project_view(
         config_status,
         setup_status: "configured".to_string(),
         setup_available: false,
-        workspace_root: None,
-        parent_project: None,
+        workspace_root: project.workspace_root.clone(),
+        parent_project: project.parent_workspace.clone(),
         package_name: None,
         package_kind: None,
         profiles,
@@ -1547,7 +1555,7 @@ fn command_line(pid: u32) -> Option<String> {
 const DASHBOARD_HTML: &str = include_str!("../dashboard.html");
 const WARD_LOGO_DARK_SVG: &str = include_str!("../assets/ward-logo-dark.svg");
 const WARD_LOGO_TRANSPARENT_SVG: &str = include_str!("../assets/ward-logo-transparent.svg");
-const WARD_LOGO_LIGHT_PNG: &[u8] = include_bytes!("../assets/ward-logo-light.png");
+const WARD_LOGO_DARK_PNG: &[u8] = include_bytes!("../assets/ward-logo-dark.png");
 const WARD_FAVICON_LIGHT_PNG: &[u8] = include_bytes!("../assets/ward-favicon-light.png");
 
 #[allow(dead_code)]
@@ -2024,10 +2032,10 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
         assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
-        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-light.png"));
+        assert!(DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
         assert!(WARD_LOGO_DARK_SVG.contains("<rect"));
         assert!(WARD_LOGO_TRANSPARENT_SVG.contains("<svg"));
-        assert!(WARD_LOGO_LIGHT_PNG.starts_with(b"\x89PNG"));
+        assert!(WARD_LOGO_DARK_PNG.starts_with(b"\x89PNG"));
         assert!(WARD_FAVICON_LIGHT_PNG.starts_with(b"\x89PNG"));
         assert!(!DASHBOARD_HTML.contains("<select"));
     }
@@ -2198,6 +2206,70 @@ mod tests {
         assert!(!serde_json::to_string(discovered)
             .unwrap()
             .contains("payload-secret-value"));
+    }
+
+    #[test]
+    #[serial]
+    fn dashboard_projects_hide_invalid_workspace_root_registry_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"cms-core","packageManager":"pnpm@9.15.9"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.path().join("turbo.json"), "{}").unwrap();
+        std::fs::write(
+            root.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - \"apps/*\"\n",
+        )
+        .unwrap();
+        let app = root.path().join("apps/aiward");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("package.json"),
+            r#"{"name":"@cms-app/aiward","scripts":{"dev":"next dev"}}"#,
+        )
+        .unwrap();
+        std::fs::write(app.join(".env.example"), "DATABASE_URI=\nPAYLOAD_SECRET=\n").unwrap();
+        let cfg = config::ProjectConfig::default_for_dir(&app, Some("cms-core:ward".to_string()))
+            .unwrap();
+        config::write_project_config(&app, &cfg, true).unwrap();
+
+        registry::register_project(
+            "cms-core:ward-root".to_string(),
+            root.path().to_path_buf(),
+            root.path().join(".env.vault"),
+        )
+        .unwrap();
+        registry::register_project(
+            "cms-core:ward".to_string(),
+            app.clone(),
+            app.join(".env.vault"),
+        )
+        .unwrap();
+        registry::update_project_workspace_metadata(
+            "cms-core:ward",
+            Some(root.path().to_path_buf()),
+            Some("cms-core".to_string()),
+            Some("aiward".to_string()),
+            Some("cms-core".to_string()),
+        )
+        .unwrap();
+
+        let projects = dashboard_projects().unwrap();
+        let names = projects
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"cms-core:ward-root"));
+        assert!(names.contains(&"cms-core:ward"));
+        let child = projects
+            .iter()
+            .find(|project| project.name == "cms-core:ward")
+            .unwrap();
+        assert_eq!(child.parent_project.as_deref(), Some("cms-core"));
     }
 
     #[test]

@@ -26,4 +26,5 @@ pub mod unlock;
 pub mod vault;
 pub mod webui;
 pub mod workspace;
+pub mod workspace_target;
 pub mod worktrees;

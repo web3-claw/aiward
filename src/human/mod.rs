@@ -236,10 +236,19 @@ pub fn send_guardian_shutdown() -> Result<()> {
 
 // ── Activation (ward human command handler) ───────────────────────────────────
 
-pub fn activate_human_mode(ttl: &str) -> Result<()> {
-    use crate::{config, logs::LogKind, registry, unlock, vault};
+pub fn activate_human_mode(
+    project: Option<String>,
+    app: Option<String>,
+    all: bool,
+    ttl: &str,
+) -> Result<()> {
+    use crate::{config, logs::LogKind, registry, unlock, vault, workspace, workspace_target};
 
     let cwd = std::env::current_dir()?;
+    let workspace_root_mode = project.is_none()
+        && app.is_none()
+        && config::find_project_root(&cwd).is_none()
+        && workspace::discover_containing(&cwd)?.is_some();
     let (header_project, header_path) = config::find_project_root(&cwd)
         .and_then(|root| {
             config::read_project_config(&root)
@@ -262,28 +271,39 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     );
 
     let passphrase = vault::read_existing_passphrase()?;
-    let resolved = registry::resolve_project_with_passphrase(None, &cwd, &passphrase)?;
-    registry::update_project_vault(
-        &resolved.name,
-        resolved.path.clone(),
-        resolved.vault.clone(),
-    )?;
+    let selector = workspace_target::TargetSelector {
+        project,
+        app,
+        all: all || workspace_root_mode,
+    };
+    let targets = workspace_target::resolve_many_with_passphrase(&selector, &cwd, &passphrase)?;
     let duration = unlock::parse_ttl(ttl)?;
     let ttl_seconds = duration.num_seconds();
 
     // Unlock vault in broker (handles both passphrase-encrypted and session-encrypted vaults).
-    if let Err(error) = crate::cli::create_run_unlock_session(
-        &resolved.name,
-        &resolved.vault,
-        &passphrase,
-        ttl,
-        None,
-    ) {
-        term::section("Session");
-        term::warn("human mode was not activated");
-        term::info("The vault passphrase did not unlock this project.");
-        term::next("try again with: ward human");
-        return Err(error).context("human mode was not activated");
+    for target in &targets {
+        let resolved = target.resolved_project();
+        registry::update_project_vault(
+            &resolved.name,
+            resolved.path.clone(),
+            resolved.vault.clone(),
+        )?;
+        if let Err(error) = crate::cli::create_run_unlock_session(
+            &resolved.name,
+            &resolved.vault,
+            &passphrase,
+            ttl,
+            None,
+        ) {
+            term::section("Session");
+            term::warn("human mode was not activated");
+            term::info(&format!(
+                "The vault passphrase did not unlock {}.",
+                resolved.name
+            ));
+            term::next("try again with: ward human");
+            return Err(error).context("human mode was not activated");
+        }
     }
 
     // Generate a random session token.
@@ -341,6 +361,12 @@ pub fn activate_human_mode(ttl: &str) -> Result<()> {
     term::blank();
     term::section("Session");
     term::ok("human mode active");
+    if targets.len() > 1 {
+        term::ok(&format!(
+            "{} workspace app sessions unlocked",
+            targets.len()
+        ));
+    }
     term::ok(&format!("expires in {ttl_label}"));
     term::ok(&format!("guardian attached to shell {shell_pid}"));
 
