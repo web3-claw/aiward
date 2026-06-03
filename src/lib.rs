@@ -23,6 +23,7 @@ pub mod project_store;
 pub mod recovery;
 pub mod registry;
 pub mod runner;
+pub mod teams;
 pub mod term;
 pub mod unlock;
 pub mod vault;

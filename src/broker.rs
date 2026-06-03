@@ -30,7 +30,7 @@ use crate::{
     approvals::{ApprovalScope, ApprovalSource},
     config, detection, env_file, fs_util, logs, modes, project_store, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
-    vault,
+    teams, vault,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +84,18 @@ pub struct BrokerProjectProvisionStatus {
     pub profiles: Vec<String>,
     pub agents: Vec<String>,
     pub store: project_store::ProjectStoreSummary,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProjectProvisionRequest {
+    pub source_project: String,
+    pub source_vault: PathBuf,
+    pub target_path: PathBuf,
+    pub project: String,
+    pub profiles: Vec<String>,
+    pub env_names: Vec<String>,
+    pub agents: Vec<String>,
+    pub members: Vec<teams::TeamMemberInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +233,8 @@ enum BrokerRequest {
         profiles: Vec<String>,
         env_names: Vec<String>,
         agents: Vec<String>,
+        #[serde(default)]
+        members: Vec<teams::TeamMemberInput>,
     },
 }
 
@@ -739,13 +753,7 @@ pub fn snapshot_project_from_active_session(
 }
 
 pub fn provision_project_from_active_session(
-    source_project: &str,
-    source_vault: &Path,
-    target_path: &Path,
-    project: String,
-    profiles: Vec<String>,
-    env_names: Vec<String>,
-    agents: Vec<String>,
+    request: ProjectProvisionRequest,
 ) -> Result<BrokerProjectProvisionStatus> {
     ensure_running()?;
     let exe = std::env::current_exe().context("failed to resolve current executable")?;
@@ -753,13 +761,14 @@ pub fn provision_project_from_active_session(
         anyhow::bail!("Ward broker is unavailable from this executable");
     }
     match send_simple(BrokerRequest::ProvisionProject {
-        source_project: source_project.to_string(),
-        source_vault: source_vault.to_path_buf(),
-        target_path: target_path.to_path_buf(),
-        project,
-        profiles,
-        env_names,
-        agents,
+        source_project: request.source_project,
+        source_vault: request.source_vault,
+        target_path: request.target_path,
+        project: request.project,
+        profiles: request.profiles,
+        env_names: request.env_names,
+        agents: request.agents,
+        members: request.members,
     })? {
         BrokerResponse::ProjectProvision { status } => Ok(status),
         BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
@@ -1445,6 +1454,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             profiles,
             env_names,
             agents,
+            members,
         } => {
             if let Err(message) = require_trusted_client(&stream) {
                 let response = broker_error("broker_client_untrusted", message);
@@ -1463,33 +1473,31 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     return Ok(false);
                 }
             };
-            match {
+            let request = ProjectProvisionRequest {
+                source_project,
+                source_vault,
+                target_path,
+                project,
+                profiles,
+                env_names,
+                agents,
+                members,
+            };
+            let provision_result = {
                 let passphrase = material.passphrase.clone();
-                provision_project_with_material(
-                    &source_project,
-                    &source_vault,
-                    &target_path,
-                    &project,
-                    profiles,
-                    env_names,
-                    agents,
-                    &material,
-                )
-                .map(|(status, expires_at)| (status, expires_at, passphrase))
-            } {
+                provision_project_with_material(&request, &material)
+                    .map(|(status, expires_at)| (status, expires_at, passphrase))
+            };
+            match provision_result {
                 Ok((status, expires_at, passphrase)) => {
-                    let new_session_key =
-                        match vault::decrypt_vault_file(&status.vault, &passphrase).and_then(
-                            |plaintext| {
-                                let ephemeral_key = generate_session_key();
-                                let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
-                                vault::write_vault(&status.vault, &envelope)?;
-                                Ok(ephemeral_key)
-                            },
-                        ) {
-                            Ok(ephemeral_key) => Some(ephemeral_key),
-                            Err(_) => None,
-                        };
+                    let new_session_key = vault::decrypt_vault_file(&status.vault, &passphrase)
+                        .and_then(|plaintext| {
+                            let ephemeral_key = generate_session_key();
+                            let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
+                            vault::write_vault(&status.vault, &envelope)?;
+                            Ok(ephemeral_key)
+                        })
+                        .ok();
                     state
                         .lock()
                         .expect("broker state poisoned")
@@ -1576,29 +1584,28 @@ fn snapshot_project_with_material(
 }
 
 fn provision_project_with_material(
-    source_project: &str,
-    source_vault: &Path,
-    target_path: &Path,
-    project: &str,
-    profiles: Vec<String>,
-    env_names: Vec<String>,
-    agents: Vec<String>,
+    request: &ProjectProvisionRequest,
     material: &ActiveProjectMaterial,
 ) -> Result<(BrokerProjectProvisionStatus, DateTime<Utc>)> {
-    validate_project_name(project)?;
-    let selected_env = normalize_env_names(env_names)?;
+    validate_project_name(&request.project)?;
+    let selected_env = normalize_env_names(request.env_names.clone())?;
     if selected_env.is_empty() {
         anyhow::bail!("at least one env name is required");
     }
-    let selected_agents = normalize_agent_names(agents)?;
+    let selected_agents = normalize_agent_names(request.agents.clone())?;
 
     let registry = registry::list_projects()?;
     let source_registered = registry
         .projects
-        .get(source_project)
-        .with_context(|| format!("source project {source_project} is not registered"))?;
+        .get(&request.source_project)
+        .with_context(|| {
+            format!(
+                "source project {} is not registered",
+                request.source_project
+            )
+        })?;
     let source_config = config::read_project_config(&source_registered.path)?;
-    let source_plaintext = vault::decrypt_vault_file(source_vault, &material.decrypt_key)?;
+    let source_plaintext = vault::decrypt_vault_file(&request.source_vault, &material.decrypt_key)?;
     let source_env = env_file::parse_env_map(&source_plaintext)?;
     let missing = selected_env
         .iter()
@@ -1613,10 +1620,10 @@ fn provision_project_with_material(
     }
 
     let selected_env_set = selected_env.iter().cloned().collect::<BTreeSet<_>>();
-    let profile_names = normalize_profile_names(if profiles.is_empty() {
+    let profile_names = normalize_profile_names(if request.profiles.is_empty() {
         source_config.profiles.keys().cloned().collect()
     } else {
-        profiles
+        request.profiles.clone()
     })?;
     let mut target_profiles = BTreeMap::new();
     for profile_name in &profile_names {
@@ -1631,10 +1638,10 @@ fn provision_project_with_material(
         target_profiles.insert(profile_name.clone(), profile);
     }
 
-    let target_path = prepare_provision_target(target_path)?;
+    let target_path = prepare_provision_target(&request.target_path)?;
     let vault_path = target_path.join(config::DEFAULT_VAULT_FILE);
     let mut target_config =
-        config::ProjectConfig::default_for_dir(&target_path, Some(project.to_string()))?;
+        config::ProjectConfig::default_for_dir(&target_path, Some(request.project.clone()))?;
     target_config.vault = PathBuf::from(config::DEFAULT_VAULT_FILE);
     target_config.profiles = target_profiles;
     target_config.agent_policies = selected_agents
@@ -1661,14 +1668,14 @@ fn provision_project_with_material(
 
     config::write_project_config(&target_path, &target_config, true)?;
     config::ensure_env_example(&target_path)?;
-    config::ensure_agent_instructions(&target_path, project)?;
+    config::ensure_agent_instructions(&target_path, &request.project)?;
     config::ensure_gitignore(&target_path, true)?;
     let envelope = vault::encrypt_env(&selected_plaintext, &material.passphrase)?;
     vault::write_vault(&vault_path, &envelope)?;
     env_file::lock_env_file(&target_path.join(".env"), &vault_path)?;
-    approval_receipts::ensure_project_key(project, &material.passphrase)?;
+    approval_receipts::ensure_project_key(&request.project, &material.passphrase)?;
     if recovery::create_recovery_files_with_material(
-        project,
+        &request.project,
         &material.passphrase,
         &material.passphrase,
         Some(&selected_plaintext),
@@ -1679,9 +1686,28 @@ fn provision_project_with_material(
         let _ = config::write_project_config(&target_path, &target_config, true);
     }
 
-    registry::update_project_vault(project, target_path.clone(), vault_path.clone())?;
+    let mut team_record = teams::default_record(&request.project);
+    for member in request.members.clone() {
+        teams::upsert_member(&mut team_record, member, None)?;
+    }
+    if !selected_agents.is_empty() {
+        teams::upsert_policy(
+            &mut team_record,
+            teams::TeamPolicyInput {
+                name: "provisioned-agents".to_string(),
+                member_id: Some(teams::current_member_id()),
+                agents: selected_agents.clone(),
+                profiles: profile_names.clone(),
+                env: selected_env.clone(),
+            },
+            None,
+        )?;
+    }
+    teams::write_record(&team_record)?;
+
+    registry::update_project_vault(&request.project, target_path.clone(), vault_path.clone())?;
     let store = project_store::refresh_from_plaintext(
-        project,
+        &request.project,
         &target_path,
         &vault_path,
         &target_config,
@@ -1691,7 +1717,7 @@ fn provision_project_with_material(
 
     Ok((
         BrokerProjectProvisionStatus {
-            project: project.to_string(),
+            project: request.project.clone(),
             path: target_path,
             vault: vault_path,
             env_names: selected_env,
@@ -3045,13 +3071,16 @@ mod tests {
         };
 
         let (status, _) = provision_project_with_material(
-            "source",
-            &source_vault,
-            &target,
-            "target",
-            vec!["dev".to_string()],
-            vec!["DATABASE_URL".to_string()],
-            vec!["codex".to_string()],
+            &ProjectProvisionRequest {
+                source_project: "source".to_string(),
+                source_vault,
+                target_path: target,
+                project: "target".to_string(),
+                profiles: vec!["dev".to_string()],
+                env_names: vec!["DATABASE_URL".to_string()],
+                agents: vec!["codex".to_string()],
+                members: Vec::new(),
+            },
             &material,
         )
         .unwrap();

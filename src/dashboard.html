@@ -492,6 +492,7 @@
   <div class="header-right">
     <a class="btn" id="overview-link" href="/">overview</a>
     <a class="btn" id="logs-link" href="/logs">all logs</a>
+    <a class="btn" id="team-link" href="/team">team</a>
     <button class="btn" id="add-project-btn">add project</button>
     <div class="notification-wrap" id="notification-wrap">
       <button class="btn notification-btn" id="notifications-btn" type="button">notifications<span class="notification-count" id="notification-count">0</span></button>
@@ -526,9 +527,11 @@
 const token = new URLSearchParams(location.search).get('token') || '';
 const currentPath = window.location.pathname;
 const logsProject = projectFromLogPath(currentPath);
+const teamProject = projectFromTeamPath(currentPath);
 let projects = [];
 let status = null;
 let events = [];
+let team = null;
 let selectedProject = null;
 let selectedRow = null;
 let selectedEventKey = null;
@@ -573,7 +576,16 @@ function projectFromLogPath(path) {
   return null;
 }
 
+function projectFromTeamPath(path) {
+  const parts = path.split('/').filter(Boolean);
+  if (parts.length === 3 && parts[0] === 'projects' && parts[2] === 'team') {
+    return decodeURIComponent(parts[1]);
+  }
+  return null;
+}
+
 function isLogsPage() { return currentPath === '/logs' || logsProject; }
+function isTeamPage() { return currentPath === '/team' || teamProject; }
 
 async function load() {
   [projects, status, notifications] = await Promise.all([
@@ -582,11 +594,14 @@ async function load() {
     api('/api/notifications')
   ]);
   if (!selectedProject && projects.length) {
-    selectedProject = logsProject || (projects.find(p => p.active) || projects[0]).name;
+    selectedProject = logsProject || teamProject || (projects.find(p => p.active) || projects[0]).name;
   }
   if (isLogsPage()) {
     await loadEvents(logsProject);
     renderLogs();
+  } else if (isTeamPage()) {
+    await loadTeam(selectedProject);
+    renderTeam();
   } else {
     renderOverview();
   }
@@ -600,10 +615,15 @@ async function loadEvents(project) {
   events = await api(`/api/events${suffix}`);
 }
 
+async function loadTeam(project) {
+  team = project ? await api(`/api/teams/projects/${encodeURIComponent(project)}`) : null;
+}
+
 function renderOverview() {
   document.getElementById('page-title').textContent = 'overview';
   document.getElementById('overview-link').href = link('/');
   document.getElementById('logs-link').href = link('/logs');
+  document.getElementById('team-link').href = link('/team');
   renderProjectFilters();
   renderProjectTable();
   if (pendingProvision) {
@@ -631,7 +651,7 @@ function renderProjectFilters() {
 function renderProjectTable() {
   const table = document.getElementById('main-table');
   table.innerHTML = `<thead><tr>
-    <th>project</th><th>config</th><th>setup</th><th>session</th><th>store</th><th>env</th><th>profiles</th><th>agents</th>
+    <th>project</th><th>config</th><th>setup</th><th>session</th><th>store</th><th>team</th><th>env</th><th>profiles</th><th>agents</th>
   </tr></thead><tbody></tbody>`;
   const tbody = table.querySelector('tbody');
   projects.forEach((project, index) => {
@@ -643,6 +663,7 @@ function renderProjectTable() {
       <td>${statusBadge(project.setupStatus === 'configured' || project.configStatus === 'ok', project.setupStatus || 'configured')}</td>
       <td>${statusBadge(project.brokerSessionActive, project.brokerSessionActive ? 'active' : 'locked')}</td>
       <td>${statusBadge(Boolean(project.storeSnapshot), project.storeSnapshot ? (project.storeSnapshot.stale ? 'stale' : 'stored') : 'missing')}</td>
+      <td>${project.team ? `${project.team.memberCount}/${project.team.policyCount}` : '0/0'}</td>
       <td>${project.envNames.length}</td>
       <td>${project.profiles.length}</td>
       <td>${(project.agentPolicies || []).length}</td>`;
@@ -684,6 +705,7 @@ function renderProjectDetail(project) {
       <span class="badge ${project.brokerSessionActive ? 'badge-ok' : 'badge-warn'}">${project.brokerSessionActive ? 'active' : 'locked'}</span>
       <span class="detail-title">${esc(project.name)}</span>
       <a class="btn detail-ts" href="${link(`/projects/${encodeURIComponent(project.name)}/logs`)}">logs</a>
+      <a class="btn detail-ts" href="${link(`/projects/${encodeURIComponent(project.name)}/team`)}">team</a>
     </div>
     ${project.parentProject ? field('workspace', esc(project.parentProject)) : ''}
     ${project.packageName ? field('package', esc(project.packageName)) : ''}
@@ -692,6 +714,7 @@ function renderProjectDetail(project) {
     ${field('config', project.configStatus)}
     ${field('setup', project.setupStatus || 'configured')}
     ${field('project store', project.storeSnapshot ? `${project.storeSnapshot.stale ? 'stale' : 'ready'} · ${esc(project.storeSnapshot.updatedAt)}` : 'missing')}
+    ${field('team', project.team ? `${project.team.memberCount} member(s), ${project.team.policyCount} policy(s), ${project.team.agentCount} agent(s)` : 'missing')}
     ${project.setupAvailable ? `<button class="btn primary" data-setup-detected="${esc(project.name)}">setup app</button>` : ''}
     ${field('vault keys', project.vaultKeysVerified ? 'verified' : 'unavailable')}
     ${field('env names', project.envNames.map(envChip).join('') || '<span class="sev-info">none</span>')}
@@ -792,11 +815,232 @@ function profilePayload(editor) {
   };
 }
 
+function renderTeam() {
+  const project = currentProject();
+  document.getElementById('page-title').textContent = project ? `${project.name} team` : 'team';
+  document.getElementById('overview-link').href = link('/');
+  document.getElementById('logs-link').href = link(project ? `/projects/${encodeURIComponent(project.name)}/logs` : '/logs');
+  document.getElementById('team-link').href = link('/team');
+  renderTeamFilters();
+  renderTeamTable();
+  renderTeamDetail(project);
+}
+
+function renderTeamFilters() {
+  const filters = document.getElementById('filters');
+  filters.innerHTML = '<span class="filter-label">project</span>' + projects.map(p => (
+    `<button class="chip ${p.name === selectedProject ? 'active' : ''}" data-team-project="${esc(p.name)}">${esc(p.name)}</button>`
+  )).join('');
+  filters.querySelectorAll('[data-team-project]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      selectedProject = btn.dataset.teamProject;
+      await loadTeam(selectedProject);
+      renderTeam();
+    });
+  });
+}
+
+function renderTeamTable() {
+  const table = document.getElementById('main-table');
+  table.innerHTML = `<thead><tr>
+    <th>project</th><th>members</th><th>policies</th><th>agents</th><th>session</th>
+  </tr></thead><tbody></tbody>`;
+  const tbody = table.querySelector('tbody');
+  projects.forEach(project => {
+    const tr = document.createElement('tr');
+    if (project.name === selectedProject) tr.classList.add('selected');
+    tr.innerHTML = `
+      <td><span class="badge ${project.active ? 'badge-ok' : 'badge-neutral'}">${esc(project.name)}</span></td>
+      <td>${project.team ? project.team.memberCount : 0}</td>
+      <td>${project.team ? project.team.policyCount : 0}</td>
+      <td>${project.team ? project.team.agentCount : 0}</td>
+      <td>${statusBadge(project.brokerSessionActive, project.brokerSessionActive ? 'active' : 'locked')}</td>`;
+    tr.addEventListener('click', async () => {
+      selectedProject = project.name;
+      await loadTeam(selectedProject);
+      renderTeam();
+    });
+    tbody.appendChild(tr);
+  });
+  document.getElementById('item-count').textContent = `${projects.length} team project(s)`;
+  document.getElementById('filter-count').textContent = team ? `${Object.keys(team.members || {}).length} members · ${Object.keys(team.policies || {}).length} policies` : '';
+}
+
+function renderTeamDetail(project) {
+  const pane = document.getElementById('detail-pane');
+  if (!project || !team) {
+    pane.innerHTML = '<div class="detail-empty">select a project</div>';
+    return;
+  }
+  pane.innerHTML = `
+    <div class="detail-header">
+      <span class="badge ${project.brokerSessionActive ? 'badge-ok' : 'badge-warn'}">${project.brokerSessionActive ? 'active' : 'locked'}</span>
+      <span class="detail-title">${esc(project.name)} team</span>
+      <a class="btn detail-ts" href="${link(`/projects/${encodeURIComponent(project.name)}/logs`)}">logs</a>
+    </div>
+    ${field('policy source', 'local team simulator')}
+    ${field('members', String(Object.keys(team.members || {}).length))}
+    ${field('policies', String(Object.keys(team.policies || {}).length))}
+    <div class="field-group">
+      <div class="field-label">members</div>
+      <div id="team-members"></div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">new member</div>
+      ${memberEditor(null)}
+    </div>
+    <div class="field-group">
+      <div class="field-label">agent env policies</div>
+      <div id="team-policies"></div>
+    </div>
+    <div class="field-group">
+      <div class="field-label">new policy</div>
+      ${teamPolicyEditor(project, null)}
+    </div>`;
+  renderMemberCards(project);
+  renderTeamPolicyCards(project);
+  bindTeamEditors(project);
+}
+
+function renderMemberCards(project) {
+  const host = document.getElementById('team-members');
+  const members = Object.values(team.members || {}).sort((a, b) => a.id.localeCompare(b.id));
+  host.innerHTML = members.map(member => `
+    <div class="policy-card">
+      <div class="policy-actions">
+        <span><span class="badge badge-neutral">${esc(member.id)}</span> ${esc(member.role)}</span>
+        <button class="btn danger" data-delete-member="${esc(member.id)}">delete</button>
+      </div>
+      ${memberEditor(member)}
+    </div>
+  `).join('') || '<div class="finding-msg">no members</div>';
+}
+
+function memberEditor(member) {
+  return `
+    <div class="form-grid" data-member-editor="${esc(member ? member.id : 'create')}">
+      <input data-field="id" placeholder="member id or email" value="${esc(member ? member.id : '')}">
+      ${dropdownMarkup('role', member ? member.role : 'developer', ['owner','admin','developer','viewer'])}
+      <input class="full" data-field="name" placeholder="display name" value="${esc(member ? member.name : '')}">
+      <input class="full" data-field="agents" placeholder="agent identities, comma separated" value="${esc(member ? (member.agents || []).join(', ') : '')}">
+      <div class="full inline-form">
+        <button class="btn primary" data-save-member="${esc(member ? member.id : '')}">${member ? 'save' : 'create'}</button>
+      </div>
+    </div>`;
+}
+
+function renderTeamPolicyCards(project) {
+  const host = document.getElementById('team-policies');
+  const policies = Object.values(team.policies || {}).sort((a, b) => a.name.localeCompare(b.name));
+  host.innerHTML = policies.map(policy => `
+    <div class="policy-card">
+      <div class="policy-actions">
+        <span><span class="badge badge-neutral">${esc(policy.name)}</span> ${(policy.agents || []).map(envChip).join('')}</span>
+        <button class="btn danger" data-delete-team-policy="${esc(policy.name)}">delete</button>
+      </div>
+      ${teamPolicyEditor(project, policy)}
+    </div>
+  `).join('') || '<div class="finding-msg">no team policies</div>';
+}
+
+function teamPolicyEditor(project, policy) {
+  const profiles = new Set(policy ? policy.profiles || [] : []);
+  const env = new Set(policy ? policy.env || [] : []);
+  const members = Object.values(team.members || {}).sort((a, b) => a.id.localeCompare(b.id));
+  return `
+    <div class="form-grid" data-team-policy-editor="${esc(policy ? policy.name : 'create')}">
+      <input data-field="name" placeholder="policy name" value="${esc(policy ? policy.name : '')}">
+      ${dropdownMarkup('memberId', policy && policy.memberId ? policy.memberId : '', [{ value: '', label: 'no member' }].concat(members.map(member => ({ value: member.id, label: member.id }))))}
+      <input class="full" data-field="agents" placeholder="agent identities, comma separated" value="${esc(policy ? (policy.agents || []).join(', ') : '')}">
+      <div class="field-label full">profiles</div>
+      <div class="full check-grid">
+        ${project.profiles.map(profile => `<label><input type="checkbox" data-policy-profile="${esc(profile.name)}" ${profiles.has(profile.name) ? 'checked' : ''}>${esc(profile.name)}</label>`).join('') || '<span class="sev-info">none</span>'}
+      </div>
+      <div class="field-label full">env names</div>
+      <div class="full check-grid">
+        ${project.envNames.map(name => `<label><input type="checkbox" data-policy-env="${esc(name)}" ${env.has(name) ? 'checked' : ''}>${esc(name)}</label>`).join('') || '<span class="sev-info">none</span>'}
+      </div>
+      <div class="full inline-form">
+        <button class="btn primary" data-save-team-policy="${esc(policy ? policy.name : '')}">${policy ? 'save' : 'create'}</button>
+      </div>
+    </div>`;
+}
+
+function bindTeamEditors(project) {
+  bindDropdowns(document.getElementById('detail-pane'));
+  document.querySelectorAll('[data-save-member]').forEach(btn => {
+    btn.addEventListener('click', () => saveTeamMember(project.name, btn.dataset.saveMember, btn.closest('[data-member-editor]')));
+  });
+  document.querySelectorAll('[data-delete-member]').forEach(btn => {
+    btn.addEventListener('click', () => deleteTeamMember(project.name, btn.dataset.deleteMember));
+  });
+  document.querySelectorAll('[data-save-team-policy]').forEach(btn => {
+    btn.addEventListener('click', () => saveTeamPolicy(project.name, btn.dataset.saveTeamPolicy, btn.closest('[data-team-policy-editor]')));
+  });
+  document.querySelectorAll('[data-delete-team-policy]').forEach(btn => {
+    btn.addEventListener('click', () => deleteTeamPolicy(project.name, btn.dataset.deleteTeamPolicy));
+  });
+}
+
+async function saveTeamMember(projectName, oldId, editor) {
+  const body = {
+    id: editor.querySelector('[data-field="id"]').value.trim(),
+    name: editor.querySelector('[data-field="name"]').value.trim(),
+    role: editor.querySelector('[data-field="role"]').dataset.value,
+    agents: splitList(editor.querySelector('[data-field="agents"]').value)
+  };
+  const path = oldId
+    ? `/api/teams/projects/${encodeURIComponent(projectName)}/members/${encodeURIComponent(oldId)}`
+    : `/api/teams/projects/${encodeURIComponent(projectName)}/members`;
+  const method = oldId ? 'PATCH' : 'POST';
+  await mutateTeam(path, method, body, projectName);
+}
+
+async function deleteTeamMember(projectName, memberId) {
+  await mutateTeam(`/api/teams/projects/${encodeURIComponent(projectName)}/members/${encodeURIComponent(memberId)}`, 'DELETE', null, projectName);
+}
+
+async function saveTeamPolicy(projectName, oldName, editor) {
+  const memberId = editor.querySelector('[data-field="memberId"]').dataset.value;
+  const body = {
+    name: editor.querySelector('[data-field="name"]').value.trim(),
+    memberId: memberId || null,
+    agents: splitList(editor.querySelector('[data-field="agents"]').value),
+    profiles: [...editor.querySelectorAll('[data-policy-profile]:checked')].map(input => input.dataset.policyProfile),
+    env: [...editor.querySelectorAll('[data-policy-env]:checked')].map(input => input.dataset.policyEnv)
+  };
+  const path = oldName
+    ? `/api/teams/projects/${encodeURIComponent(projectName)}/policies/${encodeURIComponent(oldName)}`
+    : `/api/teams/projects/${encodeURIComponent(projectName)}/policies`;
+  const method = oldName ? 'PATCH' : 'POST';
+  await mutateTeam(path, method, body, projectName);
+}
+
+async function deleteTeamPolicy(projectName, policyName) {
+  await mutateTeam(`/api/teams/projects/${encodeURIComponent(projectName)}/policies/${encodeURIComponent(policyName)}`, 'DELETE', null, projectName);
+}
+
+async function mutateTeam(path, method, body, projectName) {
+  try {
+    team = await api(path, { method, body: body ? JSON.stringify(body) : undefined });
+    projects = await api('/api/projects');
+    selectedProject = projectName;
+    renderTeam();
+  } catch (error) {
+    alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
+  }
+}
+
+function splitList(value) {
+  return String(value || '').split(',').map(item => item.trim()).filter(Boolean);
+}
+
 function renderLogs() {
   const title = logsProject ? `${logsProject} logs` : 'logs';
   document.getElementById('page-title').textContent = title;
   document.getElementById('overview-link').href = link('/');
   document.getElementById('logs-link').href = link('/logs');
+  document.getElementById('team-link').href = link(logsProject ? `/projects/${encodeURIComponent(logsProject)}/team` : '/team');
   renderLogFilters();
   renderLogTable();
   const selectedEvent = selectedLogEvent();
@@ -1152,10 +1396,14 @@ function renderProvisionForm() {
         ${profileNames.map(name => `<label><input type="checkbox" data-provision-profile="${esc(name)}" checked>${esc(name)}</label>`).join('') || '<span class="sev-info">none</span>'}
       </div>
       <input class="full" data-field="agents" placeholder="agent allowlist, comma separated">
+      <div class="field-label full">initial team members</div>
+      <input data-field="members" placeholder="member ids/emails, comma separated">
+      ${dropdownMarkup('memberRole', 'developer', ['owner','admin','developer','viewer'])}
       <div class="full inline-form">
         <button class="btn primary" data-provision-create>create</button>
       </div>
     </div>`;
+  bindDropdowns(pane);
   pane.querySelector('[data-provision-cancel]').addEventListener('click', () => {
     pendingProvision = null;
     renderOverview();
@@ -1171,7 +1419,13 @@ async function createProvisionProject() {
     project: editor.querySelector('[data-field="project"]').value.trim(),
     env: [...editor.querySelectorAll('[data-provision-env]:checked')].map(input => input.dataset.provisionEnv),
     profiles: [...editor.querySelectorAll('[data-provision-profile]:checked')].map(input => input.dataset.provisionProfile),
-    agents: editor.querySelector('[data-field="agents"]').value.split(',').map(value => value.trim()).filter(Boolean)
+    agents: splitList(editor.querySelector('[data-field="agents"]').value),
+    members: splitList(editor.querySelector('[data-field="members"]').value).map(id => ({
+      id,
+      name: id,
+      role: editor.querySelector('[data-field="memberRole"]').dataset.value,
+      agents: []
+    }))
   };
   try {
     const result = await api('/api/projects/provision', { method: 'POST', body: JSON.stringify(body) });

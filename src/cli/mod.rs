@@ -1947,15 +1947,17 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
         } => {
             let cwd = env::current_dir()?;
             let source = registry::resolve_project(Some(&from_project), &cwd)?;
-            let status = broker::provision_project_from_active_session(
-                &source.name,
-                &source.vault,
-                &path,
-                name,
-                profiles,
-                env_names,
-                agents,
-            )?;
+            let status =
+                broker::provision_project_from_active_session(broker::ProjectProvisionRequest {
+                    source_project: source.name,
+                    source_vault: source.vault,
+                    target_path: path,
+                    project: name,
+                    profiles,
+                    env_names,
+                    agents,
+                    members: Vec::new(),
+                })?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
