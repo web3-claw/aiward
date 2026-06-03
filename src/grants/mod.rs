@@ -224,6 +224,21 @@ pub fn revoke_session_grants() -> Result<usize> {
     revoke_session_grants_at_path(&path)
 }
 
+pub fn revoke_project_session_grants(project: &str) -> Result<usize> {
+    let path = grants_path();
+    let grants = load_grants_from_path(&path)?;
+    let before = grants.len();
+    let retained = grants
+        .into_iter()
+        .filter(|grant| grant.project != project || grant.scope != ApprovalScope::Session)
+        .collect::<Vec<_>>();
+    let revoked = before - retained.len();
+    if revoked > 0 {
+        write_grants_to_path(&path, &retained)?;
+    }
+    Ok(revoked)
+}
+
 pub fn revoke_grant(id: uuid::Uuid) -> Result<bool> {
     revoke_grant_at_path(&grants_path(), id)
 }

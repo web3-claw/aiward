@@ -4370,6 +4370,8 @@ fn library_dispatch_exercises_cli_paths_linked_into_integration_tests() {
                 project: None,
                 app: None,
                 all: false,
+                json: false,
+                no_prompt: false,
             },
         },
     })

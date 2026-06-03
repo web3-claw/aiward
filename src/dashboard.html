@@ -522,6 +522,7 @@
   <span>ward browser dashboard</span>
   <span class="count" id="item-count">0 items</span>
   <span id="filter-count"></span>
+  <span id="edit-status"></span>
 </footer>
 
 <script>
@@ -544,7 +545,9 @@ let sevFilter = 'all';
 let agentFilter = '';
 let notifications = [];
 let notificationsOpen = false;
+let editState = { dirty: false, refreshDeferred: false };
 const paneWidthStorageKey = 'ward.dashboard.tablePaneWidth';
+const autoRefreshMs = 5000;
 
 restorePaneWidth();
 
@@ -652,6 +655,7 @@ function renderProjectFilters() {
   )).join('');
   filters.querySelectorAll('[data-project]').forEach(btn => {
     btn.addEventListener('click', () => {
+      if (!confirmDiscardDrafts()) return;
       selectedProject = btn.dataset.project;
       selectedRow = null;
       renderOverview();
@@ -683,6 +687,7 @@ function renderProjectTable() {
         openProjectLogs(project.name);
         return;
       }
+      if (!confirmDiscardDrafts()) return;
       selectedProject = project.name;
       selectedRow = index;
       renderOverview();
@@ -702,6 +707,7 @@ function projectWasDoubleClicked(projectName) {
 }
 
 function openProjectLogs(projectName) {
+  if (!confirmDiscardDrafts()) return;
   window.location.href = link(`/projects/${encodeURIComponent(projectName)}/logs`);
 }
 
@@ -724,8 +730,15 @@ function renderProjectDetail(project) {
     ${field('vault', shortPath(project.vault))}
     ${field('config', project.configStatus)}
     ${field('setup', project.setupStatus || 'configured')}
+    ${field('session', project.brokerSessionActive ? `active until ${esc(formatDateTime(project.brokerSessionExpiresAt))}` : 'locked')}
     ${field('project store', project.storeSnapshot ? `${project.storeSnapshot.stale ? 'stale' : 'ready'} · ${esc(project.storeSnapshot.updatedAt)}` : 'missing')}
     ${field('team', project.team ? `${project.team.memberCount} member(s), ${project.team.policyCount} policy(s), ${project.team.agentCount} agent(s)` : 'missing')}
+    <div class="inline-form">
+      <button class="btn" data-lock-project="${esc(project.name)}">lock project</button>
+      <button class="btn" data-lock-all>lock all</button>
+      <button class="btn" data-copy-unlock="${esc(project.name)}">copy unlock</button>
+      <button class="btn danger" data-remove-project="${esc(project.name)}">remove project</button>
+    </div>
     ${project.setupAvailable ? `<button class="btn primary" data-setup-detected="${esc(project.name)}">setup app</button>` : ''}
     ${field('vault keys', project.vaultKeysVerified ? 'verified' : 'unavailable')}
     ${field('env names', project.envNames.map(envChip).join('') || '<span class="sev-info">none</span>')}
@@ -741,6 +754,7 @@ function renderProjectDetail(project) {
   renderProfileCards(project);
   bindProfileEditors(project);
   bindDetectedProjectSetup(project);
+  bindProjectControls(project);
 }
 
 function renderProfileCards(project) {
@@ -761,7 +775,7 @@ function profileEditor(project, profile) {
   const env = new Set(profile ? profile.env : []);
   const defaultScope = profile ? profile.defaultScope : 'session';
   return `
-    <div class="form-grid" data-profile-editor="${esc(prefix)}">
+    <div class="form-grid" data-dirty-scope data-profile-editor="${esc(prefix)}">
       <input data-field="name" placeholder="name" value="${esc(profile ? profile.name : '')}">
       ${dropdownMarkup('defaultScope', defaultScope, ['once','session','branch','always'])}
       <input class="full" data-field="command" placeholder="command" value="${esc(profile ? profile.command : '')}">
@@ -779,15 +793,25 @@ function profileEditor(project, profile) {
 
 function bindProfileEditors(project) {
   bindDropdowns(document.getElementById('detail-pane'));
+  bindDirtyTracking(document.getElementById('detail-pane'));
   document.querySelectorAll('[data-add-env]').forEach(btn => {
     btn.addEventListener('click', event => {
       const editor = event.target.closest('[data-profile-editor]');
       const input = editor.querySelector('[data-field="extraEnv"]');
       const name = input.value.trim();
       if (!name) return;
+      if (!isValidEnvName(name)) {
+        alert(`Invalid env name: ${name}`);
+        return;
+      }
+      if ([...editor.querySelectorAll('[data-env]')].some(existing => existing.dataset.env === name)) {
+        alert(`${name} is already in this profile editor`);
+        return;
+      }
       const grid = editor.querySelector('.check-grid');
       grid.insertAdjacentHTML('beforeend', `<label><input type="checkbox" data-env="${esc(name)}" checked>${esc(name)}</label>`);
       input.value = '';
+      markEditorDirty();
     });
   });
   document.querySelectorAll('[data-save-profile]').forEach(btn => {
@@ -807,12 +831,15 @@ async function saveProfile(projectName, oldName, editor) {
   const updated = await api(path, { method, body: JSON.stringify(body) });
   projects = projects.map(project => project.name === projectName ? updated : project);
   selectedProject = projectName;
+  clearEditorDirty();
   renderOverview();
 }
 
 async function deleteProfile(projectName, profileName) {
+  if (!confirmDiscardDrafts()) return;
   const updated = await api(`/api/projects/${encodeURIComponent(projectName)}/profiles/${encodeURIComponent(profileName)}`, { method: 'DELETE' });
   projects = projects.map(project => project.name === projectName ? updated : project);
+  clearEditorDirty();
   renderOverview();
 }
 
@@ -845,6 +872,7 @@ function renderTeamFilters() {
   )).join('');
   filters.querySelectorAll('[data-team-project]').forEach(btn => {
     btn.addEventListener('click', async () => {
+      if (!confirmDiscardDrafts()) return;
       selectedProject = btn.dataset.teamProject;
       await loadTeam(selectedProject);
       renderTeam();
@@ -868,6 +896,7 @@ function renderTeamTable() {
       <td>${project.team ? project.team.agentCount : 0}</td>
       <td>${statusBadge(project.brokerSessionActive, project.brokerSessionActive ? 'active' : 'locked')}</td>`;
     tr.addEventListener('click', async () => {
+      if (!confirmDiscardDrafts()) return;
       selectedProject = project.name;
       await loadTeam(selectedProject);
       renderTeam();
@@ -930,7 +959,7 @@ function renderMemberCards(project) {
 
 function memberEditor(member) {
   return `
-    <div class="form-grid" data-member-editor="${esc(member ? member.id : 'create')}">
+    <div class="form-grid" data-dirty-scope data-member-editor="${esc(member ? member.id : 'create')}">
       <input data-field="id" placeholder="member id or email" value="${esc(member ? member.id : '')}">
       ${dropdownMarkup('role', member ? member.role : 'developer', ['owner','admin','developer','viewer'])}
       <input class="full" data-field="name" placeholder="display name" value="${esc(member ? member.name : '')}">
@@ -960,7 +989,7 @@ function teamPolicyEditor(project, policy) {
   const env = new Set(policy ? policy.env || [] : []);
   const members = Object.values(team.members || {}).sort((a, b) => a.id.localeCompare(b.id));
   return `
-    <div class="form-grid" data-team-policy-editor="${esc(policy ? policy.name : 'create')}">
+    <div class="form-grid" data-dirty-scope data-team-policy-editor="${esc(policy ? policy.name : 'create')}">
       <input data-field="name" placeholder="policy name" value="${esc(policy ? policy.name : '')}">
       ${dropdownMarkup('memberId', policy && policy.memberId ? policy.memberId : '', [{ value: '', label: 'no member' }].concat(members.map(member => ({ value: member.id, label: member.id }))))}
       <input class="full" data-field="agents" placeholder="agent identities, comma separated" value="${esc(policy ? (policy.agents || []).join(', ') : '')}">
@@ -980,6 +1009,7 @@ function teamPolicyEditor(project, policy) {
 
 function bindTeamEditors(project) {
   bindDropdowns(document.getElementById('detail-pane'));
+  bindDirtyTracking(document.getElementById('detail-pane'));
   document.querySelectorAll('[data-save-member]').forEach(btn => {
     btn.addEventListener('click', () => saveTeamMember(project.name, btn.dataset.saveMember, btn.closest('[data-member-editor]')));
   });
@@ -1009,6 +1039,7 @@ async function saveTeamMember(projectName, oldId, editor) {
 }
 
 async function deleteTeamMember(projectName, memberId) {
+  if (!confirmDiscardDrafts()) return;
   await mutateTeam(`/api/teams/projects/${encodeURIComponent(projectName)}/members/${encodeURIComponent(memberId)}`, 'DELETE', null, projectName);
 }
 
@@ -1029,6 +1060,7 @@ async function saveTeamPolicy(projectName, oldName, editor) {
 }
 
 async function deleteTeamPolicy(projectName, policyName) {
+  if (!confirmDiscardDrafts()) return;
   await mutateTeam(`/api/teams/projects/${encodeURIComponent(projectName)}/policies/${encodeURIComponent(policyName)}`, 'DELETE', null, projectName);
 }
 
@@ -1037,6 +1069,7 @@ async function mutateTeam(path, method, body, projectName) {
     team = await api(path, { method, body: body ? JSON.stringify(body) : undefined });
     projects = await api('/api/projects');
     selectedProject = projectName;
+    clearEditorDirty();
     renderTeam();
   } catch (error) {
     alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
@@ -1137,6 +1170,10 @@ function renderCloudDetail(status, teams, environments, audit) {
 
 function splitList(value) {
   return String(value || '').split(',').map(item => item.trim()).filter(Boolean);
+}
+
+function isValidEnvName(name) {
+  return /^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(name);
 }
 
 function renderLogs() {
@@ -1451,6 +1488,7 @@ function severity(event) {
 }
 
 async function addProject() {
+  if (!confirmDiscardDrafts()) return;
   try {
     let picked;
     try {
@@ -1490,7 +1528,7 @@ function renderProvisionForm() {
     </div>
     ${field('source', esc(source.name))}
     ${field('target', shortPath(pendingProvision.path))}
-    <div class="form-grid" data-provision-editor>
+    <div class="form-grid" data-dirty-scope data-provision-editor>
       <input class="full" data-field="project" placeholder="project name" value="${esc(pendingProvision.project)}">
       <div class="field-label full">env names</div>
       <div class="full check-grid">
@@ -1509,8 +1547,11 @@ function renderProvisionForm() {
       </div>
     </div>`;
   bindDropdowns(pane);
+  bindDirtyTracking(pane);
   pane.querySelector('[data-provision-cancel]').addEventListener('click', () => {
+    if (!confirmDiscardDrafts()) return;
     pendingProvision = null;
+    clearEditorDirty();
     renderOverview();
   });
   pane.querySelector('[data-provision-create]').addEventListener('click', createProvisionProject);
@@ -1536,6 +1577,7 @@ async function createProvisionProject() {
     const result = await api('/api/projects/provision', { method: 'POST', body: JSON.stringify(body) });
     pendingProvision = null;
     selectedProject = result.project;
+    clearEditorDirty();
     await load();
   } catch (error) {
     alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
@@ -1546,6 +1588,7 @@ function bindDetectedProjectSetup(project) {
   const btn = document.querySelector('[data-setup-detected]');
   if (!btn) return;
   btn.addEventListener('click', async () => {
+    if (!confirmDiscardDrafts()) return;
     try {
       btn.disabled = true;
       btn.textContent = 'setting up';
@@ -1560,6 +1603,80 @@ function bindDetectedProjectSetup(project) {
       btn.textContent = 'setup app';
     }
   });
+}
+
+function bindProjectControls(project) {
+  document.querySelectorAll('[data-lock-project]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!window.confirm(`Lock Ward session for ${project.name}?`)) return;
+      try {
+        await api(`/api/projects/${encodeURIComponent(project.name)}/lock`, { method: 'POST', body: '{}' });
+        await reloadAfterExternalMutation();
+      } catch (error) {
+        alert(error.data && error.data.fixCommand ? `${error.message}\n${error.data.fixCommand}` : error.message);
+      }
+    });
+  });
+  document.querySelectorAll('[data-lock-all]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!window.confirm('Lock all Ward sessions?')) return;
+      try {
+        await api('/api/sessions/lock-all', { method: 'POST', body: '{}' });
+        await reloadAfterExternalMutation();
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+  });
+  document.querySelectorAll('[data-copy-unlock]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const command = unlockCommand(project);
+      try {
+        await navigator.clipboard.writeText(command);
+        document.getElementById('edit-status').textContent = 'unlock command copied';
+      } catch (_) {
+        window.prompt('Copy unlock command', command);
+      }
+    });
+  });
+  document.querySelectorAll('[data-remove-project]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirmDiscardDrafts()) return;
+      const typed = window.prompt(`Remove ${project.name} from Ward? Type the project name to confirm.`);
+      if (typed !== project.name) return;
+      try {
+        await api(`/api/projects/${encodeURIComponent(project.name)}/remove`, {
+          method: 'POST',
+          body: JSON.stringify({ confirm: project.name, exportPath: '.env.export', restoreEnv: false })
+        });
+        selectedProject = null;
+        clearEditorDirty();
+        await load();
+      } catch (error) {
+        alert(error.data && error.data.fixCommand ? `${error.message}\n${error.data.fixCommand}` : error.message);
+      }
+    });
+  });
+}
+
+function unlockCommand(project) {
+  if (project.packageName || project.parentProject) {
+    const app = project.packageName || project.name.split(':').pop();
+    return `ward unlock --app ${shellQuote(app)} --ttl 8h`;
+  }
+  return `ward unlock --project ${shellQuote(project.name)} --ttl 8h`;
+}
+
+function shellQuote(value) {
+  if (/^[A-Za-z0-9_:\-./]+$/.test(value)) return value;
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
+}
+
+function formatDateTime(value) {
+  if (!value) return 'unknown';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString();
 }
 
 function setupSourceProject() {
@@ -1600,6 +1717,11 @@ function renderNotifications() {
   panel.querySelectorAll('[data-deny-notification]').forEach(button => {
     button.addEventListener('click', async () => {
       await denyNotification(button.dataset.notificationId, button.dataset.notificationKind);
+    });
+  });
+  panel.querySelectorAll('[data-dismiss-notification]').forEach(button => {
+    button.addEventListener('click', async () => {
+      await dismissNotification(button.dataset.notificationId);
     });
   });
   panel.querySelectorAll('[data-copy-command]').forEach(button => {
@@ -1659,6 +1781,9 @@ function notificationActions(notification) {
   if (notification.canDeny) {
     html += `<button class="btn danger" data-deny-notification="${id}" data-notification-kind="${esc(notification.kind)}">deny</button>`;
   }
+  if (notification.canDismiss) {
+    html += `<button class="btn" data-dismiss-notification="${id}">dismiss</button>`;
+  }
   html += '</div>';
   return html;
 }
@@ -1680,7 +1805,7 @@ async function approveNotification(id, scope) {
         body: JSON.stringify({ scope, confirmCritical: notification.kind === 'criticalApproval' })
       });
     }
-    await load();
+    await reloadAfterExternalMutation();
   } catch (error) {
     alert(error.data && error.data.fixCommand ? `${error.message}\\n${error.data.fixCommand}` : error.message);
   }
@@ -1690,7 +1815,16 @@ async function denyNotification(id, kind) {
   try {
     const path = kind === 'worktreeApproval' ? `/api/worktrees/${encodeURIComponent(id)}/deny` : `/api/approvals/${encodeURIComponent(id)}/deny`;
     await api(path, { method: 'POST', body: '{}' });
-    await load();
+    await reloadAfterExternalMutation();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function dismissNotification(id) {
+  try {
+    await api(`/api/notifications/${encodeURIComponent(id)}/dismiss`, { method: 'POST', body: '{}' });
+    await reloadAfterExternalMutation();
   } catch (error) {
     alert(error.message);
   }
@@ -1704,6 +1838,94 @@ function timeAgo(value) {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `${minutes}m`;
   return `${Math.round(minutes / 60)}h`;
+}
+
+function bindDirtyTracking(root = document) {
+  root.querySelectorAll('[data-dirty-scope]').forEach(scope => {
+    if (scope.dataset.dirtyBound === 'true') return;
+    scope.dataset.dirtyBound = 'true';
+    scope.addEventListener('input', markEditorDirty);
+    scope.addEventListener('change', markEditorDirty);
+    scope.addEventListener('ward:dropdown-change', markEditorDirty);
+    scope.addEventListener('focusin', updateEditStatus);
+    scope.addEventListener('focusout', () => setTimeout(updateEditStatus, 0));
+  });
+}
+
+function markEditorDirty() {
+  editState.dirty = true;
+  editState.refreshDeferred = false;
+  updateEditStatus();
+}
+
+function clearEditorDirty() {
+  editState.dirty = false;
+  editState.refreshDeferred = false;
+  updateEditStatus();
+}
+
+function hasEditorFocus() {
+  const active = document.activeElement;
+  return Boolean(active && active.closest && active.closest('[data-dirty-scope]'));
+}
+
+function shouldPauseAutoRefresh() {
+  return editState.dirty || hasEditorFocus();
+}
+
+function confirmDiscardDrafts() {
+  if (!editState.dirty) return true;
+  if (!window.confirm('Discard unsaved changes?')) return false;
+  clearEditorDirty();
+  return true;
+}
+
+async function guardedLoad(options = {}) {
+  const manual = Boolean(options.manual);
+  if (manual) {
+    if (!confirmDiscardDrafts()) return;
+  } else if (shouldPauseAutoRefresh()) {
+    editState.refreshDeferred = true;
+    updateEditStatus();
+    return;
+  }
+  editState.refreshDeferred = false;
+  updateEditStatus();
+  await load();
+}
+
+async function reloadAfterExternalMutation() {
+  if (shouldPauseAutoRefresh()) {
+    await refreshNotificationsOnly();
+    editState.refreshDeferred = true;
+    updateEditStatus();
+    return;
+  }
+  await load();
+}
+
+async function refreshNotificationsOnly() {
+  notifications = await api('/api/notifications');
+  renderNotificationBadge();
+  if (notificationsOpen) renderNotifications();
+}
+
+function updateEditStatus() {
+  const status = document.getElementById('edit-status');
+  if (!status) return;
+  if (editState.dirty) {
+    status.textContent = 'unsaved changes';
+  } else if (editState.refreshDeferred || hasEditorFocus()) {
+    status.textContent = 'refresh paused while editing';
+  } else {
+    status.textContent = '';
+  }
+}
+
+function startAutoRefresh() {
+  window.setInterval(() => {
+    guardedLoad().catch(error => console.warn('dashboard refresh failed', error));
+  }, autoRefreshMs);
 }
 
 function bindNotificationStream() {
@@ -1780,7 +2002,9 @@ function esc(value) {
     .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-document.getElementById('refresh-btn').addEventListener('click', load);
+document.getElementById('refresh-btn').addEventListener('click', () => {
+  guardedLoad({ manual: true }).catch(error => alert(error.message));
+});
 document.getElementById('add-project-btn').addEventListener('click', addProject);
 document.getElementById('notifications-btn').addEventListener('click', event => {
   event.stopPropagation();
@@ -1788,6 +2012,11 @@ document.getElementById('notifications-btn').addEventListener('click', event => 
 });
 bindSplitter();
 document.addEventListener('click', event => {
+  const linkEl = event.target.closest('a[href]');
+  if (linkEl && !confirmDiscardDrafts()) {
+    event.preventDefault();
+    return;
+  }
   if (notificationsOpen && !event.target.closest('#notification-wrap')) toggleNotifications(false);
   if (!event.target.closest('[data-dropdown]')) closeDropdowns();
 });
@@ -1798,7 +2027,7 @@ load().catch(error => {
   document.getElementById('detail-pane').innerHTML = `<div class="finding"><div class="finding-header"><span class="sev-crit">error</span></div><div class="finding-msg">${esc(error.message)}</div></div>`;
 });
 bindNotificationStream();
-setInterval(load, 5000);
+startAutoRefresh();
 </script>
 </body>
 </html>

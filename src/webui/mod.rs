@@ -27,7 +27,7 @@ use crate::{
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
-    notifications, project_store,
+    notifications, project_store, project_teardown,
     registry::{self, RegisteredProject},
     teams, workspace, worktrees,
 };
@@ -128,6 +128,7 @@ struct ProjectView {
     env_names: Vec<String>,
     vault_keys_verified: bool,
     broker_session_active: bool,
+    broker_session_expires_at: Option<chrono::DateTime<chrono::Utc>>,
     store_snapshot: Option<project_store::ProjectStoreSummary>,
     team: teams::TeamSummary,
 }
@@ -201,6 +202,20 @@ struct ProjectProvisionRequest {
     agents: Vec<String>,
     #[serde(default)]
     members: Vec<teams::TeamMemberInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveProjectRequest {
+    confirm: String,
+    #[serde(default = "default_remove_export_path")]
+    export_path: PathBuf,
+    #[serde(default)]
+    restore_env: bool,
+}
+
+fn default_remove_export_path() -> PathBuf {
+    PathBuf::from(".env.export")
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,7 +510,25 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             respond_project_provision_result(req, result);
         }
         (Method::Post, _) => {
-            if let Some((request_id, action)) = approval_action_route(&path) {
+            if let Some((notification_id, action)) = notification_action_route(&path) {
+                let result = notification_action(notification_id, &action);
+                respond_json_result(req, result);
+            } else if path == "/api/sessions/lock-all" {
+                let result = lock_all_sessions();
+                respond_json_result(req, result);
+            } else if let Some((project, action)) = project_action_route(&path) {
+                match action.as_str() {
+                    "lock" => {
+                        let result = lock_project_session(&project);
+                        respond_json_result(req, result);
+                    }
+                    "remove" => {
+                        let result = remove_project_from_dashboard(&project, &mut req);
+                        respond_broker_project_result(req, result, "project_remove_failed");
+                    }
+                    _ => respond_not_found(req),
+                }
+            } else if let Some((request_id, action)) = approval_action_route(&path) {
                 let result = approval_action(&mut req, request_id, &action);
                 respond_approval_result(req, result);
             } else if let Some((request_id, action)) = worktree_action_route(&path) {
@@ -948,6 +981,27 @@ fn profile_env_route(path: &str) -> Option<(String, String)> {
     }
 }
 
+fn project_action_route(path: &str) -> Option<(String, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "projects", project, action] if *action == "lock" || *action == "remove" => {
+            Some((url_decode(project), (*action).to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn notification_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "notifications", notification_id, action] if *action == "dismiss" => Some((
+            uuid::Uuid::parse_str(notification_id).ok()?,
+            (*action).to_string(),
+        )),
+        _ => None,
+    }
+}
+
 fn approval_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match parts.as_slice() {
@@ -1065,6 +1119,56 @@ fn worktree_action(request_id: uuid::Uuid, action: &str) -> Result<Value> {
         }
         _ => anyhow::bail!("unknown worktree action: {action}"),
     }
+}
+
+fn notification_action(notification_id: uuid::Uuid, action: &str) -> Result<Value> {
+    match action {
+        "dismiss" => Ok(serde_json::to_value(notifications::dismiss_notification(
+            notification_id,
+        )?)?),
+        _ => anyhow::bail!("unknown notification action: {action}"),
+    }
+}
+
+fn lock_project_session(project: &str) -> Result<broker::BrokerProjectLockStatus> {
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    broker::lock_project(project, &registered.vault)
+}
+
+fn lock_all_sessions() -> Result<Value> {
+    let revoked_session_grants = crate::grants::revoke_session_grants()?;
+    let cleared_unlock_sessions = crate::unlock::clear_all_unlocks()?;
+    broker::stop()?;
+    Ok(json!({
+        "status": "locked",
+        "revokedSessionGrants": revoked_session_grants,
+        "clearedUnlockSessions": cleared_unlock_sessions,
+    }))
+}
+
+fn remove_project_from_dashboard(
+    project: &str,
+    req: &mut tiny_http::Request,
+) -> Result<project_teardown::ProjectTeardownOutcome> {
+    let requested: RemoveProjectRequest = read_json_body(req)?;
+    if requested.confirm != project {
+        anyhow::bail!("project removal requires confirm to equal the project name");
+    }
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    broker::remove_project_from_active_session(
+        project,
+        &registered.vault,
+        requested.export_path,
+        requested.restore_env,
+    )
 }
 
 fn team_view(project: &str) -> Result<teams::TeamRecord> {
@@ -1695,14 +1799,15 @@ fn project_view(
         Err(error) => format!("unavailable: {error}"),
     };
 
-    let broker_session_active = broker_status
-        .map(|status| {
-            status
-                .sessions
-                .iter()
-                .any(|session| session.project == name && same_path(&session.vault, &project.vault))
-        })
-        .unwrap_or(false);
+    let broker_session_expires_at = broker_status.and_then(|status| {
+        status
+            .sessions
+            .iter()
+            .filter(|session| session.project == name && same_path(&session.vault, &project.vault))
+            .map(|session| session.expires_at)
+            .max()
+    });
+    let broker_session_active = broker_session_expires_at.is_some();
 
     let mut vault_keys_verified = false;
     if broker_session_active {
@@ -1731,6 +1836,7 @@ fn project_view(
         env_names: env_names.into_iter().collect(),
         vault_keys_verified,
         broker_session_active,
+        broker_session_expires_at,
         store_snapshot: project_store::show_summary(name).ok(),
         team: teams::summary(name)?,
     })
@@ -1785,22 +1891,23 @@ fn discovered_project_view(
         workspace::WorkspaceSetupStatus::NeedsEnv => "needs env".to_string(),
         workspace::WorkspaceSetupStatus::NotConfigured => "not configured".to_string(),
     };
-    let broker_session_active = broker_status
-        .map(|status| {
-            status.sessions.iter().any(|session| {
-                session.project == package.project_name
-                    && same_path(
-                        &session.vault,
-                        &package.path.join(config::DEFAULT_VAULT_FILE),
-                    )
+    let package_vault = package.path.join(config::DEFAULT_VAULT_FILE);
+    let broker_session_expires_at = broker_status.and_then(|status| {
+        status
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.project == package.project_name && same_path(&session.vault, &package_vault)
             })
-        })
-        .unwrap_or(false);
+            .map(|session| session.expires_at)
+            .max()
+    });
+    let broker_session_active = broker_session_expires_at.is_some();
 
     Ok(ProjectView {
         name: package.project_name.clone(),
         path: package.path.clone(),
-        vault: package.path.join(config::DEFAULT_VAULT_FILE),
+        vault: package_vault,
         active: active_project == Some(package.project_name.as_str()),
         config_status,
         setup_status: workspace_setup_status_label(&package.setup_status).to_string(),
@@ -1821,6 +1928,7 @@ fn discovered_project_view(
         env_names: env_names.into_iter().collect(),
         vault_keys_verified: false,
         broker_session_active,
+        broker_session_expires_at,
         store_snapshot: None,
         team: teams::summary(&package.project_name)?,
     })
@@ -2712,6 +2820,18 @@ mod tests {
             worktree_action_route(&format!("/api/worktrees/{request_id}/deny")),
             Some((request_id, "deny".to_string()))
         );
+        assert_eq!(
+            notification_action_route(&format!("/api/notifications/{request_id}/dismiss")),
+            Some((request_id, "dismiss".to_string()))
+        );
+        assert_eq!(
+            project_action_route("/api/projects/demo/lock"),
+            Some(("demo".to_string(), "lock".to_string()))
+        );
+        assert_eq!(
+            project_action_route("/api/projects/demo/remove"),
+            Some(("demo".to_string(), "remove".to_string()))
+        );
     }
 
     #[test]
@@ -2744,6 +2864,19 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("/api/notifications/stream"));
         assert!(DASHBOARD_HTML.contains("/api/approvals/"));
         assert!(DASHBOARD_HTML.contains("/api/worktrees/"));
+        assert!(DASHBOARD_HTML.contains("/api/sessions/lock-all"));
+        assert!(DASHBOARD_HTML.contains("data-lock-project"));
+        assert!(DASHBOARD_HTML.contains("data-remove-project"));
+        assert!(DASHBOARD_HTML.contains("data-dismiss-notification"));
+        assert!(DASHBOARD_HTML.contains("isValidEnvName"));
+        assert!(DASHBOARD_HTML.contains("data-dirty-scope"));
+        assert!(DASHBOARD_HTML.contains("bindDirtyTracking"));
+        assert!(DASHBOARD_HTML.contains("guardedLoad"));
+        assert!(DASHBOARD_HTML.contains("startAutoRefresh"));
+        assert!(DASHBOARD_HTML.contains("Discard unsaved changes?"));
+        assert!(DASHBOARD_HTML.contains("refresh paused while editing"));
+        assert!(DASHBOARD_HTML.contains("renderNotificationBadge();"));
+        assert!(!DASHBOARD_HTML.contains("setInterval(load, 5000)"));
         assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
         assert!(DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
         assert!(WARD_LOGO_DARK_SVG.contains("<rect"));

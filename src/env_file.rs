@@ -54,13 +54,22 @@ pub fn export_env_file(
     passphrase: &str,
     force: bool,
 ) -> Result<()> {
+    export_env_file_with_key(output, vault_path, passphrase, force)
+}
+
+pub fn export_env_file_with_key(
+    output: &Path,
+    vault_path: &Path,
+    decrypt_key: &str,
+    force: bool,
+) -> Result<()> {
     if output.exists() && !force {
         anyhow::bail!(
             "{} already exists; pass --force to overwrite",
             output.display()
         );
     }
-    let plaintext = vault::decrypt_vault_file(vault_path, passphrase)?;
+    let plaintext = vault::decrypt_vault_file(vault_path, decrypt_key)?;
     ensure_not_locked_marker(&plaintext, vault_path)?;
     write_plaintext_env(output, &plaintext, false)
 }

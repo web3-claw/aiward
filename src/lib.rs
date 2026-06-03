@@ -21,6 +21,7 @@ pub mod notifications;
 pub mod pending_requests;
 pub mod policy;
 pub mod project_store;
+pub mod project_teardown;
 pub mod recovery;
 pub mod registry;
 pub mod runner;

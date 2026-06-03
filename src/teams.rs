@@ -147,6 +147,15 @@ pub fn write_record(record: &TeamRecord) -> Result<PathBuf> {
     Ok(path)
 }
 
+pub fn remove_record(project: &str) -> Result<bool> {
+    let path = record_path(project);
+    if !path.exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    Ok(true)
+}
+
 pub fn summary(project: &str) -> Result<TeamSummary> {
     let record = load_or_default(project)?;
     Ok(summary_for_record(&record))

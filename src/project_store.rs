@@ -118,6 +118,15 @@ pub fn show_summary(project: &str) -> Result<ProjectStoreSummary> {
     Ok(summary_for_record(&record))
 }
 
+pub fn remove_record(project: &str) -> Result<bool> {
+    let path = record_path(project);
+    if !path.exists() {
+        return Ok(false);
+    }
+    fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    Ok(true)
+}
+
 pub fn diagnostics(project: &str) -> Result<ProjectStoreDiagnostics> {
     let path = record_path(project);
     if !path.exists() {

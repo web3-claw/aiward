@@ -28,9 +28,10 @@ use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
     approvals::{ApprovalScope, ApprovalSource},
-    config, detection, env_file, fs_util, logs, modes, project_store, recovery, registry,
+    config, detection, env_file, fs_util, grants, logs, modes, project_store, project_teardown,
+    recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
-    teams, vault,
+    teams, unlock, vault,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +85,16 @@ pub struct BrokerProjectProvisionStatus {
     pub profiles: Vec<String>,
     pub agents: Vec<String>,
     pub store: project_store::ProjectStoreSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerProjectLockStatus {
+    pub project: String,
+    pub broker_session_removed: bool,
+    pub revoked_session_grants: usize,
+    pub cleared_unlock_sessions: usize,
+    pub cancelled_human_commands: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +189,10 @@ pub enum ListKeysAuthorization {
 enum BrokerRequest {
     Ping,
     Stop,
+    LockProject {
+        project: String,
+        vault: PathBuf,
+    },
     Unlock {
         project: String,
         vault: PathBuf,
@@ -236,6 +251,12 @@ enum BrokerRequest {
         #[serde(default)]
         members: Vec<teams::TeamMemberInput>,
     },
+    RemoveProject {
+        project: String,
+        vault: PathBuf,
+        export_path: PathBuf,
+        restore_env: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -266,6 +287,12 @@ enum BrokerResponse {
     },
     ProjectProvision {
         status: BrokerProjectProvisionStatus,
+    },
+    ProjectLock {
+        status: BrokerProjectLockStatus,
+    },
+    ProjectTeardown {
+        status: project_teardown::ProjectTeardownOutcome,
     },
     Error {
         reason: String,
@@ -310,6 +337,7 @@ struct HumanSessionEntry {
 }
 
 struct ActiveHumanCommand {
+    project: String,
     cancellation: Arc<AtomicBool>,
     child_pid: Arc<AtomicU32>,
 }
@@ -714,6 +742,45 @@ pub fn stop() -> Result<()> {
     }
 }
 
+pub fn lock_project(project: &str, vault: &Path) -> Result<BrokerProjectLockStatus> {
+    ensure_running()?;
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::LockProject {
+        project: project.to_string(),
+        vault: vault.to_path_buf(),
+    })? {
+        BrokerResponse::ProjectLock { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn remove_project_from_active_session(
+    project: &str,
+    vault: &Path,
+    export_path: PathBuf,
+    restore_env: bool,
+) -> Result<project_teardown::ProjectTeardownOutcome> {
+    ensure_running()?;
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::RemoveProject {
+        project: project.to_string(),
+        vault: vault.to_path_buf(),
+        export_path,
+        restore_env,
+    })? {
+        BrokerResponse::ProjectTeardown { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
 pub fn setup_project_with_active_passphrase(
     source_project: &str,
     source_vault: &Path,
@@ -923,6 +990,22 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             }
             write_response(&mut stream, &BrokerResponse::Ok)?;
             return Ok(true);
+        }
+        BrokerRequest::LockProject { project, vault } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            match lock_project_in_state(&state, &project, &vault) {
+                Ok(status) => {
+                    write_response(&mut stream, &BrokerResponse::ProjectLock { status })?;
+                }
+                Err(error) => {
+                    let response = broker_error("project_lock_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
         }
         BrokerRequest::Unlock {
             project,
@@ -1275,6 +1358,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                         register_human_command(
                             &mut state.lock().expect("broker state poisoned"),
                             shell_pid,
+                            project.clone(),
                             Arc::clone(&cancellation),
                             Arc::clone(&child_pid),
                         );
@@ -1517,6 +1601,46 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 }
                 Err(error) => {
                     let response = broker_error("project_provision_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
+        BrokerRequest::RemoveProject {
+            project,
+            vault,
+            export_path,
+            restore_env,
+        } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            let material = {
+                let state = state.lock().expect("broker state poisoned");
+                active_project_material(&state, &project, &vault)
+            };
+            match material.and_then(|material| {
+                let registry = registry::list_projects()?;
+                let registered = registry
+                    .projects
+                    .get(&project)
+                    .with_context(|| format!("project {project} is not registered"))?;
+                project_teardown::teardown_project(project_teardown::ProjectTeardownRequest {
+                    project: project.clone(),
+                    path: registered.path.clone(),
+                    vault: vault.clone(),
+                    export_path,
+                    restore_env,
+                    decrypt_key: material.decrypt_key,
+                })
+            }) {
+                Ok(status) => {
+                    discard_project_runtime_after_teardown(&state, &project, &vault);
+                    write_response(&mut stream, &BrokerResponse::ProjectTeardown { status })?;
+                }
+                Err(error) => {
+                    let response = broker_error("unlock_required", error.to_string());
                     write_response(&mut stream, &response)?;
                 }
             }
@@ -2271,6 +2395,7 @@ fn executable_hash(path: &Path) -> Result<Vec<u8>> {
 fn register_human_command(
     state: &mut BrokerState,
     shell_pid: u32,
+    project: String,
     cancellation: Arc<AtomicBool>,
     child_pid: Arc<AtomicU32>,
 ) {
@@ -2279,6 +2404,7 @@ fn register_human_command(
     state.human_commands.entry(shell_pid).or_default().insert(
         command_id,
         ActiveHumanCommand {
+            project,
             cancellation,
             child_pid,
         },
@@ -2318,6 +2444,38 @@ fn cancel_human_commands(state: &mut BrokerState, shell_pid: u32) {
             }
         }
     }
+}
+
+fn cancel_project_human_commands(state: &mut BrokerState, project: &str) -> usize {
+    let mut cancelled = 0;
+    let shell_pids = state.human_commands.keys().copied().collect::<Vec<_>>();
+    let mut empty_shells = Vec::new();
+    for shell_pid in shell_pids {
+        let Some(commands) = state.human_commands.get_mut(&shell_pid) else {
+            continue;
+        };
+        let command_ids = commands
+            .iter()
+            .filter_map(|(id, command)| (command.project == project).then_some(*id))
+            .collect::<Vec<_>>();
+        for command_id in command_ids {
+            if let Some(command) = commands.remove(&command_id) {
+                cancelled += 1;
+                command.cancellation.store(true, Ordering::SeqCst);
+                let child_pid = command.child_pid.load(Ordering::SeqCst);
+                if child_pid != 0 {
+                    terminate_process_group(child_pid);
+                }
+            }
+        }
+        if commands.is_empty() {
+            empty_shells.push(shell_pid);
+        }
+    }
+    for shell_pid in empty_shells {
+        state.human_commands.remove(&shell_pid);
+    }
+    cancelled
 }
 
 fn cancel_all_human_commands(state: &mut BrokerState) {
@@ -2475,6 +2633,57 @@ fn restore_all_sessions(state: &Arc<Mutex<BrokerState>>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn lock_project_in_state(
+    state: &Arc<Mutex<BrokerState>>,
+    project: &str,
+    vault: &Path,
+) -> Result<BrokerProjectLockStatus> {
+    let key = session_key(project, vault);
+    let restore_material = {
+        let state = state.lock().expect("broker state poisoned");
+        state.sessions.get(&key).and_then(|session| {
+            session.session_key.as_ref().map(|session_key| {
+                (
+                    session.vault.clone(),
+                    session_key.clone(),
+                    session.passphrase.clone(),
+                )
+            })
+        })
+    };
+    if let Some((vault, session_key, passphrase)) = restore_material {
+        restore_vault_from_session(&vault, &session_key, &passphrase).context(format!(
+            "failed to restore {} before locking project",
+            vault.display()
+        ))?;
+    }
+    let (broker_session_removed, cancelled_human_commands) = {
+        let mut state = state.lock().expect("broker state poisoned");
+        let removed = state.sessions.remove(&key).is_some();
+        let cancelled = cancel_project_human_commands(&mut state, project);
+        (removed, cancelled)
+    };
+    let revoked_session_grants = grants::revoke_project_session_grants(project)?;
+    let cleared_unlock_sessions = unlock::clear_project_unlocks(project)?;
+    Ok(BrokerProjectLockStatus {
+        project: project.to_string(),
+        broker_session_removed,
+        revoked_session_grants,
+        cleared_unlock_sessions,
+        cancelled_human_commands,
+    })
+}
+
+fn discard_project_runtime_after_teardown(
+    state: &Arc<Mutex<BrokerState>>,
+    project: &str,
+    vault: &Path,
+) {
+    let mut state = state.lock().expect("broker state poisoned");
+    state.sessions.remove(&session_key(project, vault));
+    cancel_project_human_commands(&mut state, project);
 }
 
 /// Decrypts the session-encrypted vault and re-writes it with the original passphrase.
