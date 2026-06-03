@@ -27,8 +27,7 @@ use crate::{
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
-    notifications,
-    project_store,
+    notifications, project_store,
     registry::{self, RegisteredProject},
     workspace, worktrees,
 };

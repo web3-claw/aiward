@@ -1,7 +1,8 @@
 [package]
 name = "aiward"
-version = "0.5.18"
+version = "0.5.19"
 edition = "2021"
+rust-version = "1.86"
 description = "Local-first AI secret firewall for development environments."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/aiWardsh/aiward"
@@ -47,7 +48,7 @@ sha2 = "0.10"
 tempfile = "3.10"
 uuid = { version = "1.8", features = ["serde", "v4"] }
 zeroize = "1.8"
-ratatui = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_28", "underline-color"] }
 crossterm = { version = "0.28", features = ["event-stream"] }
 indicatif = "0.17"
 tiny_http = "0.12"
