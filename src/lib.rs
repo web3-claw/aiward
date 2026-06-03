@@ -4,6 +4,7 @@ pub mod approval_receipts;
 pub mod approvals;
 pub mod broker;
 pub mod cli;
+pub mod cloud;
 pub mod config;
 pub mod context;
 pub mod dashboard;

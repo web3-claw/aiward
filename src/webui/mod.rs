@@ -23,7 +23,7 @@ use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
-    approvals, broker,
+    approvals, broker, cloud,
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
@@ -85,6 +85,17 @@ struct DashboardStatus {
     instances: Vec<DashboardInstance>,
     broker: broker::BrokerStatus,
     human: HumanRuntimeView,
+    cloud: cloud::CloudDashboardStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudDashboardView {
+    status: cloud::CloudDashboardStatus,
+    teams: Vec<cloud::TeamView>,
+    catalog: Option<cloud::CloudCatalog>,
+    audit: Vec<cloud::CloudAuditEvent>,
+    auth_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -451,6 +462,19 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             respond_notifications_stream(req);
         }
         (Method::Get, "/api/dashboard/status") => respond_json_result(req, dashboard_status()),
+        (Method::Get, "/api/cloud") => respond_json_result(req, cloud_dashboard_view()),
+        (Method::Get, "/api/cloud/status") => respond_json_result(req, cloud::dashboard_status()),
+        (Method::Get, "/api/cloud/teams") => {
+            respond_json_result(req, cloud::list_teams(&cloud::default_db_path()))
+        }
+        (Method::Get, "/api/cloud/catalog") => respond_json_result(req, cloud_catalog_view()),
+        (Method::Get, "/api/cloud/audit/events") => {
+            let team = query_param(&query, "teamId");
+            respond_json_result(
+                req,
+                cloud::list_audit_events(&cloud::default_db_path(), team.as_deref()),
+            )
+        }
         (Method::Get, _) => {
             if let Some(project) = team_project_route(&path) {
                 respond_json_result(req, team_view(&project));
@@ -823,6 +847,7 @@ fn is_dashboard_page_route(path: &str) -> bool {
     path == "/"
         || path == "/logs"
         || path == "/team"
+        || path == "/cloud"
         || project_logs_route(path).is_some()
         || project_team_route(path).is_some()
 }
@@ -1547,7 +1572,59 @@ fn dashboard_status() -> Result<DashboardStatus> {
         instances: running_instances()?,
         broker: broker::status()?,
         human: human_runtime_view(),
+        cloud: cloud::dashboard_status()?,
     })
+}
+
+fn cloud_dashboard_view() -> Result<CloudDashboardView> {
+    let status = cloud::dashboard_status()?;
+    let teams = if status.db_exists {
+        cloud::list_teams(&cloud::default_db_path())?
+    } else {
+        Vec::new()
+    };
+    let catalog = cloud_catalog_option()?;
+    let auth_required = catalog.is_none();
+    let audit = if status.db_exists {
+        cloud::list_audit_events(&cloud::default_db_path(), None)?
+    } else {
+        Vec::new()
+    };
+    Ok(CloudDashboardView {
+        status,
+        teams,
+        catalog,
+        audit,
+        auth_required,
+    })
+}
+
+fn cloud_catalog_view() -> Result<Value> {
+    Ok(match cloud_catalog_option()? {
+        Some(catalog) => json!({
+            "authenticated": true,
+            "catalog": catalog,
+        }),
+        None => json!({
+            "authenticated": false,
+            "catalog": null,
+            "fixCommand": format!("ward auth login --cloud-url {}", cloud::default_cloud_url()),
+        }),
+    })
+}
+
+fn cloud_catalog_option() -> Result<Option<cloud::CloudCatalog>> {
+    let Ok(auth) = cloud::load_any_auth_session() else {
+        return Ok(None);
+    };
+    if !cloud::default_db_path().is_file() {
+        return Ok(None);
+    }
+    Ok(Some(cloud::catalog(
+        &cloud::default_db_path(),
+        &auth.account_email,
+        &auth.device_id,
+    )?))
 }
 
 fn dashboard_projects() -> Result<Vec<ProjectView>> {
@@ -2622,6 +2699,7 @@ mod tests {
         assert!(is_dashboard_page_route("/"));
         assert!(is_dashboard_page_route("/logs"));
         assert!(is_dashboard_page_route("/team"));
+        assert!(is_dashboard_page_route("/cloud"));
         assert!(is_dashboard_page_route("/projects/demo/logs"));
         assert!(is_dashboard_page_route("/projects/demo/team"));
         assert!(profile_env_route("/api/projects/demo").is_none());
@@ -2656,6 +2734,9 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
         assert!(DASHBOARD_HTML.contains("notifications-btn"));
         assert!(DASHBOARD_HTML.contains("id=\"team-link\""));
+        assert!(DASHBOARD_HTML.contains("id=\"cloud-link\""));
+        assert!(DASHBOARD_HTML.contains("renderCloud"));
+        assert!(DASHBOARD_HTML.contains("/api/cloud"));
         assert!(DASHBOARD_HTML.contains("/api/teams/projects/"));
         assert!(DASHBOARD_HTML.contains("renderTeam"));
         assert!(DASHBOARD_HTML.contains("data-save-team-policy"));
