@@ -15,11 +15,11 @@ use serde_json::Value;
 use crate::{
     agents, anomaly,
     approvals::{self, ApprovalChannel, ApprovalDecision, ApprovalScope},
-    broker, config, context, detection, env_file, git_context, grants,
+    broker, cloud, config, context, detection, env_file, git_context, grants,
     logs::{self as audit_logs, self as logs, LogKind},
     modes, notifications, pending_requests,
     policy::{self, AccessRequest, ApprovalMode},
-    recovery, registry,
+    project_store, recovery, registry,
     runner::{self, RunCommandRequest},
     term, unlock, vault, workspace, workspace_target, worktrees,
 };
@@ -62,6 +62,8 @@ pub struct Cli {
 pub enum Commands {
     /// Initialize, import, register, and create short profiles.
     Setup {
+        #[command(subcommand)]
+        command: Option<SetupCommand>,
         #[arg(long)]
         yes: bool,
         #[arg(long)]
@@ -123,6 +125,21 @@ pub enum Commands {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Inspect the local encrypted project store.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+    /// Sign in to a Ward local-cloud account.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Manage the local cloud-shaped team backend.
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
     },
     /// Manage the current project's dotenv vault and locked .env file.
     Env {
@@ -420,6 +437,15 @@ pub enum Commands {
         #[arg(long)]
         token: String,
     },
+    #[command(hide = true, name = "__cloud-dev-server")]
+    CloudDevServer {
+        #[arg(long)]
+        port: u16,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        db: PathBuf,
+    },
     #[command(hide = true, name = "__human-guardian")]
     HumanGuardian {
         #[arg(long)]
@@ -449,6 +475,136 @@ pub enum ProjectsCommand {
     Use { project: String },
     /// Remove a project from the global registry.
     Remove { project: String },
+    /// Provision a new project from selected envs in an unlocked source project.
+    Provision {
+        #[arg(long = "from")]
+        from_project: String,
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        name: String,
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
+        #[arg(long = "env")]
+        env_names: Vec<String>,
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SetupCommand {
+    /// Import an invited cloud project/environment into this folder.
+    Login {
+        #[arg(long, default_value_t = cloud::default_cloud_url())]
+        cloud_url: String,
+        #[arg(long)]
+        team: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        environment: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StoreCommand {
+    /// List encrypted project-store snapshots.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one encrypted project-store snapshot summary.
+    Show {
+        project: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh a project-store snapshot from an active broker session.
+    Refresh {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Create or select a local cloud account and device.
+    Login {
+        #[arg(long, default_value_t = cloud::default_cloud_url())]
+        cloud_url: String,
+        #[arg(long)]
+        email: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        device_name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CloudCommand {
+    /// Manage the local cloud-shaped backend.
+    Dev {
+        #[command(subcommand)]
+        command: CloudDevCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CloudDevCommand {
+    /// Start the localhost cloud-dev service.
+    Start {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        foreground: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop the localhost cloud-dev service.
+    Stop {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show localhost cloud-dev status.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Publish selected envs from a local Ward project into the local cloud-dev database.
+    Publish {
+        #[arg(long, default_value_t = cloud::default_cloud_url())]
+        cloud_url: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        team: String,
+        #[arg(long)]
+        cloud_project: Option<String>,
+        #[arg(long, default_value = "development")]
+        environment: String,
+        #[arg(long = "env")]
+        env_names: Vec<String>,
+        #[arg(long = "profile")]
+        profiles: Vec<String>,
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        #[arg(long = "member")]
+        members: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -566,6 +722,27 @@ pub enum EnvCommand {
         app: Option<String>,
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// Ask a human to add a missing env key without exposing the value to the agent.
+    RequestSet {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        wait_for_approval: bool,
+        #[arg(long, default_value = "30m")]
+        approval_timeout: String,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        no_prompt: bool,
     },
     /// Set one encrypted env value with KEY=value syntax.
     Set {
@@ -730,6 +907,7 @@ pub enum RecoveryCommand {
 pub fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Setup {
+            command,
             yes,
             project,
             source,
@@ -744,6 +922,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             apps,
             all,
         } => {
+            if let Some(command) = command {
+                return setup_command(command);
+            }
             let options = SetupOptions {
                 yes,
                 project,
@@ -776,6 +957,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         Commands::Use { project } => use_project(&project),
         Commands::Projects { command } => projects_command(command),
         Commands::Config { command } => config_command(command),
+        Commands::Store { command } => store_command(command),
+        Commands::Auth { command } => auth_command(command),
+        Commands::Cloud { command } => cloud_command(command),
         Commands::Env { command } => env_command(command),
         Commands::Request {
             project,
@@ -982,6 +1166,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
         } => recovery_command(project, app, command),
         Commands::Dashboard { command } => dashboard_command(command),
         Commands::DashboardServer { port, token } => crate::webui::serve_standalone(port, token),
+        Commands::CloudDevServer { port, token, db } => cloud::serve_standalone(port, token, db),
         Commands::Human {
             project,
             app,
@@ -1185,19 +1370,6 @@ struct LogsUnlockEvent<'a> {
     project: &'a str,
     vault: &'a Path,
     expires_at: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TeardownEvent<'a> {
-    #[serde(rename = "type")]
-    event_type: &'static str,
-    project: &'a str,
-    export_path: &'a Path,
-    removed_files: Vec<String>,
-    removed_grants: usize,
-    removed_pending_requests: usize,
-    cleared_unlock_sessions: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1572,6 +1744,19 @@ fn setup(options: SetupOptions) -> Result<()> {
             recovery_plaintext = vault::decrypt_vault_file(&vault_path, passphrase).ok();
         }
     }
+    if let (Some(passphrase), Some(plaintext)) = (
+        setup_passphrase_final.as_deref(),
+        recovery_plaintext.as_deref(),
+    ) {
+        warn_store_refresh_failure(project_store::refresh_from_plaintext(
+            &project_config.project,
+            &cwd,
+            &vault_path,
+            &project_config,
+            plaintext,
+            passphrase,
+        ));
+    }
 
     let unlock_session = if options.no_unlock {
         term::section("Session");
@@ -1793,6 +1978,15 @@ fn import(source: PathBuf, explicit_vault: Option<PathBuf>) -> Result<()> {
     vault::decrypt_vault_file(&written, &passphrase)?;
     env_file::lock_env_file(&source, &written)?;
     registry::update_project_vault(&config.project, cwd.clone(), written.clone())?;
+    let resolved = registry::ResolvedProject {
+        name: config.project.clone(),
+        path: cwd.clone(),
+        vault: written.clone(),
+    };
+    warn_store_refresh_failure(refresh_project_store_with_passphrase(
+        &resolved,
+        &passphrase,
+    ));
     let event = VaultImportEvent {
         event_type: "vault.import",
         project: &config.project,
@@ -1867,6 +2061,332 @@ fn projects_command(command: ProjectsCommand) -> Result<()> {
                 println!("Removed project {project}");
             } else {
                 println!("Project not found: {project}");
+            }
+        }
+        ProjectsCommand::Provision {
+            from_project,
+            path,
+            name,
+            profiles,
+            env_names,
+            agents,
+            json,
+        } => {
+            let cwd = env::current_dir()?;
+            let source = registry::resolve_project(Some(&from_project), &cwd)?;
+            let status =
+                broker::provision_project_from_active_session(broker::ProjectProvisionRequest {
+                    source_project: source.name,
+                    source_vault: source.vault,
+                    target_path: path,
+                    project: name,
+                    profiles,
+                    env_names,
+                    agents,
+                    members: Vec::new(),
+                })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!("Provisioned {}", status.project);
+                println!("Path: {}", status.path.display());
+                println!("Vault: {}", status.vault.display());
+                println!("Env: {}", status.env_names.join(", "));
+                println!("Profiles: {}", status.profiles.join(", "));
+                if !status.agents.is_empty() {
+                    println!("Agents: {}", status.agents.join(", "));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn setup_command(command: SetupCommand) -> Result<()> {
+    match command {
+        SetupCommand::Login {
+            cloud_url,
+            team,
+            project,
+            environment,
+            json,
+        } => {
+            let cwd = env::current_dir()?;
+            let auth = cloud::load_auth_session(&cloud_url)?;
+            let pin = vault::read_existing_passphrase()?;
+            let imported = cloud::import_from_cloud(cloud::SetupLoginOptions {
+                db: cloud::default_db_path(),
+                cloud_url,
+                auth,
+                pin,
+                target_dir: cwd,
+                team,
+                project,
+                environment,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&imported)?);
+            } else {
+                term::guided_header(
+                    "setup login",
+                    &imported.local_project,
+                    &imported.path,
+                    "Ward imported this cloud-managed project into a local encrypted vault.",
+                );
+                term::section("Cloud");
+                term::ok(&format!(
+                    "{} / {} / {}",
+                    imported.team, imported.project, imported.environment
+                ));
+                term::section("Vault");
+                term::ok(&format!(
+                    "encrypted vault written  {}",
+                    imported.vault.display()
+                ));
+                term::ok(&format!(
+                    "env names imported  {}",
+                    imported.env_names.join(", ")
+                ));
+                term::section("Project");
+                term::ok(".ward.json compiled from cloud policies");
+                term::ok("project registered");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn auth_command(command: AuthCommand) -> Result<()> {
+    match command {
+        AuthCommand::Login {
+            cloud_url,
+            email,
+            name,
+            device_name,
+            json,
+        } => {
+            let email = match email {
+                Some(email) => email,
+                None => inquire::Text::new("Account email").prompt()?,
+            };
+            let pin =
+                vault::read_new_pin("New local Ward cloud PIN", "Confirm local Ward cloud PIN")?;
+            let session = cloud::login_account(cloud::AuthLoginOptions {
+                cloud_url,
+                email,
+                name,
+                device_name,
+                pin,
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&cloud::CloudAuthSummary::from(session))?
+                );
+            } else {
+                term::guided_header(
+                    "auth login",
+                    &session.account_email,
+                    Path::new("."),
+                    "Ward created a local cloud account session and encrypted this device key with your PIN.",
+                );
+                term::section("Account");
+                term::ok(&format!("signed in as {}", session.account_email));
+                term::section("Device");
+                term::ok(&format!("registered {}", session.device_id));
+                term::next("run: ward setup login");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cloud_command(command: CloudCommand) -> Result<()> {
+    match command {
+        CloudCommand::Dev { command } => cloud_dev_command(command),
+    }
+}
+
+fn cloud_dev_command(command: CloudDevCommand) -> Result<()> {
+    match command {
+        CloudDevCommand::Start {
+            port,
+            db,
+            foreground,
+            json,
+        } => {
+            cloud::start_dev_server(cloud::CloudDevStartOptions {
+                port,
+                db,
+                foreground,
+                json,
+            })?;
+        }
+        CloudDevCommand::Stop { json } => {
+            cloud::stop_dev_server(cloud::CloudDevStopOptions { json })?;
+        }
+        CloudDevCommand::Status { json } => {
+            cloud::status(json)?;
+        }
+        CloudDevCommand::Publish {
+            cloud_url,
+            project,
+            team,
+            cloud_project,
+            environment,
+            env_names,
+            profiles,
+            agents,
+            members,
+            json,
+        } => publish_cloud_environment(
+            cloud_url,
+            project,
+            team,
+            cloud_project,
+            environment,
+            env_names,
+            profiles,
+            agents,
+            members,
+            json,
+        )?,
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_cloud_environment(
+    cloud_url: String,
+    project: Option<String>,
+    team: String,
+    cloud_project: Option<String>,
+    environment: String,
+    env_names: Vec<String>,
+    profiles: Vec<String>,
+    agents: Vec<String>,
+    members: Vec<String>,
+    json: bool,
+) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let source = registry::resolve_project(project.as_deref(), &cwd)?;
+    let auth = cloud::load_auth_session(&cloud_url)?;
+    let owner_pin = vault::read_existing_passphrase()?;
+    let source_passphrase = if source.vault.exists() {
+        vault::read_existing_passphrase()?
+    } else {
+        anyhow::bail!("source vault is missing: {}", source.vault.display());
+    };
+    let member_inputs = parse_cloud_members(members)?;
+    let published = cloud::publish_environment(cloud::PublishEnvironmentOptions {
+        db: cloud::default_db_path(),
+        cloud_url,
+        owner: auth,
+        owner_pin,
+        source_project: source.name.clone(),
+        source_path: source.path.clone(),
+        source_vault: source.vault.clone(),
+        source_passphrase,
+        team_name: team,
+        project_name: cloud_project.unwrap_or_else(|| source.name.clone()),
+        environment_name: environment,
+        env_names,
+        profile_names: profiles,
+        agent_names: agents,
+        members: member_inputs,
+    })?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&published)?);
+    } else {
+        println!(
+            "Published {} / {} / {}",
+            published.team.name, published.project.name, published.environment.name
+        );
+        println!("Env: {}", published.environment.env_names.join(", "));
+        println!("Wrapped devices: {}", published.wrapped_devices);
+        if !published.rewrap_required_members.is_empty() {
+            println!(
+                "Rewrap required after device login: {}",
+                published.rewrap_required_members.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn parse_cloud_members(values: Vec<String>) -> Result<Vec<cloud::CloudMemberInput>> {
+    values
+        .into_iter()
+        .map(|value| {
+            let mut parts = value.splitn(2, ':');
+            let email = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("member must be formatted as email:role")?
+                .to_string();
+            let role = match parts.next().map(str::trim).unwrap_or("developer") {
+                "owner" => cloud::CloudRole::Owner,
+                "admin" => cloud::CloudRole::Admin,
+                "developer" => cloud::CloudRole::Developer,
+                "viewer" => cloud::CloudRole::Viewer,
+                other => anyhow::bail!("unsupported cloud member role: {other}"),
+            };
+            Ok(cloud::CloudMemberInput { email, role })
+        })
+        .collect()
+}
+
+fn store_command(command: StoreCommand) -> Result<()> {
+    match command {
+        StoreCommand::List { json } => {
+            let summaries = project_store::list_summaries()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summaries)?);
+            } else if summaries.is_empty() {
+                println!("No project-store snapshots.");
+            } else {
+                for summary in summaries {
+                    let stale = if summary.stale { " stale" } else { "" };
+                    println!(
+                        "{} env={} profiles={} agents={} updated={}{}",
+                        summary.project_name,
+                        summary.env_names.len(),
+                        summary.profile_names.len(),
+                        summary.agent_names.len(),
+                        summary.updated_at,
+                        stale
+                    );
+                }
+            }
+        }
+        StoreCommand::Show { project, json } => {
+            let summary = project_store::show_summary(&project)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+            } else {
+                println!("Project: {}", summary.project_name);
+                println!("Path: {}", summary.path.display());
+                println!("Vault: {}", summary.vault.display());
+                println!("Env: {}", summary.env_names.join(", "));
+                println!("Profiles: {}", summary.profile_names.join(", "));
+                println!("Agents: {}", summary.agent_names.join(", "));
+                println!("Updated: {}", summary.updated_at);
+                println!("Stale: {}", summary.stale);
+            }
+        }
+        StoreCommand::Refresh { project, json } => {
+            let cwd = env::current_dir()?;
+            let resolved = registry::resolve_project(project.as_deref(), &cwd)?;
+            let status =
+                broker::snapshot_project_from_active_session(&resolved.name, &resolved.vault)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            } else {
+                println!(
+                    "Refreshed project-store snapshot for {} at {}",
+                    status.store.project_name, status.store.updated_at
+                );
             }
         }
     }
@@ -2458,21 +2978,157 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
 
 fn env_command(command: EnvCommand) -> Result<()> {
     match command {
-        EnvCommand::List { project, app, all } => {
+        EnvCommand::List {
+            project,
+            app,
+            all,
+            json,
+            no_prompt,
+        } => {
+            if no_prompt {
+                if !json {
+                    anyhow::bail!("ward env list --no-prompt requires --json");
+                }
+                let targets = resolve_env_targets(project, app, all)?;
+                let mut projects = Vec::new();
+                for target in targets {
+                    let names =
+                        broker::list_vault_keys_from_active_session(&target.name, &target.vault)
+                            .with_context(|| {
+                                format!(
+                                    "env list requires an active broker session for {}",
+                                    target.name
+                                )
+                            })?;
+                    projects.push(serde_json::json!({
+                        "project": target.name,
+                        "envNames": names,
+                    }));
+                }
+                if all {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "ok",
+                            "projects": projects,
+                        }))?
+                    );
+                } else {
+                    let project = projects
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| serde_json::json!({ "project": "", "envNames": [] }));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "ok",
+                            "project": project.get("project").cloned().unwrap_or_default(),
+                            "envNames": project.get("envNames").cloned().unwrap_or_default(),
+                        }))?
+                    );
+                }
+                return Ok(());
+            }
             let passphrase = vault::read_existing_passphrase()?;
             let targets = resolve_env_targets_with_passphrase(project, app, all, &passphrase)?;
+            let mut json_projects = Vec::new();
             for target in targets {
                 let resolved = target.resolved_project();
                 let names = with_passphrase_vault_access(&resolved, &passphrase, || {
                     env_file::list_env_names(&resolved.vault, &passphrase)
                 })?;
-                for name in names {
-                    if all {
-                        println!("{}\t{name}", resolved.name);
-                    } else {
-                        println!("{name}");
+                if json {
+                    json_projects.push(serde_json::json!({
+                        "project": resolved.name,
+                        "envNames": names,
+                    }));
+                } else {
+                    for name in names {
+                        if all {
+                            println!("{}\t{name}", resolved.name);
+                        } else {
+                            println!("{name}");
+                        }
                     }
                 }
+            }
+            if json {
+                if all {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "ok",
+                            "projects": json_projects,
+                        }))?
+                    );
+                } else {
+                    let project = json_projects
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| serde_json::json!({ "project": "", "envNames": [] }));
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "ok",
+                            "project": project.get("project").cloned().unwrap_or_default(),
+                            "envNames": project.get("envNames").cloned().unwrap_or_default(),
+                        }))?
+                    );
+                }
+            }
+        }
+        EnvCommand::RequestSet {
+            project,
+            app,
+            key,
+            wait_for_approval,
+            approval_timeout,
+            json,
+            no_prompt,
+        } => {
+            if no_prompt && !json {
+                anyhow::bail!("ward env request-set --no-prompt requires --json");
+            }
+            let key = key.trim().to_string();
+            validate_env_key(&key)?;
+            let target = resolve_env_project(project, app)?;
+            let fix_command = format!(
+                "ward env set --project {} {}=<value> && ward env lock --project {}",
+                shell_quote(&target.name),
+                key,
+                shell_quote(&target.name)
+            );
+            let notification = notifications::create_block_notification(
+                notifications::NotificationKind::VaultKeyMissing,
+                &target.name,
+                None,
+                Some("ward env request-set"),
+                std::slice::from_ref(&key),
+                &[],
+                "warning",
+                format!("Env key {key} is missing from the vault. A human must add its value."),
+                Some(&fix_command),
+            )?;
+            if wait_for_approval {
+                wait_for_env_key(&target, &key, &approval_timeout)?;
+                notifications::remove_block_notification(notification.id)?;
+                print_env_request_set_response(
+                    json,
+                    "env_available",
+                    &target.name,
+                    &key,
+                    notification.id,
+                    Some(&fix_command),
+                )?;
+            } else {
+                print_env_request_set_response(
+                    json,
+                    "notification_created",
+                    &target.name,
+                    &key,
+                    notification.id,
+                    Some(&fix_command),
+                )?;
             }
         }
         EnvCommand::Set {
@@ -2483,7 +3139,12 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let passphrase = vault::read_existing_passphrase()?;
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let key = with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::set_env_value(&resolved.vault, &passphrase, &assignment)
+                let key = env_file::set_env_value(&resolved.vault, &passphrase, &assignment)?;
+                warn_store_refresh_failure(refresh_project_store_with_passphrase(
+                    &resolved,
+                    &passphrase,
+                ));
+                Ok(key)
             })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.set", &resolved, None, Some(&key))?;
@@ -2493,7 +3154,12 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let passphrase = vault::read_existing_passphrase()?;
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let removed = with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::unset_env_value(&resolved.vault, &passphrase, &key)
+                let removed = env_file::unset_env_value(&resolved.vault, &passphrase, &key)?;
+                warn_store_refresh_failure(refresh_project_store_with_passphrase(
+                    &resolved,
+                    &passphrase,
+                ));
+                Ok(removed)
             })?;
             env_file::refresh_locked_env(&resolved.path, &resolved.vault)?;
             log_env_file_event("env.unset", &resolved, None, Some(&key))?;
@@ -2535,7 +3201,12 @@ fn env_command(command: EnvCommand) -> Result<()> {
             let resolved = resolve_env_project_with_passphrase(project, app, &passphrase)?;
             let source = project_relative_path(&resolved.path, source);
             with_passphrase_vault_access(&resolved, &passphrase, || {
-                env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)
+                env_file::lock_plaintext_source(&source, &resolved.vault, &passphrase)?;
+                warn_store_refresh_failure(refresh_project_store_with_passphrase(
+                    &resolved,
+                    &passphrase,
+                ));
+                Ok(())
             })?;
             log_env_file_event("env.lock", &resolved, Some(&source), None)?;
             println!("Re-encrypted vault and locked {}", source.display());
@@ -2596,6 +3267,28 @@ fn resolve_env_project_with_passphrase(
     Ok(resolved)
 }
 
+fn resolve_env_project(
+    project: Option<String>,
+    app: Option<String>,
+) -> Result<registry::ResolvedProject> {
+    let cwd = env::current_dir()?;
+    let target =
+        workspace_target::resolve_one(&workspace_target::TargetSelector::one(project, app), &cwd)?;
+    Ok(target.resolved_project())
+}
+
+fn resolve_env_targets(
+    project: Option<String>,
+    app: Option<String>,
+    all: bool,
+) -> Result<Vec<workspace_target::WorkspaceTarget>> {
+    let cwd = env::current_dir()?;
+    workspace_target::resolve_many(
+        &workspace_target::TargetSelector { project, app, all },
+        &cwd,
+    )
+}
+
 fn resolve_env_targets_with_passphrase(
     project: Option<String>,
     app: Option<String>,
@@ -2615,6 +3308,81 @@ fn resolve_env_targets_with_passphrase(
         }
     }
     Ok(targets)
+}
+
+fn validate_env_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .chars()
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        || !key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        anyhow::bail!("invalid env name: {key}");
+    }
+    Ok(())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.' | '/'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn wait_for_env_key(target: &registry::ResolvedProject, key: &str, timeout: &str) -> Result<()> {
+    let timeout = unlock::parse_ttl(timeout)?;
+    let deadline = chrono::Utc::now() + timeout;
+    loop {
+        if let Ok(names) = broker::list_vault_keys_from_active_session(&target.name, &target.vault)
+        {
+            if names.iter().any(|name| name == key) {
+                return Ok(());
+            }
+        }
+        if chrono::Utc::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for env key {key} to be added to {}",
+                target.name
+            );
+        }
+        thread::sleep(StdDuration::from_millis(500));
+    }
+}
+
+fn print_env_request_set_response(
+    json_output: bool,
+    status: &str,
+    project: &str,
+    key: &str,
+    notification_id: uuid::Uuid,
+    fix_command: Option<&str>,
+) -> Result<()> {
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": status,
+                "project": project,
+                "envName": key,
+                "notificationId": notification_id,
+                "fixCommand": fix_command,
+            }))?
+        );
+    } else {
+        println!("{status}: {key} for {project}");
+        if let Some(command) = fix_command {
+            println!("Fix: {command}");
+        }
+    }
+    Ok(())
 }
 
 fn project_relative_path(project_path: &Path, path: PathBuf) -> PathBuf {
@@ -2671,6 +3439,26 @@ fn with_passphrase_vault_access<T>(
         }
     }
     result
+}
+
+fn refresh_project_store_with_passphrase(
+    resolved: &registry::ResolvedProject,
+    passphrase: &str,
+) -> Result<project_store::ProjectStoreSummary> {
+    let config = config::read_project_config(&resolved.path)?;
+    project_store::refresh_from_vault(
+        &resolved.name,
+        &resolved.path,
+        &resolved.vault,
+        &config,
+        passphrase,
+    )
+}
+
+fn warn_store_refresh_failure(result: Result<project_store::ProjectStoreSummary>) {
+    if let Err(error) = result {
+        eprintln!("Ward warning: project-store snapshot refresh failed: {error}");
+    }
 }
 
 fn remaining_session_ttl(
@@ -4172,6 +4960,47 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
         Err(e) => term::fail(&format!("registry resolve failed — {e}")),
     }
 
+    // ── project store ────────────────────────────────────────────────────────
+    term::section("project store");
+    match registry::resolve_project(None, &cwd) {
+        Ok(project) => {
+            match project_store::diagnostics(&project.name) {
+                Ok(diagnostics) if diagnostics.exists => {
+                    if diagnostics.stale {
+                        term::warn(&format!(
+                            "snapshot stale  {}",
+                            term::short_path(&diagnostics.path)
+                        ));
+                    } else {
+                        term::ok(&format!(
+                            "snapshot  {}",
+                            term::short_path(&diagnostics.path)
+                        ));
+                    }
+                    term::info(&format!(
+                        "env={} profiles={} agentPolicies={}",
+                        diagnostics.env_count,
+                        diagnostics.profile_count,
+                        diagnostics.agent_policy_count
+                    ));
+                }
+                Ok(diagnostics) => {
+                    term::warn("no local project-store snapshot");
+                    term::info(&format!("expected {}", term::short_path(&diagnostics.path)));
+                }
+                Err(error) => term::fail(&format!("project-store check failed — {error}")),
+            }
+            match broker::active_session_expiry(&project.name, &project.vault) {
+                Ok(Some(_)) => term::ok("active broker session can refresh/provision"),
+                Ok(None) => {
+                    term::warn("run ward unlock --ttl 8h to refresh/provision from this project")
+                }
+                Err(error) => term::fail(&format!("broker session check failed — {error}")),
+            }
+        }
+        Err(error) => term::fail(&format!("registry resolve failed — {error}")),
+    }
+
     // ── human mode ───────────────────────────────────────────────────────────
     term::section("human mode");
     let human = crate::human::runtime_diagnostics();
@@ -4418,7 +5247,12 @@ fn edit(project: Option<String>, app: Option<String>) -> Result<()> {
     )?;
     let resolved = target.resolved_project();
     with_passphrase_vault_access(&resolved, &passphrase, || {
-        vault::edit_vault_file(&resolved.vault, &passphrase)
+        vault::edit_vault_file(&resolved.vault, &passphrase)?;
+        warn_store_refresh_failure(refresh_project_store_with_passphrase(
+            &resolved,
+            &passphrase,
+        ));
+        Ok(())
     })?;
     let event = VaultEditEvent {
         event_type: "vault.edit",
@@ -4646,6 +5480,14 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
 
     config::write_project_config(&cwd, &config, true)?;
     registry::update_project_vault(&project_name, cwd.clone(), new_vault.clone())?;
+    warn_store_refresh_failure(project_store::refresh_from_plaintext(
+        &project_name,
+        &cwd,
+        &new_vault,
+        &config,
+        &plaintext,
+        &passphrase,
+    ));
     env_file::refresh_locked_env(&cwd, &new_vault)?;
     config::ensure_gitignore(&cwd, true)?;
     println!("[ok] Vault rotated to {}", new_vault.display());
@@ -5427,16 +6269,6 @@ fn teardown(
     }
     let cwd = env::current_dir()?;
     let selector = workspace_target::TargetSelector::one(project, app);
-    let initial = workspace_target::resolve_one(&selector, &cwd)?.resolved_project();
-    let export_path = if restore_env && export_path == PathBuf::from(".env.export") {
-        PathBuf::from(".env")
-    } else {
-        export_path
-    };
-    let output = project_relative_path(&initial.path, export_path);
-    if output == initial.path.join(".env") && !restore_env {
-        anyhow::bail!("restoring plaintext .env requires --restore-env");
-    }
     if env::var_os("WARD_UNSAFE_TEST_PASSPHRASE").is_none() && !std::io::stdin().is_terminal() {
         anyhow::bail!(
             "teardown requires the vault PIN/passphrase; --yes only skips destructive confirmation and does not bypass secret export approval"
@@ -5448,85 +6280,22 @@ fn teardown(
     let resolved = workspace_target::resolve_one_with_passphrase(&selector, &cwd, &passphrase)?
         .resolved_project();
     with_passphrase_vault_access(&resolved, &passphrase, || {
-        env_file::export_env_file(&output, &resolved.vault, &passphrase, true)
+        vault::decrypt_vault_file(&resolved.vault, &passphrase)
     })?;
-    vault::validate_dotenv(&fs::read_to_string(&output)?)?;
-
-    let mut removed_files = Vec::new();
-    for path in [
-        resolved.path.join(config::PROJECT_CONFIG_FILE),
-        resolved.vault.clone(),
-    ] {
-        remove_project_file_if_exists(&path, &mut removed_files)?;
-    }
-    let env_path = resolved.path.join(".env");
-    remove_locked_env_if_needed(&env_path, &output, &mut removed_files)?;
-    for path in [
-        resolved.path.join(config::AGENT_INSTRUCTIONS_FILE),
-        resolved.path.join(config::CLAUDE_INSTRUCTIONS_FILE),
-    ] {
-        if remove_agent_instruction_section(&path)? {
-            removed_files.push(format!("updated {}", path.display()));
-        }
-    }
-    registry::remove_project(&resolved.name)?;
-    let removed_grants = grants::remove_project_grants(&resolved.name)?;
-    let removed_pending_requests = pending_requests::remove_project_requests(&resolved.name)?;
-    let cleared_unlock_sessions = unlock::clear_project_unlocks(&resolved.name)?;
-    let event = TeardownEvent {
-        event_type: "teardown.completed",
-        project: &resolved.name,
-        export_path: &output,
-        removed_files,
-        removed_grants,
-        removed_pending_requests,
-        cleared_unlock_sessions,
-    };
-    audit_logs::append_event(LogKind::Sessions, event)?;
-    println!("Exported plaintext env {}", output.display());
-    println!("Removed Ward project {}", resolved.name);
+    let outcome = crate::project_teardown::teardown_project(
+        crate::project_teardown::ProjectTeardownRequest {
+            project: resolved.name.clone(),
+            path: resolved.path.clone(),
+            vault: resolved.vault.clone(),
+            export_path,
+            restore_env,
+            decrypt_key: passphrase,
+        },
+    )?;
+    println!("Exported plaintext env {}", outcome.export_path.display());
+    println!("Removed Ward project {}", outcome.project);
     println!("Encrypted audit logs were preserved.");
     Ok(())
-}
-
-fn remove_locked_env_if_needed(
-    env_path: &Path,
-    output: &Path,
-    removed_files: &mut Vec<String>,
-) -> Result<()> {
-    let should_keep_env = env_path == output || !env_file::is_locked_env_file(env_path)?;
-    if should_keep_env {
-        return Ok(());
-    }
-    remove_project_file_if_exists(env_path, removed_files)
-}
-
-fn remove_project_file_if_exists(path: &Path, removed_files: &mut Vec<String>) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    fs::remove_file(path).context(format!("failed to remove {}", path.display()))?;
-    removed_files.push(path.display().to_string());
-    Ok(())
-}
-
-fn remove_agent_instruction_section(path: &Path) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let contents =
-        fs::read_to_string(path).context(format!("failed to read {}", path.display()))?;
-    let Some(index) = contents.find("<!-- ward-agent-instructions -->") else {
-        return Ok(false);
-    };
-    let retained = contents[..index].trim_end();
-    if retained.is_empty() {
-        fs::remove_file(path).context(format!("failed to remove {}", path.display()))?;
-    } else {
-        fs::write(path, format!("{retained}\n"))
-            .context(format!("failed to write {}", path.display()))?;
-    }
-    Ok(true)
 }
 
 fn unlock_logs(ttl: &str) -> Result<()> {
@@ -5611,15 +6380,22 @@ fn resolve_run_profile(
     allow_empty_env: bool,
 ) -> Result<ResolvedProfile> {
     if let Some(profile_name) = profile {
-        if !command.is_empty() || !env_names.is_empty() {
-            anyhow::bail!("--profile cannot be combined with explicit command args or --env");
+        if !env_names.is_empty() {
+            anyhow::bail!("--profile cannot be combined with --env");
         }
         let Some(profile) = config.profiles.get(profile_name) else {
             anyhow::bail!("profile {profile_name} is not defined in .ward.json");
         };
+        let mut command_args = split_profile_command(&profile.command);
+        command_args.extend(command);
+        let command_text = if command_args.is_empty() {
+            profile.command.clone()
+        } else {
+            command_args.join(" ")
+        };
         return Ok(ResolvedProfile {
-            command: profile.command.clone(),
-            command_args: split_profile_command(&profile.command),
+            command: command_text,
+            command_args,
             env_names: profile.env.clone(),
             action: action.or_else(|| Some(profile.action.clone())),
             default_scope: profile.default_scope,
@@ -5976,7 +6752,7 @@ fn print_run_vault_key_missing(
         findings: &evaluation.findings,
         risk: run_risk_summary(evaluation),
         message: "One or more approved env vars are not present in the vault.",
-        remediation: "Update .ward.json to request only vault-present keys, or run ward env unlock, add the missing key, then ward env lock.",
+        remediation: "Add/update a profile that covers this command and env name, or run ward env request-set --key <ENV_NAME> --wait-for-approval --json --no-prompt so a human can add the missing vault key.",
     };
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -6088,7 +6864,7 @@ fn execute_no_prompt_with_optional_wait(
                         evaluation,
                         "The approved request references env names that are not present in the vault.",
                         Some(
-                            "ward env unlock, add the missing key, then run ward env lock",
+                            "ward env request-set --key <ENV_NAME> --wait-for-approval --json --no-prompt",
                         ),
                     )?;
                     print_run_vault_key_missing(access, evaluation, missing_env)?;
@@ -7003,6 +7779,10 @@ mod tests {
     use crate::{
         config::ProjectConfig,
         policy::{AccessRequest, ApprovalMode, PolicyEvaluation},
+        project_teardown::{
+            remove_agent_instruction_section, remove_locked_env_if_needed,
+            remove_project_file_if_exists,
+        },
     };
     use clap::CommandFactory;
     use std::{
@@ -7271,6 +8051,7 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Setup {
+                command: None,
                 yes: true,
                 project: Some("kept".to_string()),
                 source: ".env".into(),
@@ -7493,6 +8274,7 @@ mod tests {
 
         let dispatch_conflict = dispatch(Cli {
             command: Commands::Setup {
+                command: None,
                 yes: true,
                 project: Some("demo".to_string()),
                 source: "missing.env".into(),
@@ -7753,6 +8535,7 @@ mod tests {
 
         dispatch(Cli {
             command: Commands::Setup {
+                command: None,
                 yes: true,
                 project: Some("demo".to_string()),
                 source: ".env".into(),
@@ -7823,6 +8606,8 @@ mod tests {
                 project: None,
                 app: None,
                 all: false,
+                json: false,
+                no_prompt: false,
             },
             EnvCommand::Set {
                 project: None,
@@ -9284,6 +10069,7 @@ mod tests {
             vault: ".env.vault".into(),
             presets: Vec::new(),
             profiles: std::collections::BTreeMap::new(),
+            agent_policies: std::collections::BTreeMap::new(),
             anomaly_detection: config::AnomalyDetectionConfig {
                 enabled: true,
                 working_hours_start: 8,
@@ -9342,6 +10128,24 @@ mod tests {
         .unwrap();
         assert_eq!(run_profile.command_args, vec!["pnpm", "payload", "migrate"]);
         assert_eq!(run_profile.default_scope, ApprovalScope::Branch);
+
+        let run_profile_with_args = resolve_run_profile(
+            &config,
+            Some("migrate"),
+            None,
+            Vec::new(),
+            vec!["--dry-run".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            run_profile_with_args.command_args,
+            vec!["pnpm", "payload", "migrate", "--dry-run"]
+        );
+        assert_eq!(
+            run_profile_with_args.command,
+            "pnpm payload migrate --dry-run"
+        );
 
         let missing_profile = resolve_profile(&config, Some("missing"), None, None, Vec::new())
             .unwrap_err()
@@ -9476,6 +10280,7 @@ mod tests {
             "unlock",
             "workspace",
             "config",
+            "store",
         ] {
             let rendered = command
                 .find_subcommand_mut(subcommand)
@@ -9543,6 +10348,28 @@ mod tests {
             ],
             vec!["ward", "projects", "use", "demo"],
             vec!["ward", "projects", "remove", "demo"],
+            vec![
+                "ward",
+                "projects",
+                "provision",
+                "--from",
+                "source",
+                "--path",
+                "./target",
+                "--name",
+                "target",
+                "--profile",
+                "dev",
+                "--env",
+                "DATABASE_URL",
+                "--agent",
+                "codex",
+                "--json",
+            ],
+            vec!["ward", "store", "list"],
+            vec!["ward", "store", "list", "--json"],
+            vec!["ward", "store", "show", "demo", "--json"],
+            vec!["ward", "store", "refresh", "--project", "demo", "--json"],
             vec!["ward", "workspace", "discover"],
             vec!["ward", "workspace", "discover", "--json"],
             vec!["ward", "env", "list", "--project", "demo"],
@@ -9697,6 +10524,58 @@ mod tests {
             vec!["ward", "dashboard", "stop", "--port", "7780"],
             vec!["ward", "dashboard", "status", "--json"],
             vec!["ward", "dashboard", "tui"],
+            vec![
+                "ward",
+                "auth",
+                "login",
+                "--cloud-url",
+                "http://127.0.0.1:8787",
+                "--email",
+                "owner@example.com",
+                "--json",
+            ],
+            vec![
+                "ward",
+                "setup",
+                "login",
+                "--cloud-url",
+                "http://127.0.0.1:8787",
+                "--team",
+                "team",
+                "--project",
+                "project",
+                "--environment",
+                "development",
+                "--json",
+            ],
+            vec!["ward", "cloud", "dev", "start", "--port", "8787", "--json"],
+            vec!["ward", "cloud", "dev", "status", "--json"],
+            vec!["ward", "cloud", "dev", "stop", "--json"],
+            vec![
+                "ward",
+                "cloud",
+                "dev",
+                "publish",
+                "--cloud-url",
+                "http://127.0.0.1:8787",
+                "--project",
+                "ward",
+                "--team",
+                "team",
+                "--cloud-project",
+                "project",
+                "--environment",
+                "development",
+                "--env",
+                "DATABASE_URL",
+                "--profile",
+                "dev",
+                "--agent",
+                "codex",
+                "--member",
+                "dev@example.com:developer",
+                "--json",
+            ],
             vec!["ward", "edit"],
             vec!["ward", "unlock", "--ttl", "1h"],
             vec!["ward", "lock"],
@@ -9836,6 +10715,7 @@ mod tests {
             format!(
                 "{:?}",
                 Commands::Setup {
+                    command: None,
                     yes: true,
                     project: Some("demo".to_string()),
                     source: ".env".into(),
@@ -9849,6 +10729,91 @@ mod tests {
                     workspace: false,
                     apps: Vec::new(),
                     all: false,
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Setup {
+                    command: Some(SetupCommand::Login {
+                        cloud_url: "http://127.0.0.1:8787".to_string(),
+                        team: Some("team".to_string()),
+                        project: Some("project".to_string()),
+                        environment: Some("development".to_string()),
+                        json: true,
+                    }),
+                    yes: false,
+                    project: None,
+                    source: ".env".into(),
+                    vault: ".env.vault".into(),
+                    commit_vault: false,
+                    ignore_vault: false,
+                    remove_plaintext: false,
+                    keep_plaintext: false,
+                    unlock_ttl: "8h".to_string(),
+                    no_unlock: false,
+                    workspace: false,
+                    apps: Vec::new(),
+                    all: false,
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Auth {
+                    command: AuthCommand::Login {
+                        cloud_url: "http://127.0.0.1:8787".to_string(),
+                        email: Some("owner@example.com".to_string()),
+                        name: None,
+                        device_name: None,
+                        json: true,
+                    },
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Cloud {
+                    command: CloudCommand::Dev {
+                        command: CloudDevCommand::Start {
+                            port: Some(8787),
+                            db: None,
+                            foreground: false,
+                            json: true,
+                        },
+                    },
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Cloud {
+                    command: CloudCommand::Dev {
+                        command: CloudDevCommand::Status { json: true },
+                    },
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Cloud {
+                    command: CloudCommand::Dev {
+                        command: CloudDevCommand::Stop { json: true },
+                    },
+                }
+            ),
+            format!(
+                "{:?}",
+                Commands::Cloud {
+                    command: CloudCommand::Dev {
+                        command: CloudDevCommand::Publish {
+                            cloud_url: "http://127.0.0.1:8787".to_string(),
+                            project: Some("ward".to_string()),
+                            team: "team".to_string(),
+                            cloud_project: Some("project".to_string()),
+                            environment: "development".to_string(),
+                            env_names: vec!["DATABASE_URL".to_string()],
+                            profiles: vec!["dev".to_string()],
+                            agents: vec!["codex".to_string()],
+                            members: vec!["dev@example.com:developer".to_string()],
+                            json: true,
+                        },
+                    },
                 }
             ),
             format!(
@@ -9979,7 +10944,7 @@ mod tests {
             format!("{:?}", DashboardCommand::Tui),
         ];
 
-        assert_eq!(commands.len(), 29);
+        assert_eq!(commands.len(), 35);
         for value in commands {
             assert!(!value.is_empty());
         }

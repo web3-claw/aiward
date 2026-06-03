@@ -217,6 +217,23 @@ pub fn deny_pending(id: uuid::Uuid) -> Result<bool> {
     Ok(false)
 }
 
+pub fn remove_project(project: &str) -> Result<usize> {
+    let mut state = load_state()?;
+    let removed = state
+        .projects
+        .remove(project)
+        .map(|project_state| {
+            project_state.allowed_roots.len()
+                + project_state.known_worktrees.len()
+                + project_state.pending.len()
+        })
+        .unwrap_or(0);
+    if removed > 0 {
+        save_state(&state)?;
+    }
+    Ok(removed)
+}
+
 pub fn evaluate_worktree(
     registered: &registry::RegisteredProject,
     project: &str,

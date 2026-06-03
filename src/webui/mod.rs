@@ -23,13 +23,13 @@ use std::os::unix::process::CommandExt;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
 use crate::{
-    approvals, broker,
+    approvals, broker, cloud,
     config::{self, ProfileConfig},
     fs_util, human,
     logs::{self, LogKind},
-    notifications,
+    notifications, project_store, project_teardown,
     registry::{self, RegisteredProject},
-    workspace, worktrees,
+    teams, workspace, worktrees,
 };
 
 const DEFAULT_PORT: u16 = 7777;
@@ -85,6 +85,17 @@ struct DashboardStatus {
     instances: Vec<DashboardInstance>,
     broker: broker::BrokerStatus,
     human: HumanRuntimeView,
+    cloud: cloud::CloudDashboardStatus,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CloudDashboardView {
+    status: cloud::CloudDashboardStatus,
+    teams: Vec<cloud::TeamView>,
+    catalog: Option<cloud::CloudCatalog>,
+    audit: Vec<cloud::CloudAuditEvent>,
+    auth_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,9 +124,13 @@ struct ProjectView {
     package_name: Option<String>,
     package_kind: Option<String>,
     profiles: Vec<ProfileView>,
+    agent_policies: Vec<AgentPolicyView>,
     env_names: Vec<String>,
     vault_keys_verified: bool,
     broker_session_active: bool,
+    broker_session_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    store_snapshot: Option<project_store::ProjectStoreSummary>,
+    team: teams::TeamSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +141,14 @@ struct ProfileView {
     env: Vec<String>,
     default_scope: crate::approvals::ApprovalScope,
     action: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentPolicyView {
+    agent: String,
+    profiles: Vec<String>,
+    env: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +186,59 @@ struct ProjectSetupRequest {
     path: PathBuf,
     project: Option<String>,
     source_project: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectProvisionRequest {
+    source_project: Option<String>,
+    path: PathBuf,
+    project: String,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
+    #[serde(default)]
+    agents: Vec<String>,
+    #[serde(default)]
+    members: Vec<teams::TeamMemberInput>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveProjectRequest {
+    confirm: String,
+    #[serde(default = "default_remove_export_path")]
+    export_path: PathBuf,
+    #[serde(default)]
+    restore_env: bool,
+}
+
+fn default_remove_export_path() -> PathBuf {
+    PathBuf::from(".env.export")
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamMemberRequest {
+    id: String,
+    name: Option<String>,
+    role: Option<teams::TeamRole>,
+    #[serde(default)]
+    agents: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TeamPolicyRequest {
+    name: String,
+    member_id: Option<String>,
+    #[serde(default)]
+    agents: Vec<String>,
+    #[serde(default)]
+    profiles: Vec<String>,
+    #[serde(default)]
+    env: Vec<String>,
 }
 
 pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
@@ -387,6 +463,9 @@ fn handle(mut req: tiny_http::Request, token: &str) {
 
     match (method, path.as_str()) {
         (Method::Get, "/api/projects") => respond_json_result(req, dashboard_projects()),
+        (Method::Get, "/api/store/projects") => {
+            respond_json_result(req, project_store::list_summaries())
+        }
         (Method::Get, "/api/events") => {
             let project = query_param(&query, "project");
             respond_json_result(req, Ok(load_all_events(project.as_deref())))
@@ -398,6 +477,26 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             respond_notifications_stream(req);
         }
         (Method::Get, "/api/dashboard/status") => respond_json_result(req, dashboard_status()),
+        (Method::Get, "/api/cloud") => respond_json_result(req, cloud_dashboard_view()),
+        (Method::Get, "/api/cloud/status") => respond_json_result(req, cloud::dashboard_status()),
+        (Method::Get, "/api/cloud/teams") => {
+            respond_json_result(req, cloud::list_teams(&cloud::default_db_path()))
+        }
+        (Method::Get, "/api/cloud/catalog") => respond_json_result(req, cloud_catalog_view()),
+        (Method::Get, "/api/cloud/audit/events") => {
+            let team = query_param(&query, "teamId");
+            respond_json_result(
+                req,
+                cloud::list_audit_events(&cloud::default_db_path(), team.as_deref()),
+            )
+        }
+        (Method::Get, _) => {
+            if let Some(project) = team_project_route(&path) {
+                respond_json_result(req, team_view(&project));
+            } else {
+                respond_not_found(req);
+            }
+        }
         (Method::Post, "/api/projects/pick-folder") => {
             let result = pick_project_folder(&mut req);
             respond_json_result(req, result);
@@ -406,16 +505,47 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             let result = setup_project_from_dashboard(&mut req);
             respond_project_setup_result(req, result);
         }
+        (Method::Post, "/api/projects/provision") => {
+            let result = provision_project_from_dashboard(&mut req);
+            respond_project_provision_result(req, result);
+        }
         (Method::Post, _) => {
-            if let Some((request_id, action)) = approval_action_route(&path) {
+            if let Some((notification_id, action)) = notification_action_route(&path) {
+                let result = notification_action(notification_id, &action);
+                respond_json_result(req, result);
+            } else if path == "/api/sessions/lock-all" {
+                let result = lock_all_sessions();
+                respond_json_result(req, result);
+            } else if let Some((project, action)) = project_action_route(&path) {
+                match action.as_str() {
+                    "lock" => {
+                        let result = lock_project_session(&project);
+                        respond_json_result(req, result);
+                    }
+                    "remove" => {
+                        let result = remove_project_from_dashboard(&project, &mut req);
+                        respond_broker_project_result(req, result, "project_remove_failed");
+                    }
+                    _ => respond_not_found(req),
+                }
+            } else if let Some((request_id, action)) = approval_action_route(&path) {
                 let result = approval_action(&mut req, request_id, &action);
                 respond_approval_result(req, result);
             } else if let Some((request_id, action)) = worktree_action_route(&path) {
                 let result = worktree_action(request_id, &action);
                 respond_json_result(req, result);
+            } else if let Some(project) = team_members_collection_route(&path) {
+                let result = create_team_member(&project, &mut req);
+                respond_team_result(req, result);
+            } else if let Some(project) = team_policies_collection_route(&path) {
+                let result = create_team_policy(&project, &mut req);
+                respond_team_result(req, result);
             } else if let Some(project) = profiles_collection_route(&path) {
                 let result = create_profile_policy(&project, &mut req);
                 respond_json_result(req, result);
+            } else if let Some(project) = store_snapshot_route(&path) {
+                let result = snapshot_project_from_dashboard(&project);
+                respond_project_snapshot_result(req, result);
             } else if let Some((project, profile)) = profile_env_route(&path) {
                 let result = update_profile_env(&project, &profile, &mut req);
                 respond_json_result(req, result);
@@ -424,7 +554,13 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             }
         }
         (Method::Patch, _) => {
-            if let Some((project, profile)) = profile_policy_route(&path) {
+            if let Some((project, member)) = team_member_route(&path) {
+                let result = update_team_member(&project, &member, &mut req);
+                respond_team_result(req, result);
+            } else if let Some((project, policy)) = team_policy_route(&path) {
+                let result = update_team_policy(&project, &policy, &mut req);
+                respond_team_result(req, result);
+            } else if let Some((project, profile)) = profile_policy_route(&path) {
                 let result = update_profile_policy(&project, &profile, &mut req);
                 respond_json_result(req, result);
             } else if let Some((project, profile)) = profile_env_route(&path) {
@@ -435,7 +571,13 @@ fn handle(mut req: tiny_http::Request, token: &str) {
             }
         }
         (Method::Delete, _) => {
-            if let Some((project, profile)) = profile_policy_route(&path) {
+            if let Some((project, member)) = team_member_route(&path) {
+                let result = delete_team_member(&project, &member);
+                respond_team_result(req, result);
+            } else if let Some((project, policy)) = team_policy_route(&path) {
+                let result = delete_team_policy(&project, &policy);
+                respond_team_result(req, result);
+            } else if let Some((project, profile)) = profile_policy_route(&path) {
                 let result = delete_profile_policy(&project, &profile);
                 respond_json_result(req, result);
             } else {
@@ -561,6 +703,87 @@ fn respond_approval_result(req: tiny_http::Request, result: Result<Value>) {
     }
 }
 
+fn respond_project_snapshot_result(
+    req: tiny_http::Request,
+    result: Result<broker::BrokerProjectSnapshotStatus>,
+) {
+    respond_broker_project_result(req, result, "project_snapshot_failed")
+}
+
+fn respond_project_provision_result(
+    req: tiny_http::Request,
+    result: Result<broker::BrokerProjectProvisionStatus>,
+) {
+    respond_broker_project_result(req, result, "project_provision_failed")
+}
+
+fn respond_team_result<T: Serialize>(req: tiny_http::Request, result: Result<T>) {
+    match result {
+        Ok(value) => respond_json(req, StatusCode(200), &value),
+        Err(error) => {
+            let message = error.to_string();
+            let unlock_required = message.contains("unlock_required")
+                || message.contains("missing broker unlock session")
+                || message.contains("expired broker unlock session")
+                || message.contains("active broker session required");
+            respond_json(
+                req,
+                if unlock_required {
+                    StatusCode(423)
+                } else {
+                    StatusCode(500)
+                },
+                &json!({
+                    "error": if unlock_required { "unlock_required" } else { "team_policy_failed" },
+                    "status": if unlock_required { "unlock_required" } else { "error" },
+                    "unlockRequired": unlock_required,
+                    "message": message,
+                    "fixCommand": if unlock_required { "ward unlock --ttl 8h" } else { "" }
+                }),
+            );
+        }
+    }
+}
+
+fn respond_broker_project_result<T: Serialize>(
+    req: tiny_http::Request,
+    result: Result<T>,
+    error_name: &'static str,
+) {
+    match result {
+        Ok(value) => respond_json(req, StatusCode(200), &value),
+        Err(error) => {
+            if let Some(broker_error) = error.downcast_ref::<broker::BrokerError>() {
+                if broker_error.reason() == "unlock_required"
+                    || broker_error
+                        .message()
+                        .contains("missing broker unlock session")
+                    || broker_error
+                        .message()
+                        .contains("expired broker unlock session")
+                {
+                    respond_json(
+                        req,
+                        StatusCode(423),
+                        &json!({
+                            "status": "unlock_required",
+                            "unlockRequired": true,
+                            "message": broker_error.message(),
+                            "fixCommand": "ward unlock --ttl 8h"
+                        }),
+                    );
+                    return;
+                }
+            }
+            respond_json(
+                req,
+                StatusCode(500),
+                &json!({ "error": error_name, "message": error.to_string() }),
+            );
+        }
+    }
+}
+
 fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value: &T) {
     let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     let response = Response::new(
@@ -654,13 +877,78 @@ fn query_param(query: &str, name: &str) -> Option<String> {
 }
 
 fn is_dashboard_page_route(path: &str) -> bool {
-    path == "/" || path == "/logs" || project_logs_route(path).is_some()
+    path == "/"
+        || path == "/logs"
+        || path == "/team"
+        || path == "/cloud"
+        || project_logs_route(path).is_some()
+        || project_team_route(path).is_some()
 }
 
 fn project_logs_route(path: &str) -> Option<String> {
     let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
     match parts.as_slice() {
         ["projects", project, "logs"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn project_team_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["projects", project, "team"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn store_snapshot_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "store", "projects", project, "snapshot"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn team_project_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "teams", "projects", project] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn team_members_collection_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "teams", "projects", project, "members"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn team_member_route(path: &str) -> Option<(String, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "teams", "projects", project, "members", member] => {
+            Some((url_decode(project), url_decode(member)))
+        }
+        _ => None,
+    }
+}
+
+fn team_policies_collection_route(path: &str) -> Option<String> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "teams", "projects", project, "policies"] => Some(url_decode(project)),
+        _ => None,
+    }
+}
+
+fn team_policy_route(path: &str) -> Option<(String, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "teams", "projects", project, "policies", policy] => {
+            Some((url_decode(project), url_decode(policy)))
+        }
         _ => None,
     }
 }
@@ -689,6 +977,27 @@ fn profile_env_route(path: &str) -> Option<(String, String)> {
         ["api", "projects", project, "profiles", profile, "env"] => {
             Some((url_decode(project), url_decode(profile)))
         }
+        _ => None,
+    }
+}
+
+fn project_action_route(path: &str) -> Option<(String, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "projects", project, action] if *action == "lock" || *action == "remove" => {
+            Some((url_decode(project), (*action).to_string()))
+        }
+        _ => None,
+    }
+}
+
+fn notification_action_route(path: &str) -> Option<(uuid::Uuid, String)> {
+    let parts = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    match parts.as_slice() {
+        ["api", "notifications", notification_id, action] if *action == "dismiss" => Some((
+            uuid::Uuid::parse_str(notification_id).ok()?,
+            (*action).to_string(),
+        )),
         _ => None,
     }
 }
@@ -810,6 +1119,220 @@ fn worktree_action(request_id: uuid::Uuid, action: &str) -> Result<Value> {
         }
         _ => anyhow::bail!("unknown worktree action: {action}"),
     }
+}
+
+fn notification_action(notification_id: uuid::Uuid, action: &str) -> Result<Value> {
+    match action {
+        "dismiss" => Ok(serde_json::to_value(notifications::dismiss_notification(
+            notification_id,
+        )?)?),
+        _ => anyhow::bail!("unknown notification action: {action}"),
+    }
+}
+
+fn lock_project_session(project: &str) -> Result<broker::BrokerProjectLockStatus> {
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    broker::lock_project(project, &registered.vault)
+}
+
+fn lock_all_sessions() -> Result<Value> {
+    let revoked_session_grants = crate::grants::revoke_session_grants()?;
+    let cleared_unlock_sessions = crate::unlock::clear_all_unlocks()?;
+    broker::stop()?;
+    Ok(json!({
+        "status": "locked",
+        "revokedSessionGrants": revoked_session_grants,
+        "clearedUnlockSessions": cleared_unlock_sessions,
+    }))
+}
+
+fn remove_project_from_dashboard(
+    project: &str,
+    req: &mut tiny_http::Request,
+) -> Result<project_teardown::ProjectTeardownOutcome> {
+    let requested: RemoveProjectRequest = read_json_body(req)?;
+    if requested.confirm != project {
+        anyhow::bail!("project removal requires confirm to equal the project name");
+    }
+    let registry = registry::list_projects()?;
+    let registered = registry
+        .projects
+        .get(project)
+        .with_context(|| format!("project {project} is not registered"))?;
+    broker::remove_project_from_active_session(
+        project,
+        &registered.vault,
+        requested.export_path,
+        requested.restore_env,
+    )
+}
+
+fn team_view(project: &str) -> Result<teams::TeamRecord> {
+    registered_project(project)?;
+    teams::load_or_default(project)
+}
+
+fn create_team_member(project: &str, req: &mut tiny_http::Request) -> Result<teams::TeamRecord> {
+    let requested: TeamMemberRequest = read_json_body(req)?;
+    mutate_team(project, |record, _registered| {
+        teams::upsert_member(
+            record,
+            teams::TeamMemberInput {
+                id: requested.id,
+                name: requested.name,
+                role: requested.role,
+                agents: requested.agents,
+            },
+            None,
+        )
+    })
+}
+
+fn update_team_member(
+    project: &str,
+    member: &str,
+    req: &mut tiny_http::Request,
+) -> Result<teams::TeamRecord> {
+    let requested: TeamMemberRequest = read_json_body(req)?;
+    mutate_team(project, |record, _registered| {
+        teams::upsert_member(
+            record,
+            teams::TeamMemberInput {
+                id: requested.id,
+                name: requested.name,
+                role: requested.role,
+                agents: requested.agents,
+            },
+            Some(member),
+        )
+    })
+}
+
+fn delete_team_member(project: &str, member: &str) -> Result<teams::TeamRecord> {
+    mutate_team(project, |record, _registered| {
+        teams::remove_member(record, member)
+    })
+}
+
+fn create_team_policy(project: &str, req: &mut tiny_http::Request) -> Result<teams::TeamRecord> {
+    let requested: TeamPolicyRequest = read_json_body(req)?;
+    mutate_team_policy(project, None, requested)
+}
+
+fn update_team_policy(
+    project: &str,
+    policy: &str,
+    req: &mut tiny_http::Request,
+) -> Result<teams::TeamRecord> {
+    let requested: TeamPolicyRequest = read_json_body(req)?;
+    mutate_team_policy(project, Some(policy), requested)
+}
+
+fn delete_team_policy(project: &str, policy: &str) -> Result<teams::TeamRecord> {
+    mutate_team(project, |record, registered| {
+        let previous = record.clone();
+        teams::remove_policy(record, policy)?;
+        apply_team_policies_to_project(project, registered, &previous, record)
+    })
+}
+
+fn mutate_team_policy(
+    project: &str,
+    existing_name: Option<&str>,
+    requested: TeamPolicyRequest,
+) -> Result<teams::TeamRecord> {
+    mutate_team(project, |record, registered| {
+        let previous = record.clone();
+        teams::upsert_policy(
+            record,
+            teams::TeamPolicyInput {
+                name: requested.name,
+                member_id: requested.member_id,
+                agents: requested.agents,
+                profiles: requested.profiles,
+                env: requested.env,
+            },
+            existing_name,
+        )?;
+        apply_team_policies_to_project(project, registered, &previous, record)
+    })
+}
+
+fn mutate_team(
+    project: &str,
+    mutate: impl FnOnce(&mut teams::TeamRecord, &RegisteredProject) -> Result<()>,
+) -> Result<teams::TeamRecord> {
+    let registered = registered_project(project)?;
+    ensure_active_project_session(project, &registered)?;
+    let mut record = teams::load_or_default(project)?;
+    let actor = teams::current_member_id();
+    if !teams::can_manage(&record, &actor) {
+        anyhow::bail!("team member {actor} is not allowed to manage project policies");
+    }
+    mutate(&mut record, &registered)?;
+    teams::write_record(&record)?;
+    Ok(record)
+}
+
+fn apply_team_policies_to_project(
+    project: &str,
+    registered: &RegisteredProject,
+    previous: &teams::TeamRecord,
+    next: &teams::TeamRecord,
+) -> Result<()> {
+    let mut cfg = config::read_project_config(&registered.path)?;
+    let mut managed_agents = teams::policy_agents(previous);
+    managed_agents.extend(teams::policy_agents(next));
+    for agent in managed_agents {
+        cfg.agent_policies.remove(&agent);
+    }
+    for policy in next.policies.values() {
+        for profile in &policy.profiles {
+            if !cfg.profiles.contains_key(profile) {
+                anyhow::bail!("profile {profile} does not exist in project {project}");
+            }
+        }
+        for agent in &policy.agents {
+            cfg.agent_policies.insert(
+                agent.clone(),
+                config::AgentPolicyConfig {
+                    profiles: policy.profiles.clone(),
+                    env: policy.env.clone(),
+                },
+            );
+        }
+    }
+    config::write_project_config(&registered.path, &cfg, true)?;
+    Ok(())
+}
+
+fn ensure_active_project_session(project: &str, registered: &RegisteredProject) -> Result<()> {
+    let status = broker::status().map_err(|err| {
+        anyhow::anyhow!(
+            "unlock_required: active broker session required to update team policies ({err})"
+        )
+    })?;
+    let active = status
+        .sessions
+        .iter()
+        .any(|session| session.project == project && same_path(&session.vault, &registered.vault));
+    if !active {
+        anyhow::bail!("unlock_required: active broker session required to update team policies");
+    }
+    Ok(())
+}
+
+fn registered_project(project: &str) -> Result<RegisteredProject> {
+    let registry = registry::list_projects()?;
+    registry
+        .projects
+        .get(project)
+        .cloned()
+        .with_context(|| format!("project {project} is not registered"))
 }
 
 fn update_profile_env(
@@ -1073,6 +1596,32 @@ fn setup_project_from_dashboard(
     )
 }
 
+fn snapshot_project_from_dashboard(project: &str) -> Result<broker::BrokerProjectSnapshotStatus> {
+    let cwd = std::env::current_dir()?;
+    let resolved = registry::resolve_project(Some(project), &cwd)?;
+    broker::snapshot_project_from_active_session(&resolved.name, &resolved.vault)
+}
+
+fn provision_project_from_dashboard(
+    req: &mut tiny_http::Request,
+) -> Result<broker::BrokerProjectProvisionStatus> {
+    let requested: ProjectProvisionRequest = read_json_body(req)?;
+    let target_path = requested.path;
+    let cwd = std::env::current_dir()?;
+    let source = registry::resolve_project(requested.source_project.as_deref(), &cwd)?;
+    let status = broker::provision_project_from_active_session(broker::ProjectProvisionRequest {
+        source_project: source.name,
+        source_vault: source.vault,
+        target_path,
+        project: requested.project,
+        profiles: requested.profiles,
+        env_names: requested.env,
+        agents: requested.agents,
+        members: requested.members,
+    })?;
+    Ok(status)
+}
+
 fn validate_dashboard_setup_target(path: &Path) -> Result<PathBuf> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !path.is_dir() {
@@ -1127,7 +1676,59 @@ fn dashboard_status() -> Result<DashboardStatus> {
         instances: running_instances()?,
         broker: broker::status()?,
         human: human_runtime_view(),
+        cloud: cloud::dashboard_status()?,
     })
+}
+
+fn cloud_dashboard_view() -> Result<CloudDashboardView> {
+    let status = cloud::dashboard_status()?;
+    let teams = if status.db_exists {
+        cloud::list_teams(&cloud::default_db_path())?
+    } else {
+        Vec::new()
+    };
+    let catalog = cloud_catalog_option()?;
+    let auth_required = catalog.is_none();
+    let audit = if status.db_exists {
+        cloud::list_audit_events(&cloud::default_db_path(), None)?
+    } else {
+        Vec::new()
+    };
+    Ok(CloudDashboardView {
+        status,
+        teams,
+        catalog,
+        audit,
+        auth_required,
+    })
+}
+
+fn cloud_catalog_view() -> Result<Value> {
+    Ok(match cloud_catalog_option()? {
+        Some(catalog) => json!({
+            "authenticated": true,
+            "catalog": catalog,
+        }),
+        None => json!({
+            "authenticated": false,
+            "catalog": null,
+            "fixCommand": format!("ward auth login --cloud-url {}", cloud::default_cloud_url()),
+        }),
+    })
+}
+
+fn cloud_catalog_option() -> Result<Option<cloud::CloudCatalog>> {
+    let Ok(auth) = cloud::load_any_auth_session() else {
+        return Ok(None);
+    };
+    if !cloud::default_db_path().is_file() {
+        return Ok(None);
+    }
+    Ok(Some(cloud::catalog(
+        &cloud::default_db_path(),
+        &auth.account_email,
+        &auth.device_id,
+    )?))
 }
 
 fn dashboard_projects() -> Result<Vec<ProjectView>> {
@@ -1172,6 +1773,7 @@ fn project_view(
     let config_result = config::read_project_config(&project.path);
     let mut env_names = BTreeSet::new();
     let mut profiles = Vec::new();
+    let mut agent_policies = Vec::new();
     let config_status = match config_result {
         Ok(cfg) => {
             for (profile_name, profile) in cfg.profiles {
@@ -1184,19 +1786,28 @@ fn project_view(
                     action: profile.action,
                 });
             }
+            for (agent, policy) in cfg.agent_policies {
+                env_names.extend(policy.env.iter().cloned());
+                agent_policies.push(AgentPolicyView {
+                    agent,
+                    profiles: policy.profiles,
+                    env: policy.env,
+                });
+            }
             "ok".to_string()
         }
         Err(error) => format!("unavailable: {error}"),
     };
 
-    let broker_session_active = broker_status
-        .map(|status| {
-            status
-                .sessions
-                .iter()
-                .any(|session| session.project == name && same_path(&session.vault, &project.vault))
-        })
-        .unwrap_or(false);
+    let broker_session_expires_at = broker_status.and_then(|status| {
+        status
+            .sessions
+            .iter()
+            .filter(|session| session.project == name && same_path(&session.vault, &project.vault))
+            .map(|session| session.expires_at)
+            .max()
+    });
+    let broker_session_active = broker_session_expires_at.is_some();
 
     let mut vault_keys_verified = false;
     if broker_session_active {
@@ -1207,6 +1818,7 @@ fn project_view(
     }
 
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
+    agent_policies.sort_by(|left, right| left.agent.cmp(&right.agent));
     Ok(ProjectView {
         name: name.to_string(),
         path: project.path.clone(),
@@ -1220,9 +1832,13 @@ fn project_view(
         package_name: None,
         package_kind: None,
         profiles,
+        agent_policies,
         env_names: env_names.into_iter().collect(),
         vault_keys_verified,
         broker_session_active,
+        broker_session_expires_at,
+        store_snapshot: project_store::show_summary(name).ok(),
+        team: teams::summary(name)?,
     })
 }
 
@@ -1275,22 +1891,23 @@ fn discovered_project_view(
         workspace::WorkspaceSetupStatus::NeedsEnv => "needs env".to_string(),
         workspace::WorkspaceSetupStatus::NotConfigured => "not configured".to_string(),
     };
-    let broker_session_active = broker_status
-        .map(|status| {
-            status.sessions.iter().any(|session| {
-                session.project == package.project_name
-                    && same_path(
-                        &session.vault,
-                        &package.path.join(config::DEFAULT_VAULT_FILE),
-                    )
+    let package_vault = package.path.join(config::DEFAULT_VAULT_FILE);
+    let broker_session_expires_at = broker_status.and_then(|status| {
+        status
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.project == package.project_name && same_path(&session.vault, &package_vault)
             })
-        })
-        .unwrap_or(false);
+            .map(|session| session.expires_at)
+            .max()
+    });
+    let broker_session_active = broker_session_expires_at.is_some();
 
     Ok(ProjectView {
         name: package.project_name.clone(),
         path: package.path.clone(),
-        vault: package.path.join(config::DEFAULT_VAULT_FILE),
+        vault: package_vault,
         active: active_project == Some(package.project_name.as_str()),
         config_status,
         setup_status: workspace_setup_status_label(&package.setup_status).to_string(),
@@ -1307,9 +1924,13 @@ fn discovered_project_view(
         package_name: package.name.clone(),
         package_kind: Some(workspace_package_kind_label(&package.package_kind).to_string()),
         profiles: Vec::new(),
+        agent_policies: Vec::new(),
         env_names: env_names.into_iter().collect(),
         vault_keys_verified: false,
         broker_session_active,
+        broker_session_expires_at,
+        store_snapshot: None,
+        team: teams::summary(&package.project_name)?,
     })
 }
 
@@ -2159,9 +2780,36 @@ mod tests {
             profiles_collection_route("/api/projects/demo/profiles"),
             Some("demo".to_string())
         );
+        assert_eq!(
+            store_snapshot_route("/api/store/projects/demo/snapshot"),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            team_project_route("/api/teams/projects/demo"),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            team_members_collection_route("/api/teams/projects/demo/members"),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            team_member_route("/api/teams/projects/demo/members/local-user"),
+            Some(("demo".to_string(), "local-user".to_string()))
+        );
+        assert_eq!(
+            team_policies_collection_route("/api/teams/projects/demo/policies"),
+            Some("demo".to_string())
+        );
+        assert_eq!(
+            team_policy_route("/api/teams/projects/demo/policies/codex-dev"),
+            Some(("demo".to_string(), "codex-dev".to_string()))
+        );
         assert!(is_dashboard_page_route("/"));
         assert!(is_dashboard_page_route("/logs"));
+        assert!(is_dashboard_page_route("/team"));
+        assert!(is_dashboard_page_route("/cloud"));
         assert!(is_dashboard_page_route("/projects/demo/logs"));
+        assert!(is_dashboard_page_route("/projects/demo/team"));
         assert!(profile_env_route("/api/projects/demo").is_none());
         let request_id = uuid::Uuid::new_v4();
         assert_eq!(
@@ -2171,6 +2819,18 @@ mod tests {
         assert_eq!(
             worktree_action_route(&format!("/api/worktrees/{request_id}/deny")),
             Some((request_id, "deny".to_string()))
+        );
+        assert_eq!(
+            notification_action_route(&format!("/api/notifications/{request_id}/dismiss")),
+            Some((request_id, "dismiss".to_string()))
+        );
+        assert_eq!(
+            project_action_route("/api/projects/demo/lock"),
+            Some(("demo".to_string(), "lock".to_string()))
+        );
+        assert_eq!(
+            project_action_route("/api/projects/demo/remove"),
+            Some(("demo".to_string(), "remove".to_string()))
         );
     }
 
@@ -2193,9 +2853,30 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("openProjectLogs"));
         assert!(DASHBOARD_HTML.contains("tablePaneWidth"));
         assert!(DASHBOARD_HTML.contains("notifications-btn"));
+        assert!(DASHBOARD_HTML.contains("id=\"team-link\""));
+        assert!(DASHBOARD_HTML.contains("id=\"cloud-link\""));
+        assert!(DASHBOARD_HTML.contains("renderCloud"));
+        assert!(DASHBOARD_HTML.contains("/api/cloud"));
+        assert!(DASHBOARD_HTML.contains("/api/teams/projects/"));
+        assert!(DASHBOARD_HTML.contains("renderTeam"));
+        assert!(DASHBOARD_HTML.contains("data-save-team-policy"));
+        assert!(DASHBOARD_HTML.contains("data-save-member"));
         assert!(DASHBOARD_HTML.contains("/api/notifications/stream"));
         assert!(DASHBOARD_HTML.contains("/api/approvals/"));
         assert!(DASHBOARD_HTML.contains("/api/worktrees/"));
+        assert!(DASHBOARD_HTML.contains("/api/sessions/lock-all"));
+        assert!(DASHBOARD_HTML.contains("data-lock-project"));
+        assert!(DASHBOARD_HTML.contains("data-remove-project"));
+        assert!(DASHBOARD_HTML.contains("data-dismiss-notification"));
+        assert!(DASHBOARD_HTML.contains("isValidEnvName"));
+        assert!(DASHBOARD_HTML.contains("data-dirty-scope"));
+        assert!(DASHBOARD_HTML.contains("bindDirtyTracking"));
+        assert!(DASHBOARD_HTML.contains("guardedLoad"));
+        assert!(DASHBOARD_HTML.contains("startAutoRefresh"));
+        assert!(DASHBOARD_HTML.contains("Discard unsaved changes?"));
+        assert!(DASHBOARD_HTML.contains("refresh paused while editing"));
+        assert!(DASHBOARD_HTML.contains("renderNotificationBadge();"));
+        assert!(!DASHBOARD_HTML.contains("setInterval(load, 5000)"));
         assert!(DASHBOARD_HTML.contains("rel=\"icon\" href=\"/favicon.png\""));
         assert!(DASHBOARD_HTML.contains("/assets/ward-logo-dark.png"));
         assert!(WARD_LOGO_DARK_SVG.contains("<rect"));
@@ -2308,6 +2989,127 @@ mod tests {
 
         let deleted = delete_profile_policy("demo", "prod").unwrap();
         assert!(deleted.profiles.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn team_view_returns_default_record_without_secret_values() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let cfg = config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
+            .unwrap();
+        config::write_project_config(project.path(), &cfg, true).unwrap();
+        registry::register_project(
+            "demo".to_string(),
+            project.path().to_path_buf(),
+            project.path().join(".env.vault"),
+        )
+        .unwrap();
+
+        let team = team_view("demo").unwrap();
+        assert_eq!(team.project, "demo");
+        assert_eq!(team.members.len(), 1);
+        let serialized = serde_json::to_string(&team).unwrap();
+        assert!(serialized.contains(&teams::current_member_id()));
+        assert!(!serialized.contains("super-secret-value"));
+    }
+
+    #[test]
+    #[serial]
+    fn team_policy_mutation_requires_active_broker_session() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let cfg = config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
+            .unwrap();
+        config::write_project_config(project.path(), &cfg, true).unwrap();
+        registry::register_project(
+            "demo".to_string(),
+            project.path().to_path_buf(),
+            project.path().join(".env.vault"),
+        )
+        .unwrap();
+
+        let err = mutate_team_policy(
+            "demo",
+            None,
+            TeamPolicyRequest {
+                name: "codex-dev".to_string(),
+                member_id: None,
+                agents: vec!["codex".to_string()],
+                profiles: vec!["dev".to_string()],
+                env: vec!["API_KEY".to_string()],
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unlock_required"));
+    }
+
+    #[test]
+    #[serial]
+    fn applying_team_policy_updates_agent_policy_config() {
+        let home = tempfile::tempdir().unwrap();
+        let _guard = WardHomeGuard::set(home.path());
+        let project = tempfile::tempdir().unwrap();
+        let mut cfg =
+            config::ProjectConfig::default_for_dir(project.path(), Some("demo".to_string()))
+                .unwrap();
+        cfg.agent_policies.insert(
+            "old-agent".to_string(),
+            config::AgentPolicyConfig {
+                profiles: vec!["dev".to_string()],
+                env: vec!["OLD_SECRET".to_string()],
+            },
+        );
+        config::write_project_config(project.path(), &cfg, true).unwrap();
+        let registered = registry::register_project(
+            "demo".to_string(),
+            project.path().to_path_buf(),
+            project.path().join(".env.vault"),
+        )
+        .unwrap();
+
+        let mut previous = teams::default_record("demo");
+        teams::upsert_policy(
+            &mut previous,
+            teams::TeamPolicyInput {
+                name: "old-policy".to_string(),
+                member_id: None,
+                agents: vec!["old-agent".to_string()],
+                profiles: vec!["dev".to_string()],
+                env: vec!["OLD_SECRET".to_string()],
+            },
+            None,
+        )
+        .unwrap();
+        let mut next = teams::default_record("demo");
+        teams::upsert_policy(
+            &mut next,
+            teams::TeamPolicyInput {
+                name: "codex-dev".to_string(),
+                member_id: None,
+                agents: vec!["codex".to_string()],
+                profiles: vec!["dev".to_string()],
+                env: vec!["API_KEY".to_string()],
+            },
+            None,
+        )
+        .unwrap();
+
+        apply_team_policies_to_project("demo", &registered, &previous, &next).unwrap();
+
+        let updated = config::read_project_config(project.path()).unwrap();
+        assert!(!updated.agent_policies.contains_key("old-agent"));
+        assert_eq!(
+            updated.agent_policies["codex"].profiles,
+            vec!["dev".to_string()]
+        );
+        assert_eq!(
+            updated.agent_policies["codex"].env,
+            vec!["API_KEY".to_string()]
+        );
     }
 
     #[test]

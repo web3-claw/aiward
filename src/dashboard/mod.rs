@@ -4,7 +4,7 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Margin},
-    style::{Color, Style, Stylize},
+    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation,

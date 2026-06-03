@@ -69,6 +69,8 @@ pub struct Notification {
     #[serde(default)]
     pub can_deny: bool,
     #[serde(default)]
+    pub can_dismiss: bool,
+    #[serde(default)]
     pub waiting: bool,
 }
 
@@ -131,6 +133,32 @@ pub fn remove_block_notification(id: uuid::Uuid) -> Result<()> {
     Ok(())
 }
 
+pub fn dismiss_notification(id: uuid::Uuid) -> Result<NotificationDismissal> {
+    if block_notification_path(id).exists() {
+        remove_block_notification(id)?;
+        return Ok(NotificationDismissal {
+            id,
+            status: "dismissed".to_string(),
+        });
+    }
+    if pending_requests::pending_request_path(id).exists() {
+        anyhow::bail!("pending approval requests cannot be dismissed; approve or deny the request");
+    }
+    if worktrees::load_pending_worktree(id)?.is_some() {
+        anyhow::bail!(
+            "pending worktree bindings cannot be dismissed; approve or deny the worktree request"
+        );
+    }
+    anyhow::bail!("notification not found: {id}")
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationDismissal {
+    pub id: uuid::Uuid,
+    pub status: String,
+}
+
 pub fn list_notifications() -> Result<Vec<Notification>> {
     let mut notifications = Vec::new();
     for pending in pending_requests::list_pending_requests()? {
@@ -191,6 +219,7 @@ fn run_notification(pending: &PendingRequest) -> Notification {
             .map(|context| context.commit.clone()),
         can_approve: true,
         can_deny: true,
+        can_dismiss: false,
         waiting: true,
     }
 }
@@ -221,6 +250,7 @@ fn worktree_notification(pending: &PendingWorktree) -> Notification {
         commit: Some(pending.commit.clone()),
         can_approve: true,
         can_deny: true,
+        can_dismiss: false,
         waiting: true,
     }
 }
@@ -259,6 +289,7 @@ fn block_notification(block: &BlockNotification) -> Notification {
         commit: None,
         can_approve: false,
         can_deny: false,
+        can_dismiss: true,
         waiting: false,
     }
 }
@@ -380,6 +411,43 @@ mod tests {
         let serialized = serde_json::to_string(&notifications).unwrap();
         assert!(serialized.contains("DATABASE_URL"));
         assert!(!serialized.contains("postgres://"));
+
+        match previous_home {
+            Some(value) => std::env::set_var("WARD_HOME", value),
+            None => std::env::remove_var("WARD_HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dismiss_notification_only_removes_block_notifications() {
+        let _guard = env_lock();
+        let previous_home = std::env::var_os("WARD_HOME");
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+
+        let pending =
+            pending_requests::create_pending_request(access(), evaluation(), GitContext::default())
+                .unwrap();
+        let block = create_block_notification(
+            NotificationKind::VaultKeyMissing,
+            "demo",
+            Some("codex"),
+            Some("pnpm dev"),
+            &["DATABASE_URL".to_string()],
+            &[],
+            "warning",
+            "missing key",
+            Some("ward env request-set --key DATABASE_URL"),
+        )
+        .unwrap();
+
+        assert!(dismiss_notification(pending.id)
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be dismissed"));
+        assert_eq!(dismiss_notification(block.id).unwrap().status, "dismissed");
+        assert!(!block_notification_path(block.id).exists());
 
         match previous_home {
             Some(value) => std::env::set_var("WARD_HOME", value),

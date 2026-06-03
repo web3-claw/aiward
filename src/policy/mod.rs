@@ -69,6 +69,20 @@ pub fn evaluate_request(
         .map(|preset| preset.approval)
         .unwrap_or(ApprovalMode::Prompt);
 
+    let agent_policy = matching_agent_policy(config, request.agent.as_deref(), profile);
+    if !config.agent_policies.is_empty()
+        && request.agent.as_deref() != Some("human")
+        && agent_policy.is_none()
+    {
+        findings.push(Finding::warning(
+            "agent.policy_missing",
+            format!(
+                "agent {} is not allowed by this project's agent policy",
+                request.agent.as_deref().unwrap_or("-")
+            ),
+        ));
+    }
+
     let mut approved_env = Vec::new();
     let mut denied_env = Vec::new();
 
@@ -79,19 +93,39 @@ pub fn evaluate_request(
         let allowed_by_preset = preset
             .map(|preset| env_allowed_by_preset(env_name, &preset.allowed_env))
             .unwrap_or(false);
-        let allowed = allowed_by_profile || allowed_by_preset;
+        let allowed_by_agent = agent_policy
+            .map(|policy| policy.env.iter().any(|allowed| allowed == env_name))
+            .unwrap_or(
+                config.agent_policies.is_empty() || request.agent.as_deref() == Some("human"),
+            );
+        let allowed = (allowed_by_profile || allowed_by_preset) && allowed_by_agent;
 
         if allowed {
             approved_env.push(env_name.clone());
         } else {
             denied_env.push(env_name.clone());
-            findings.push(Finding::warning(
-                "env.scope_deviation",
-                format!("{env_name} is not covered by the matched preset or no preset matched"),
-            ));
+            if !allowed_by_agent {
+                findings.push(Finding::warning(
+                    "agent.env_denied",
+                    format!("{env_name} is not allowed for this agent"),
+                ));
+            } else {
+                findings.push(Finding::warning(
+                    "env.scope_deviation",
+                    format!("{env_name} is not covered by the matched preset or no preset matched"),
+                ));
+            }
         }
     }
 
+    let approval_mode = if !config.agent_policies.is_empty()
+        && request.agent.as_deref() != Some("human")
+        && agent_policy.is_none()
+    {
+        ApprovalMode::Deny
+    } else {
+        approval_mode
+    };
     let requires_prompt = approval_mode == ApprovalMode::Prompt
         || !denied_env.is_empty()
         || detection::has_critical_findings(&findings)
@@ -108,6 +142,28 @@ pub fn evaluate_request(
         requires_prompt,
         findings,
     }
+}
+
+fn matching_agent_policy<'a>(
+    config: &'a ProjectConfig,
+    agent: Option<&str>,
+    profile: Option<(&'a ProfileConfig, &'a String)>,
+) -> Option<&'a crate::config::AgentPolicyConfig> {
+    if config.agent_policies.is_empty() || agent == Some("human") {
+        return None;
+    }
+    let policy = config.agent_policies.get(agent?)?;
+    if let Some((_, profile_name)) = profile {
+        if !policy.profiles.is_empty()
+            && !policy
+                .profiles
+                .iter()
+                .any(|allowed_profile| allowed_profile == profile_name)
+        {
+            return None;
+        }
+    }
+    Some(policy)
 }
 
 fn find_matching_profile<'a>(
@@ -151,6 +207,7 @@ fn env_allowed_by_preset(env_name: &str, allowed_env: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::config::{PresetConfig, ProjectConfig};
+    use std::path::Path;
 
     #[test]
     fn supports_exact_and_prefix_env_patterns() {
@@ -174,6 +231,7 @@ mod tests {
                 approval: ApprovalMode::Auto,
             }],
             profiles: std::collections::BTreeMap::new(),
+            agent_policies: std::collections::BTreeMap::new(),
             anomaly_detection: crate::config::AnomalyDetectionConfig {
                 enabled: true,
                 working_hours_start: 8,
@@ -220,6 +278,7 @@ mod tests {
                     action: "Run development server".to_string(),
                 },
             )]),
+            agent_policies: std::collections::BTreeMap::new(),
             anomaly_detection: crate::config::AnomalyDetectionConfig {
                 enabled: true,
                 working_hours_start: 8,
@@ -249,6 +308,82 @@ mod tests {
     }
 
     #[test]
+    fn agent_policy_limits_named_agent_env_scope() {
+        let mut config =
+            ProjectConfig::default_for_dir(Path::new("/tmp/demo"), Some("demo".to_string()))
+                .unwrap();
+        config.profiles = std::collections::BTreeMap::from([(
+            "dev".to_string(),
+            crate::config::ProfileConfig {
+                command: "pnpm dev".to_string(),
+                env: vec!["DATABASE_URI".to_string(), "PAYLOAD_SECRET".to_string()],
+                default_scope: crate::approvals::ApprovalScope::Always,
+                action: "Run development server".to_string(),
+            },
+        )]);
+        config.agent_policies.insert(
+            "codex".to_string(),
+            crate::config::AgentPolicyConfig {
+                profiles: vec!["dev".to_string()],
+                env: vec!["DATABASE_URI".to_string()],
+            },
+        );
+        let request = AccessRequest {
+            project: "demo".to_string(),
+            agent: Some("codex".to_string()),
+            branch: None,
+            action: None,
+            command: "pnpm dev".to_string(),
+            env: vec!["DATABASE_URI".to_string(), "PAYLOAD_SECRET".to_string()],
+        };
+
+        let evaluation = evaluate_request(&config, &request, None, Vec::new());
+
+        assert_eq!(evaluation.approved_env, vec!["DATABASE_URI"]);
+        assert_eq!(evaluation.denied_env, vec!["PAYLOAD_SECRET"]);
+        assert!(evaluation
+            .findings
+            .iter()
+            .any(|finding| finding.code == "agent.env_denied"));
+    }
+
+    #[test]
+    fn human_agent_identity_ignores_agent_policy() {
+        let mut config =
+            ProjectConfig::default_for_dir(Path::new("/tmp/demo"), Some("demo".to_string()))
+                .unwrap();
+        config.profiles = std::collections::BTreeMap::from([(
+            "dev".to_string(),
+            crate::config::ProfileConfig {
+                command: "pnpm dev".to_string(),
+                env: vec!["DATABASE_URI".to_string()],
+                default_scope: crate::approvals::ApprovalScope::Always,
+                action: "Run development server".to_string(),
+            },
+        )]);
+        config.agent_policies.insert(
+            "codex".to_string(),
+            crate::config::AgentPolicyConfig {
+                profiles: vec!["dev".to_string()],
+                env: Vec::new(),
+            },
+        );
+        let request = AccessRequest {
+            project: "demo".to_string(),
+            agent: Some("human".to_string()),
+            branch: None,
+            action: None,
+            command: "pnpm dev".to_string(),
+            env: vec!["DATABASE_URI".to_string()],
+        };
+
+        let evaluation = evaluate_request(&config, &request, None, Vec::new());
+
+        assert_eq!(evaluation.approved_env, vec!["DATABASE_URI"]);
+        assert!(evaluation.denied_env.is_empty());
+    }
+
+    #[test]
     fn critical_findings_force_prompt_even_for_auto_preset() {
         let config = ProjectConfig {
             version: 1,
@@ -261,6 +396,7 @@ mod tests {
                 approval: ApprovalMode::Auto,
             }],
             profiles: std::collections::BTreeMap::new(),
+            agent_policies: std::collections::BTreeMap::new(),
             anomaly_detection: crate::config::AnomalyDetectionConfig {
                 enabled: true,
                 working_hours_start: 8,
@@ -305,6 +441,7 @@ mod tests {
                 approval: ApprovalMode::Auto,
             }],
             profiles: std::collections::BTreeMap::new(),
+            agent_policies: std::collections::BTreeMap::new(),
             anomaly_detection: crate::config::AnomalyDetectionConfig {
                 enabled: true,
                 working_hours_start: 8,
