@@ -226,7 +226,7 @@ pub fn response_for(pending: &PendingRequest) -> PendingRequestResponse<'_> {
         confirmation_required,
         confirmation: confirmation_required.then(|| critical_confirmation(pending)),
         approve_commands: approve_commands(pending.id, &approval_options, confirmation_required),
-        deny_command: format!("ward deny {} --agent-mediated", pending.id),
+        deny_command: format!("ward deny {}", pending.id),
         approval_options,
     }
 }
@@ -253,9 +253,9 @@ fn critical_confirmation(pending: &PendingRequest) -> CriticalConfirmation {
         title: "Critical secret exposure warning",
         body: "This request matched deterministic secret-exfiltration patterns. Approve only if you explicitly expect this exact command to inspect, print, transform, copy, or transmit secrets.".to_string(),
         recommended_action: "deny",
-        deny_command: format!("ward deny {} --agent-mediated", pending.id),
+        deny_command: format!("ward deny {}", pending.id),
         approve_once_command: format!(
-            "ward approve {} --scope once --confirm-critical --agent-mediated",
+            "ward approve {} --scope once --confirm-critical",
             pending.id
         ),
     }
@@ -295,7 +295,7 @@ fn approve_commands(
             ApprovalCommand {
                 scope,
                 command: format!(
-                    "ward approve {request_id} --scope {}{confirm} --agent-mediated",
+                    "ward approve {request_id} --scope {}{confirm}",
                     scope.as_cli_value()
                 ),
             }

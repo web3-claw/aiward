@@ -2918,6 +2918,7 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
             }
         }
         WorktreesCommand::Approve { request_id, json } => {
+            require_human_terminal_confirmation("APPROVE-WORKTREE", request_id)?;
             if let Some(worktree) = worktrees::approve_pending(request_id)? {
                 if json {
                     println!(
@@ -2946,6 +2947,7 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
             }
         }
         WorktreesCommand::Deny { request_id, json } => {
+            require_human_terminal_confirmation("DENY-WORKTREE", request_id)?;
             if worktrees::deny_pending(request_id)? {
                 if json {
                     println!(
@@ -3821,6 +3823,7 @@ fn allow_for_target(
     if matches!(scope, ApprovalScope::Once | ApprovalScope::Deny) {
         anyhow::bail!("ward allow supports session, branch, and always scopes");
     }
+    require_manual_allow_confirmation(scope)?;
     require_agent_identity_for_non_human(agent.as_deref())?;
 
     let git = git_context::collect_git_context(&cwd);
@@ -3866,6 +3869,49 @@ fn allow_for_target(
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
     println!("Created {} grant {}", scope, grant.id);
     Ok(())
+}
+
+fn require_manual_allow_confirmation(scope: ApprovalScope) -> Result<()> {
+    #[cfg(any(test, coverage))]
+    {
+        let _ = scope;
+        return Ok(());
+    }
+
+    #[cfg(not(any(test, coverage)))]
+    {
+        use std::io::IsTerminal as _;
+
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            anyhow::bail!(
+                "ward allow requires an interactive local terminal; agents must use ward run --wait-for-approval"
+            );
+        }
+        eprintln!("Ward allow creates a durable {scope} grant.");
+        eprintln!(
+            "Type `ALLOW {}` to continue:",
+            approval_scope_cli_value(scope)
+        );
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read allow confirmation")?;
+        if input.trim() != format!("ALLOW {}", approval_scope_cli_value(scope)) {
+            anyhow::bail!("confirmation did not match; no grant was created");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(test, coverage)))]
+fn approval_scope_cli_value(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Session => "session",
+        ApprovalScope::Branch => "branch",
+        ApprovalScope::Always => "always",
+        ApprovalScope::Deny => "deny",
+    }
 }
 
 fn grants_command(command: GrantsCommand) -> Result<()> {
@@ -3974,6 +4020,35 @@ fn wait_for_approval_command(request_id: uuid::Uuid, json: bool, timeout: &str) 
     }
 }
 
+fn require_human_terminal_confirmation(action: &str, request_id: uuid::Uuid) -> Result<()> {
+    #[cfg(any(test, coverage))]
+    {
+        let _ = (action, request_id);
+        return Ok(());
+    }
+
+    #[cfg(not(any(test, coverage)))]
+    {
+        use std::io::IsTerminal as _;
+
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            anyhow::bail!(
+                "Ward {action} requires an interactive local terminal; use the dashboard approval flow or ask a human to run this command"
+        );
+        }
+        eprintln!("Ward {action} requires local human confirmation.");
+        eprintln!("Type `{action} {request_id}` to continue:");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read approval confirmation")?;
+        if input.trim() != format!("{action} {request_id}") {
+            anyhow::bail!("confirmation did not match; no approval state was changed");
+        }
+        Ok(())
+    }
+}
+
 fn approve(
     request_id: uuid::Uuid,
     scope: ApprovalScope,
@@ -3981,12 +4056,17 @@ fn approve(
     agent_mediated: bool,
     json: bool,
 ) -> Result<()> {
+    if agent_mediated {
+        anyhow::bail!(
+            "--agent-mediated can no longer create approvals; agents must use `ward run --wait-for-approval` or `ward approvals wait <request-id> --json`"
+        );
+    }
+    require_human_terminal_confirmation("APPROVE", request_id)?;
     match approve_inner(
         request_id,
         scope,
         confirm_critical,
-        agent_mediated,
-        approval_channel_for_terminal(agent_mediated),
+        ApprovalChannel::TerminalApprove,
     ) {
         Ok(response) => {
             if json {
@@ -4029,35 +4109,25 @@ fn approve_inner(
     request_id: uuid::Uuid,
     scope: ApprovalScope,
     confirm_critical: bool,
-    agent_mediated: bool,
     approval_channel: ApprovalChannel,
 ) -> Result<ApproveJsonResponse> {
     if scope == ApprovalScope::Deny {
         anyhow::bail!("use ward deny for denied requests");
     }
     let pending = pending_requests::load_pending_request(request_id)?;
-    let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(Some(&pending.access.project), &cwd)?;
     let critical = detection::has_critical_findings(&pending.policy.findings);
     validate_pending_approval(&pending, scope, confirm_critical)?;
-    let source = if agent_mediated {
-        approvals::ApprovalSource::AgentMediated
-    } else {
-        approvals::ApprovalSource::LocalTty
+    let status =
+        broker::approve_pending_request(request_id, scope, confirm_critical, approval_channel)?;
+    let source = approvals::ApprovalSource::BrokerApproval;
+    let decision = ApprovalDecision {
+        approved: true,
+        scope,
+        approved_env: status.access.env.clone(),
+        denied_env: Vec::new(),
+        source,
+        grant_id: Some(status.grant_id),
     };
-    let receipt_context = Some(grants::GrantReceiptContext::pending(
-        request_id,
-        critical && confirm_critical,
-        pending.verified_context.clone(),
-    ));
-    let access = &pending.access;
-    let vault = &resolved.vault;
-    let grant = grants::persist_manual_grant(access, scope, source, vault, receipt_context)?;
-    pending_requests::consume_pending_request(request_id)?;
-    pending_requests::record_resolution(request_id, "approved", &pending.access.project)?;
-    let receipt = grant.receipt.as_ref();
-    let mut decision = grants::approval_from_grant(&pending.access, &grant);
-    decision.source = source;
     let request_snapshot = request_audit_snapshot(
         &pending.access,
         &pending.policy,
@@ -4071,10 +4141,10 @@ fn approve_inner(
         approval_channel,
         request_snapshot: Some(request_snapshot),
         decision: &decision,
-        persisted_grant: Some(grant.id),
-        approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
-        signer_key_id: receipt.map(|receipt| receipt.signer_key_id.as_str()),
-        signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.as_str()),
+        persisted_grant: Some(status.grant_id),
+        approval_receipt_hash: status.approval_receipt_hash.as_deref(),
+        signer_key_id: status.signer_key_id.as_deref(),
+        signature_algorithm: status.signature_algorithm.as_deref(),
         critical_confirmation: critical && confirm_critical,
         human_proof: approval_human_proof(source),
     };
@@ -4083,10 +4153,10 @@ fn approve_inner(
         status: "approved",
         request_id,
         project: pending.access.project,
-        grant_id: grant.id,
-        approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.clone()),
-        signer_key_id: receipt.map(|receipt| receipt.signer_key_id.clone()),
-        signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.clone()),
+        grant_id: status.grant_id,
+        approval_receipt_hash: status.approval_receipt_hash,
+        signer_key_id: status.signer_key_id,
+        signature_algorithm: status.signature_algorithm,
         approval_source: source,
         approval_channel,
     })
@@ -4101,7 +4171,6 @@ pub(crate) fn approve_request_from_dashboard(
         request_id,
         scope,
         confirm_critical,
-        true,
         ApprovalChannel::Dashboard,
     )?;
     serde_json::to_value(response).context("failed to serialize approval response")
@@ -4120,7 +4189,13 @@ fn validate_pending_approval(
 }
 
 fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> {
-    let pending = match pending_requests::consume_pending_request(request_id) {
+    if agent_mediated {
+        anyhow::bail!(
+            "--agent-mediated can no longer deny requests; agents must use `ward run --wait-for-approval` or `ward approvals wait <request-id> --json`"
+        );
+    }
+    require_human_terminal_confirmation("DENY", request_id)?;
+    let pending = match pending_requests::load_pending_request(request_id) {
         Ok(pending) => pending,
         Err(error) if json => {
             if print_pending_request_error_json(request_id, &error)? {
@@ -4130,12 +4205,8 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         }
         Err(error) => return Err(error),
     };
-    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
-    let source = if agent_mediated {
-        approvals::ApprovalSource::AgentMediated
-    } else {
-        approvals::ApprovalSource::LocalTty
-    };
+    let status = broker::deny_pending_request(request_id, ApprovalChannel::TerminalApprove)?;
+    let source = approvals::ApprovalSource::BrokerApproval;
     let decision = ApprovalDecision {
         approved: false,
         scope: ApprovalScope::Deny,
@@ -4144,7 +4215,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         source,
         grant_id: None,
     };
-    let approval_channel = approval_channel_for_terminal(agent_mediated);
+    let approval_channel = ApprovalChannel::TerminalApprove;
     let request_snapshot = request_audit_snapshot(
         &pending.access,
         &pending.policy,
@@ -4172,7 +4243,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
             serde_json::to_string_pretty(&serde_json::json!({
                 "status": "denied",
                 "requestId": request_id,
-                "project": pending.access.project,
+                "project": status.project,
                 "approvalSource": source,
                 "approvalChannel": approval_channel,
             }))?
@@ -4184,9 +4255,9 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
 }
 
 pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Value> {
-    let pending = pending_requests::consume_pending_request(request_id)?;
-    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
-    let source = approvals::ApprovalSource::AgentMediated;
+    let pending = pending_requests::load_pending_request(request_id)?;
+    let status = broker::deny_pending_request(request_id, ApprovalChannel::Dashboard)?;
+    let source = approvals::ApprovalSource::BrokerApproval;
     let decision = ApprovalDecision {
         approved: false,
         scope: ApprovalScope::Deny,
@@ -4219,7 +4290,7 @@ pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Valu
     Ok(serde_json::json!({
         "status": "denied",
         "requestId": request_id,
-        "project": pending.access.project,
+        "project": status.project,
         "approvalSource": source,
         "approvalChannel": ApprovalChannel::Dashboard,
     }))
@@ -4943,6 +5014,7 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
                         term::info(&format!("started  {}", started_at.to_rfc3339()));
                     }
                     term::info(&format!("sessions  {}", status.sessions.len()));
+                    term::info(&format!("broker approvals  {}", status.approval_count));
                     let active = status
                         .sessions
                         .iter()
@@ -6505,17 +6577,10 @@ fn approval_channel_for_source(source: approvals::ApprovalSource) -> ApprovalCha
         approvals::ApprovalSource::LocalTty => ApprovalChannel::LocalPrompt,
         approvals::ApprovalSource::ManualAllow => ApprovalChannel::ManualAllow,
         approvals::ApprovalSource::AgentMediated => ApprovalChannel::AgentMediatedCli,
+        approvals::ApprovalSource::BrokerApproval => ApprovalChannel::Dashboard,
         approvals::ApprovalSource::Grant => ApprovalChannel::GrantReuse,
         approvals::ApprovalSource::PolicyAuto => ApprovalChannel::PolicyAuto,
         approvals::ApprovalSource::PolicyDeny => ApprovalChannel::PolicyDeny,
-    }
-}
-
-fn approval_channel_for_terminal(agent_mediated: bool) -> ApprovalChannel {
-    if agent_mediated {
-        ApprovalChannel::AgentMediatedCli
-    } else {
-        ApprovalChannel::TerminalApprove
     }
 }
 
@@ -6538,6 +6603,7 @@ fn should_log_approval_event(decision: &ApprovalDecision) -> bool {
 fn approval_human_proof(source: approvals::ApprovalSource) -> Option<&'static str> {
     match source {
         approvals::ApprovalSource::AgentMediated => Some("external-agent-ui"),
+        approvals::ApprovalSource::BrokerApproval => Some("broker-approval"),
         approvals::ApprovalSource::LocalTty => Some("local-tty"),
         approvals::ApprovalSource::ManualAllow => Some("local-cli"),
         _ => None,
@@ -6783,7 +6849,7 @@ fn wait_for_run_approval(
     let timeout = unlock::parse_ttl(approval_timeout)?;
     let deadline = chrono::Utc::now() + timeout;
     eprintln!(
-        "Ward is waiting for approval {}. Open the dashboard notification center or run: ward approve {} --scope session --agent-mediated --json",
+        "Ward is waiting for approval {}. Open the dashboard notification center, or ask a human to run: ward approve {} --scope session",
         pending.id, pending.id
     );
 
@@ -6988,15 +7054,20 @@ fn broker_execution_rejection_is_authoritative(error: &anyhow::Error) -> bool {
     matches!(
         broker_error.reason(),
         "agent_proof_invalid"
+            | "agent_self_approval_rejected"
+            | "approval_required"
             | "broker_client_untrusted"
             | "execute_authorization_expired"
             | "execute_authorization_invalid"
             | "execute_authorization_mismatch"
             | "execute_authorization_replayed"
             | "execute_authorization_required"
+            | "grant_lookup_failed"
+            | "human_approval_required"
             | "human_session_required"
             | "mode_confirmation_required"
             | "mode_env_violation"
+            | "policy_denied"
             | "security_policy_violation"
     )
 }
@@ -10458,9 +10529,8 @@ mod tests {
                 "--scope",
                 "once",
                 "--confirm-critical",
-                "--agent-mediated",
             ],
-            vec!["ward", "deny", &request_id, "--agent-mediated"],
+            vec!["ward", "deny", &request_id],
             vec![
                 "ward",
                 "run",

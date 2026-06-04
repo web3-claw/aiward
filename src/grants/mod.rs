@@ -480,7 +480,7 @@ pub fn grant_integrity_status(grant: &ApprovalGrant, now: DateTime<Utc>) -> Gran
     }
 }
 
-fn grant_from_decision(
+pub(crate) fn grant_from_decision(
     access: &AccessRequest,
     decision: &ApprovalDecision,
     now: DateTime<Utc>,
@@ -1326,6 +1326,14 @@ mod tests {
         .is_err());
         assert!(persist_manual_grant(
             &access,
+            ApprovalScope::Once,
+            ApprovalSource::AgentMediated,
+            &vault,
+            Some(GrantReceiptContext::synthetic(false)),
+        )
+        .is_err());
+        assert!(persist_manual_grant(
+            &access,
             ApprovalScope::Deny,
             ApprovalSource::ManualAllow,
             &vault,
@@ -1344,7 +1352,7 @@ mod tests {
         let once = persist_manual_grant(
             &access,
             ApprovalScope::Once,
-            ApprovalSource::AgentMediated,
+            ApprovalSource::BrokerApproval,
             &vault,
             Some(GrantReceiptContext::synthetic(false)),
         )

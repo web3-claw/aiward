@@ -27,9 +27,10 @@ use sha2::{Digest, Sha256};
 use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
-    approvals::{ApprovalScope, ApprovalSource},
-    config, detection, env_file, fs_util, grants, logs, modes, project_store, project_teardown,
-    recovery, registry,
+    approvals::{ApprovalChannel, ApprovalDecision, ApprovalScope, ApprovalSource},
+    config, detection, env_file, fs_util, grants, logs, modes, pending_requests,
+    policy::{self, AccessRequest},
+    project_store, project_teardown, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     teams, unlock, vault,
 };
@@ -47,6 +48,8 @@ pub struct BrokerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     pub sessions: Vec<BrokerSessionStatus>,
+    #[serde(default)]
+    pub approval_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +98,29 @@ pub struct BrokerProjectLockStatus {
     pub revoked_session_grants: usize,
     pub cleared_unlock_sessions: usize,
     pub cancelled_human_commands: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerApprovalStatus {
+    pub request_id: uuid::Uuid,
+    pub project: String,
+    pub scope: ApprovalScope,
+    pub channel: ApprovalChannel,
+    pub grant_id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_receipt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses_remaining: Option<u32>,
+    #[serde(default)]
+    pub critical_confirmation: bool,
+    pub access: AccessRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -206,6 +232,20 @@ enum BrokerRequest {
         vault: PathBuf,
         payload: ApprovalReceiptPayload,
     },
+    ApproveRequest {
+        request_id: uuid::Uuid,
+        scope: ApprovalScope,
+        confirm_critical: bool,
+        channel: ApprovalChannel,
+    },
+    DenyRequest {
+        request_id: uuid::Uuid,
+        channel: ApprovalChannel,
+    },
+    ListApprovals {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
     RegisterHumanSession {
         shell_pid: u32,
         session_token: String,
@@ -268,6 +308,12 @@ enum BrokerResponse {
     },
     Signed {
         receipt: ApprovalReceipt,
+    },
+    Approval {
+        status: BrokerApprovalStatus,
+    },
+    Approvals {
+        approvals: Vec<BrokerApprovalStatus>,
     },
     Output {
         stream: String,
@@ -342,8 +388,45 @@ struct ActiveHumanCommand {
     child_pid: Arc<AtomicU32>,
 }
 
+#[derive(Debug, Clone)]
+struct BrokerApprovalRecord {
+    request_id: uuid::Uuid,
+    project: String,
+    vault: PathBuf,
+    access: AccessRequest,
+    scope: ApprovalScope,
+    channel: ApprovalChannel,
+    grant_id: uuid::Uuid,
+    approval_receipt_hash: Option<String>,
+    signer_key_id: Option<String>,
+    signature_algorithm: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    uses_remaining: Option<u32>,
+    critical_confirmation: bool,
+}
+
+impl BrokerApprovalRecord {
+    fn status(&self) -> BrokerApprovalStatus {
+        BrokerApprovalStatus {
+            request_id: self.request_id,
+            project: self.project.clone(),
+            scope: self.scope,
+            channel: self.channel,
+            grant_id: self.grant_id,
+            approval_receipt_hash: self.approval_receipt_hash.clone(),
+            signer_key_id: self.signer_key_id.clone(),
+            signature_algorithm: self.signature_algorithm.clone(),
+            expires_at: self.expires_at,
+            uses_remaining: self.uses_remaining,
+            critical_confirmation: self.critical_confirmation,
+            access: self.access.clone(),
+        }
+    }
+}
+
 struct BrokerState {
     sessions: BTreeMap<String, BrokerSession>,
+    approvals: BTreeMap<uuid::Uuid, BrokerApprovalRecord>,
     human_sessions: HashMap<u32, HumanSessionEntry>,
     human_commands: HashMap<u32, BTreeMap<u64, ActiveHumanCommand>>,
     execute_nonces: HashMap<String, DateTime<Utc>>,
@@ -355,6 +438,7 @@ impl Default for BrokerState {
     fn default() -> Self {
         Self {
             sessions: BTreeMap::new(),
+            approvals: BTreeMap::new(),
             human_sessions: HashMap::new(),
             human_commands: HashMap::new(),
             execute_nonces: HashMap::new(),
@@ -684,6 +768,7 @@ pub fn status() -> Result<BrokerStatus> {
             version: BROKER_VERSION.to_string(),
             started_at: None,
             sessions: Vec::new(),
+            approval_count: 0,
         }),
     }
 }
@@ -753,6 +838,57 @@ pub fn lock_project(project: &str, vault: &Path) -> Result<BrokerProjectLockStat
         vault: vault.to_path_buf(),
     })? {
         BrokerResponse::ProjectLock { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn approve_pending_request(
+    request_id: uuid::Uuid,
+    scope: ApprovalScope,
+    confirm_critical: bool,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    ensure_running()?;
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::ApproveRequest {
+        request_id,
+        scope,
+        confirm_critical,
+        channel,
+    })? {
+        BrokerResponse::Approval { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn deny_pending_request(
+    request_id: uuid::Uuid,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    ensure_running()?;
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::DenyRequest {
+        request_id,
+        channel,
+    })? {
+        BrokerResponse::Approval { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn list_approvals(project: Option<String>) -> Result<Vec<BrokerApprovalStatus>> {
+    ensure_running()?;
+    match send_simple(BrokerRequest::ListApprovals { project })? {
+        BrokerResponse::Approvals { approvals } => Ok(approvals),
         BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
         other => anyhow::bail!("unexpected broker response: {other:?}"),
     }
@@ -972,6 +1108,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
         let mut broker_state = state.lock().expect("broker state poisoned");
         cleanup_inactive_human_sessions(&mut broker_state);
         cleanup_expired_execute_nonces(&mut broker_state);
+        cleanup_expired_approvals(&mut broker_state);
     }
     match request {
         BrokerRequest::Ping => {
@@ -1177,6 +1314,68 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     write_response(&mut stream, &response)?;
                 }
             }
+        }
+        BrokerRequest::ApproveRequest {
+            request_id,
+            scope,
+            confirm_critical,
+            channel,
+        } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            match approve_pending_request_in_state(
+                &state,
+                request_id,
+                scope,
+                confirm_critical,
+                channel,
+            ) {
+                Ok(status) => write_response(&mut stream, &BrokerResponse::Approval { status })?,
+                Err(error) => {
+                    let response = broker_error("approval_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
+        BrokerRequest::DenyRequest {
+            request_id,
+            channel,
+        } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            match deny_pending_request_in_state(&state, request_id, channel) {
+                Ok(status) => write_response(&mut stream, &BrokerResponse::Approval { status })?,
+                Err(error) => {
+                    let response = broker_error("deny_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
+        BrokerRequest::ListApprovals { project } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            let mut state = state.lock().expect("broker state poisoned");
+            cleanup_expired_approvals(&mut state);
+            let approvals = state
+                .approvals
+                .values()
+                .filter(|approval| {
+                    project
+                        .as_deref()
+                        .is_none_or(|project| approval.project == project)
+                })
+                .map(BrokerApprovalRecord::status)
+                .collect();
+            write_response(&mut stream, &BrokerResponse::Approvals { approvals })?;
         }
         BrokerRequest::RegisterHumanSession {
             shell_pid,
@@ -1660,6 +1859,112 @@ fn sign_with_session(
     let signing_key = approval_receipts::decrypt_session_signing_key(&ciphertext, passphrase)?;
     payload.signer_key_id = signing_key.signer_key_id.clone();
     approval_receipts::sign_payload(payload, &signing_key)
+}
+
+fn approve_pending_request_in_state(
+    state: &Arc<Mutex<BrokerState>>,
+    request_id: uuid::Uuid,
+    scope: ApprovalScope,
+    confirm_critical: bool,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    if scope == ApprovalScope::Deny {
+        anyhow::bail!("use DenyRequest for denied requests");
+    }
+
+    let pending = pending_requests::load_pending_request(request_id)?;
+    let critical = detection::has_critical_findings(&pending.policy.findings);
+    if critical && !confirm_critical {
+        anyhow::bail!("critical request requires explicit critical confirmation");
+    }
+    crate::approvals::validate_scope_for_findings(scope, &pending.policy.findings)?;
+
+    let resolved = registry::resolve_project(Some(&pending.access.project), Path::new("."))?;
+    let mut decision = ApprovalDecision {
+        approved: true,
+        scope,
+        approved_env: pending.access.env.clone(),
+        denied_env: Vec::new(),
+        source: ApprovalSource::BrokerApproval,
+        grant_id: None,
+    };
+    let now = Utc::now();
+    let mut grant = grants::grant_from_decision(&pending.access, &decision, now)?;
+    grant.request_id = Some(request_id);
+    let payload = approval_receipts::build_payload_with_context(
+        &pending.access,
+        grant.id,
+        request_id,
+        &grant.approved_env,
+        grant.scope,
+        grant.expires_at,
+        critical && confirm_critical,
+        grant.created_at,
+        String::new(),
+        pending.verified_context.as_ref(),
+    );
+    let receipt = {
+        let state = state.lock().expect("broker state poisoned");
+        let session = active_session(&state, &pending.access.project, &resolved.vault)?;
+        sign_with_session(session, payload)?
+    };
+    grant.receipt = Some(receipt);
+    grants::append_grant_to_path(&grants::grants_path(), &grant)?;
+    pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "approved", &pending.access.project)?;
+
+    let receipt = grant
+        .receipt
+        .as_ref()
+        .expect("broker-created grant should have a receipt");
+    decision.grant_id = Some(grant.id);
+    let record = BrokerApprovalRecord {
+        request_id,
+        project: pending.access.project.clone(),
+        vault: resolved.vault,
+        access: pending.access,
+        scope,
+        channel,
+        grant_id: grant.id,
+        approval_receipt_hash: Some(receipt.payload_hash.clone()),
+        signer_key_id: Some(receipt.signer_key_id.clone()),
+        signature_algorithm: Some(receipt.signature_algorithm.clone()),
+        expires_at: grant.expires_at,
+        uses_remaining: grant.uses_remaining,
+        critical_confirmation: critical && confirm_critical,
+    };
+    let status = record.status();
+    if matches!(scope, ApprovalScope::Once | ApprovalScope::Session) {
+        state
+            .lock()
+            .expect("broker state poisoned")
+            .approvals
+            .insert(request_id, record);
+    }
+    Ok(status)
+}
+
+fn deny_pending_request_in_state(
+    _state: &Arc<Mutex<BrokerState>>,
+    request_id: uuid::Uuid,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    let pending = pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
+    Ok(BrokerApprovalStatus {
+        request_id,
+        project: pending.access.project.clone(),
+        scope: ApprovalScope::Deny,
+        channel,
+        grant_id: uuid::Uuid::nil(),
+        approval_receipt_hash: None,
+        signer_key_id: None,
+        signature_algorithm: None,
+        expires_at: None,
+        uses_remaining: None,
+        critical_confirmation: false,
+        access: pending.access,
+    })
 }
 
 struct ActiveProjectMaterial {
@@ -2167,6 +2472,7 @@ fn validate_execute_authorization(
                 ));
             }
             validate_execute_payload(state, project, vault, cwd, env_names, command, &payload)?;
+            validate_agent_execute_authority(state, &payload, proof)?;
             Ok(None)
         }
         ExecuteAuthorization::Internal { payload } => {
@@ -2219,6 +2525,197 @@ fn validate_execute_payload(
     Ok(())
 }
 
+fn validate_agent_execute_authority(
+    state: &mut BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+) -> std::result::Result<(), (String, String)> {
+    match payload.approval_source {
+        ApprovalSource::PolicyAuto => validate_policy_auto_authority(state, payload),
+        ApprovalSource::Grant | ApprovalSource::BrokerApproval => {
+            validate_grant_authority(state, payload, proof)
+        }
+        ApprovalSource::AgentMediated => Err((
+            "agent_self_approval_rejected".to_string(),
+            "agent-mediated approvals are no longer accepted; wait for dashboard or human approval"
+                .to_string(),
+        )),
+        ApprovalSource::LocalTty | ApprovalSource::ManualAllow => Err((
+            "human_approval_required".to_string(),
+            "agent executions cannot claim terminal or manual approval authority".to_string(),
+        )),
+        ApprovalSource::PolicyDeny => Err((
+            "policy_denied".to_string(),
+            "Ward policy denied this execution".to_string(),
+        )),
+    }
+}
+
+fn validate_policy_auto_authority(
+    state: &BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+) -> std::result::Result<(), (String, String)> {
+    let access = access_from_execute_payload(payload);
+    let resolved = registry::resolve_project(Some(&payload.project), Path::new("."))
+        .map_err(|error| ("project_unresolved".to_string(), error.to_string()))?;
+    if !same_vault_path(&resolved.vault, &payload.vault) {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "execution vault does not match the registered project vault".to_string(),
+        ));
+    }
+    let config = config::read_project_config(&resolved.path)
+        .map_err(|error| ("project_config_unavailable".to_string(), error.to_string()))?;
+    let findings =
+        detection::preflight_findings(&access.command, &access.env, access.action.as_deref());
+    let active_mode = active_session(state, &payload.project, &payload.vault)
+        .ok()
+        .and_then(|session| session.active_mode.as_ref());
+    let evaluation = policy::evaluate_request(&config, &access, active_mode, findings);
+    if evaluation.approval_mode == policy::ApprovalMode::Deny
+        || evaluation.requires_prompt
+        || !evaluation.denied_env.is_empty()
+        || !access
+            .env
+            .iter()
+            .all(|env_name| evaluation.approved_env.contains(env_name))
+    {
+        return Err((
+            "approval_required".to_string(),
+            "broker policy evaluation requires human approval".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_grant_authority(
+    state: &mut BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+) -> std::result::Result<(), (String, String)> {
+    let grant_id = payload.grant_id.ok_or_else(|| {
+        (
+            "execute_authorization_mismatch".to_string(),
+            "approved execution is missing a grant id".to_string(),
+        )
+    })?;
+    match payload.approval_scope {
+        ApprovalScope::Once | ApprovalScope::Session => {
+            validate_live_broker_approval(state, payload, grant_id)
+        }
+        ApprovalScope::Branch | ApprovalScope::Always => {
+            validate_durable_grant(payload, proof, grant_id)
+        }
+        ApprovalScope::Deny => Err((
+            "policy_denied".to_string(),
+            "denied approvals cannot authorize execution".to_string(),
+        )),
+    }
+}
+
+fn validate_live_broker_approval(
+    state: &mut BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+    grant_id: uuid::Uuid,
+) -> std::result::Result<(), (String, String)> {
+    cleanup_expired_approvals(state);
+    let Some(record) = state.approvals.values_mut().find(|approval| {
+        approval.grant_id == grant_id
+            && approval.project == payload.project
+            && same_vault_path(&approval.vault, &payload.vault)
+    }) else {
+        return Err((
+            "approval_required".to_string(),
+            "no active broker approval matched this once/session execution".to_string(),
+        ));
+    };
+    if record.scope != payload.approval_scope
+        || record.access.agent != payload.agent
+        || record.access.branch != payload.branch
+        || record.access.action != payload.action
+        || record.access.command != payload.command.join(" ")
+        || record.access.env != payload.env_names
+        || record.approval_receipt_hash != payload.approval_receipt_hash
+        || record.uses_remaining.unwrap_or(1) == 0
+    {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "active broker approval does not match requested command/env scope".to_string(),
+        ));
+    }
+    if let Some(uses_remaining) = record.uses_remaining.as_mut() {
+        *uses_remaining = uses_remaining.saturating_sub(1);
+    }
+    Ok(())
+}
+
+fn validate_durable_grant(
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+    grant_id: uuid::Uuid,
+) -> std::result::Result<(), (String, String)> {
+    let access = access_from_execute_payload(payload);
+    let critical = detection::has_critical_findings(&detection::preflight_findings(
+        &access.command,
+        &access.env,
+        access.action.as_deref(),
+    ));
+    let verified_context = verified_context_from_payload(payload, proof);
+    let matched = match verified_context.as_ref() {
+        Some(context) => grants::find_matching_grant_with_context(&access, context),
+        None => grants::find_matching_grant(&access),
+    }
+    .map_err(|error| ("grant_lookup_failed".to_string(), error.to_string()))?;
+    let Some(grant) = matched else {
+        return Err((
+            "approval_required".to_string(),
+            "no durable grant matched this execution".to_string(),
+        ));
+    };
+    let receipt_hash = grant
+        .receipt
+        .as_ref()
+        .map(|receipt| receipt.payload_hash.clone());
+    if grant.id != grant_id
+        || grant.scope != payload.approval_scope
+        || receipt_hash != payload.approval_receipt_hash
+        || critical
+    {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "durable grant does not match requested command/env scope".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn access_from_execute_payload(payload: &ExecuteAuthorizationPayload) -> AccessRequest {
+    AccessRequest {
+        project: payload.project.clone(),
+        agent: payload.agent.clone(),
+        branch: payload.branch.clone(),
+        action: payload.action.clone(),
+        command: payload.command.join(" "),
+        env: payload.env_names.clone(),
+    }
+}
+
+fn verified_context_from_payload(
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+) -> Option<crate::context::VerifiedContext> {
+    Some(crate::context::VerifiedContext {
+        project: payload.project.clone(),
+        agent: payload.agent.clone()?,
+        agent_key_id: proof.agent_key_id.clone(),
+        worktree: payload.worktree.clone()?,
+        branch: payload.branch.clone()?,
+        git_remote: payload.git_remote.clone()?,
+        commit: payload.commit.clone()?,
+        git_common_dir: None,
+    })
+}
+
 fn validate_list_keys_authorization(
     state: &Arc<Mutex<BrokerState>>,
     authorization: &ListKeysAuthorization,
@@ -2267,6 +2764,23 @@ fn cleanup_expired_execute_nonces(state: &mut BrokerState) {
     state
         .execute_nonces
         .retain(|_, expires_at| *expires_at > now);
+}
+
+fn cleanup_expired_approvals(state: &mut BrokerState) {
+    let now = Utc::now();
+    let active_sessions = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.expires_at > now)
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    state.approvals.retain(|_, approval| {
+        approval
+            .expires_at
+            .is_none_or(|expires_at| expires_at > now)
+            && approval.uses_remaining.unwrap_or(1) > 0
+            && active_sessions.contains(&session_key(&approval.project, &approval.vault))
+    });
 }
 
 #[cfg(test)]
@@ -2523,6 +3037,7 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
                 active_mode: session.active_mode.as_ref().map(|m| m.config.name.clone()),
             })
             .collect(),
+        approval_count: state.approvals.len(),
     }
 }
 
@@ -2662,6 +3177,9 @@ fn lock_project_in_state(
     let (broker_session_removed, cancelled_human_commands) = {
         let mut state = state.lock().expect("broker state poisoned");
         let removed = state.sessions.remove(&key).is_some();
+        state
+            .approvals
+            .retain(|_, approval| !approval.project.eq(project));
         let cancelled = cancel_project_human_commands(&mut state, project);
         (removed, cancelled)
     };
@@ -2683,6 +3201,9 @@ fn discard_project_runtime_after_teardown(
 ) {
     let mut state = state.lock().expect("broker state poisoned");
     state.sessions.remove(&session_key(project, vault));
+    state
+        .approvals
+        .retain(|_, approval| !approval.project.eq(project));
     cancel_project_human_commands(&mut state, project);
 }
 
@@ -2800,6 +3321,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         version: BROKER_VERSION.to_string(),
         started_at: Some(Utc::now()),
         sessions: Vec::new(),
+        approval_count: 0,
     };
     let ping_result = with_fake_broker(vec![vec![BrokerResponse::Ok]], ping)?;
     assert!(ping_result.is_err());
@@ -3373,6 +3895,7 @@ mod tests {
             ppid: Some(1),
             version: BROKER_VERSION.to_string(),
             started_at: Some(now),
+            approval_count: 0,
             sessions: vec![
                 BrokerSessionStatus {
                     project: "other".to_string(),
@@ -3652,17 +4175,55 @@ mod tests {
                     "demo",
                     &vault_path,
                     &cwd,
-                    access.env,
-                    command,
+                    access.env.clone(),
+                    command.clone(),
                     "codex",
                 )),
             },
         )
         .unwrap();
-        assert!(!handle_client(server, state).unwrap());
+        assert!(!handle_client(server, Arc::clone(&state)).unwrap());
         let mut reader = BufReader::new(client);
         let finished = read_response(&mut reader).unwrap();
-        assert!(matches!(finished, BrokerResponse::Finished { .. }));
+        assert!(matches!(
+            finished,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "human_approval_required"
+        ));
+
+        let mut forged_payload =
+            test_execute_payload("demo", &vault_path, &cwd, access.env, command.clone());
+        forged_payload.approval_source = ApprovalSource::AgentMediated;
+        forged_payload.agent = Some("codex".to_string());
+        forged_payload.worktree = Some(cwd.clone());
+        forged_payload.branch = Some("main".to_string());
+        forged_payload.git_remote = Some(String::new());
+        forged_payload.commit = Some("abc123".to_string());
+        let proof_payload = serde_json::to_string(&forged_payload).unwrap();
+        let forged_proof = agents::sign_payload("demo", "codex", &proof_payload).unwrap();
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: forged_payload.env_names.clone(),
+                command,
+                inherited_env: inherited_execution_env(),
+                authorization: Some(ExecuteAuthorization::Agent {
+                    proof: forged_proof,
+                }),
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "agent_self_approval_rejected"
+        ));
 
         std::env::remove_var("WARD_HOME");
     }

@@ -53,7 +53,8 @@ Ward will create a dashboard notification and keep the original process alive
 until the request is approved, denied, unlocked, or timed out. Do not end the
 task just because Ward is waiting.
 Lower-level request/wait flows can use `ward approvals wait <request-id>
---json --timeout 30m` after surfacing the approval choice to the user.
+--json --timeout 30m` after surfacing the approval choice to the user. This is
+a passive wait primitive only; it cannot approve, deny, sign, or mutate grants.
 
 Manual request template:
 
@@ -77,7 +78,9 @@ user as explicit choices. Use native structured choice UI when your agent
 interface supports it; do not present approval choices as loose prose when
 buttons, selectors, or typed choice prompts are available. If your structured
 choice UI has a 4-option limit, present the approval scopes in the picker and
-show `denyCommand` as a separate explicit denial action.
+show `denyCommand` as a separate explicit denial action. Do not run
+`approveCommands` or `denyCommand` yourself; they are human-terminal fallback
+commands and Ward requires local confirmation before they mutate trust state.
 
 If a no-prompt command returns `"status": "worktree_approval_required"` or
 `"approvalType": "worktreeBinding"`, show the worktree binding as a structured
@@ -92,18 +95,23 @@ Surface `action.*` findings before asking for approval. They mean the declared
 action text may include prompt-injection, approval-coercion, or secret-exposure
 language.
 
-After the user approves in the agent UI, record that approval with the matching
-approve command:
+Agents must never run `ward approve`, `ward deny`, `ward allow`, or
+`ward worktrees approve`. Those commands mutate trust state and are human-only
+fallbacks. After surfacing the request, wait for dashboard or human-terminal
+approval instead:
 
 ```bash
-ward unlock --ttl 8h
-ward approve <request-id> --scope <session|branch|always> --agent-mediated --json
+ward approvals wait <request-id> --json
 ```
 
-Approvals are signed. If `ward approve` or `ward allow` reports
-`"status": "unlock_required"` or `signing_key_unavailable`, ask the user to run
-`ward unlock --ttl 8h` and then retry the approval. Never ask the user for
-the PIN/passphrase directly.
+Approvals are signed by the broker after dashboard approval or a local human
+terminal fallback. If approval reports `"status": "unlock_required"` or
+`signing_key_unavailable`, ask the user to run `ward unlock --ttl 8h` and then
+approve from the dashboard or terminal. Never ask the user for the PIN/passphrase
+directly.
+Agents cannot create approval authority by running another Ward command. The
+broker rechecks the final execution against broker-held approval records or a
+valid durable broker-signed grant before decrypting envs.
 
 If a no-prompt command returns `"unlockRequired": true`, ask the user to run:
 
@@ -130,8 +138,7 @@ auto-approve it and do not create a durable grant. Critical requests can only be
 denied or approved once:
 
 ```bash
-ward deny <request-id> --agent-mediated --json
-ward approve <request-id> --scope once --confirm-critical --agent-mediated --json
+ward approvals wait <request-id> --json
 ```
 
 Run template:
@@ -165,5 +172,5 @@ plaintext `.env` files for agents.
 Never ask for, echo, store, or pipe the Ward vault PIN/passphrase.
 `ward init` and `ward setup` create the initial run unlock by default; the
 user may run `ward unlock --ttl 8h` locally later to refresh it. Viewing
-decrypted logs always requires the user's PIN/passphrase. Agent-mediated
-approvals are logged trust events, not cryptographic proof of human approval.
+decrypted logs always requires the user's PIN/passphrase. Agents can request
+and wait, but approval authority belongs to the broker and human approval paths.

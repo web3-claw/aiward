@@ -19,7 +19,7 @@ profiles and presets for trusted commands, grant approvals for a session,
 branch, or long-lived project workflow, and use session modes to limit which
 envs are available while the vault is unlocked. For more casual environments,
 create broader profiles or auto-approved presets. Agent mode still stays
-explicit, scoped, and audited.
+explicit, scoped, broker-authorized, and audited.
 
 ---
 
@@ -191,6 +191,11 @@ ward allow --profile dev --agent codex --scope always
 ward dev --agent codex
 ```
 
+`ward allow` is a human terminal command. It creates a durable scoped grant and
+requires local confirmation; agents should not run it. For agent workflows, use
+`ward run --wait-for-approval` and approve from the dashboard or a local human
+terminal fallback.
+
 **Presets** are lower-level policy rules for raw command matching. Use them when
 you want a known command pattern to be approved automatically if it asks only
 for the allowed env names and no critical findings are detected:
@@ -253,8 +258,11 @@ appear alongside regular projects once detected or configured.
 The header notification center shows anything currently blocking an agent:
 run approvals, critical confirmations, worktree bindings, unlock-required
 states, missing vault keys, and policy denials. For approvable requests, the
-dashboard uses the same signed grant logic as `ward approve`; it also shows
-copyable CLI commands as a fallback.
+dashboard asks the broker to approve or deny the exact pending request. The
+broker signs the grant, stores active once/session approval state, and unblocks
+waiting agents only when the execution still matches the approved command, env
+names, agent identity, and git context. The dashboard also shows copyable CLI
+commands as a human-terminal fallback.
 
 ---
 
@@ -303,12 +311,28 @@ ward run --wait-for-approval --approval-timeout 30m --json --no-prompt -- <comma
 When Ward blocks, this creates a dashboard notification and keeps the original
 process alive until the human approves, denies, unlocks, or the timeout expires.
 The lower-level tools are `ward approvals list --json` and
-`ward approvals wait <request-id> --json`.
+`ward approvals wait <request-id> --json`. These are passive inspection and wait
+tools; they cannot approve, deny, sign, or mutate grants.
+
+Agents must not run approval-mutating commands:
+
+```bash
+ward approve <request-id>
+ward deny <request-id>
+ward allow ...
+ward worktrees approve <request-id>
+```
+
+Those commands are human fallback tools and require an interactive local
+terminal confirmation. Dashboard approval is the preferred path because it goes
+directly through the broker approval RPC.
 
 The agent flow at a glance:
 
 ```
 agent runs with wait  →  ward evaluates scope  →  you approve or deny
+            ↓
+ broker verifies the exact approval before decrypting envs
             ↓
   ward injects only the approved env vars into the command
             ↓
@@ -328,10 +352,17 @@ Within that boundary, ward gives you hard guarantees:
 - **Vault rotation can move the vault to a derived filename.** The default vault file is `.env.vault`; `ward rotate` moves it to a passphrase-derived hidden filename and updates the registry and locked `.env` marker.
 - **Session encryption.** While an unlock session is active, the vault on disk is re-encrypted with a random ephemeral key held only in broker memory. Your passphrase-encrypted form does not exist on disk during an active session.
 - **Authenticated broker operations.** Session-backed broker calls that execute commands, enumerate vault keys, sign approvals, or set up new projects require a trusted Ward client process and request authorization bound to the exact operation. Raw socket clients cannot bypass Ward policy just because a session is unlocked.
+- **Broker-owned approval authority.** Agents can request access and wait, but
+  they cannot create approvals, claim `agent-mediated` approval, or decide that
+  a grant matches. Pending request approvals are created by the broker through
+  dashboard approval or a confirmed local human terminal fallback. `once` and
+  `session` approvals must match active broker state before envs decrypt;
+  `branch` and `always` grants remain durable but are still broker-signed and
+  matched to the exact command, env names, agent identity, and git context.
 - **Recovery key.** A recovery key is stored locally and encrypted with the same vault passphrase. If a session is interrupted and the broker can't restore the vault automatically, ward can use the recovery file plus your passphrase to restore access. The recovery directory contains decoys — files that are indistinguishable from the real key without the correct passphrase.
 - **Secrets are never written to disk in plaintext** during normal operation.
 - **Every secret injection is logged** with the requesting identity and scope.
-- **Approval grants are signed** — editing them invalidates them.
+- **Approval grants are signed by Ward** — editing them invalidates them.
 - **Audit logs are hash-chained** — tampering is detectable.
 
 Ward operates at the workflow layer, not the OS level. The protection is effective as long as secret-bearing commands run through ward — agents cannot access secrets outside their approved scope, and every injection is logged and attributable. Ward is not a sandbox for arbitrary same-user malware, and agents should not be run inside human-mode terminals if you want agent-mode scoping guarantees.
