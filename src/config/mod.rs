@@ -501,6 +501,10 @@ In monorepos, `--worktree` must be the Git top-level path from
 project lives inside `apps/<name>`.
 If the workspace root has multiple Ward projects, pass `--app <app-name>` or
 `--project <project-name>` on every agent request/run.
+Human mode is per app in monorepos. Tell the user to run `ward human` from the
+app folder they are working in, or `ward human --app <app-name>` from the
+workspace root. If they need multiple app terminals, they should activate human
+mode separately in each one.
 
 `--profile` is mutually exclusive with `--command` and `--env`. For `ward run`,
 you may append extra child args after `--`, for example

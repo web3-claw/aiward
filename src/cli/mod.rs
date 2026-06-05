@@ -2762,7 +2762,8 @@ fn print_workspace_setup_result(result: &WorkspaceSetupResult) {
     term::section("Next");
     if !result.configured.is_empty() {
         term::next("open the dashboard: ward dashboard start");
-        term::next("activate a protected terminal inside an app: ward human");
+        term::next("activate an app terminal: cd apps/<app> && ward human");
+        term::next("or from the workspace root: ward human --app <app>");
     } else {
         term::next("open the dashboard: ward dashboard start");
     }

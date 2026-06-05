@@ -94,6 +94,16 @@ Human mode turns your current terminal into a ward-protected session. Once activ
 ward human
 ```
 
+In monorepos, human mode is activated per app. From an app folder, run
+`ward human` normally. From the workspace root, choose a target app:
+
+```bash
+ward human --app core-workbench
+```
+
+Run `ward human` once for each app terminal you want protected. Ward does not
+implicitly unlock every app from the workspace root.
+
 Ward spawns a guardian tied to your terminal. When you run `pnpm dev`, `node`, or any other command that needs secrets, ward intercepts it, injects the approved env vars, and lets the process run. Inside a Ward project, wrapped commands fail closed if human mode is not active for that terminal, so a dev server does not silently start without secrets.
 
 `ward human` prints a guided activation summary with the active project, session
