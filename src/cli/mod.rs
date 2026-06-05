@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use dirs;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     agents, anomaly,
@@ -372,7 +373,16 @@ pub enum Commands {
         command: ModesCommand,
     },
     /// Clear unlock sessions and revoke session-scoped approval grants.
-    Lock,
+    Lock {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        workspace: bool,
+        #[arg(long)]
+        all: bool,
+    },
     /// Export plaintext env and remove Ward files from a project.
     Teardown {
         #[arg(long)]
@@ -454,6 +464,8 @@ pub enum Commands {
         session_token: String,
         #[arg(long)]
         ttl_seconds: i64,
+        #[arg(long = "project")]
+        projects: Vec<String>,
     },
 }
 
@@ -1146,7 +1158,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             verify_only,
         } => unlock_vault_for_target(project, app, all, &ttl, mode.as_deref(), verify_only),
         Commands::Modes { command } => modes_command(command),
-        Commands::Lock => lock(),
+        Commands::Lock {
+            project,
+            app,
+            workspace,
+            all,
+        } => lock(project, app, workspace, all),
         Commands::Teardown {
             project,
             app,
@@ -1177,7 +1194,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             shell_pid,
             session_token,
             ttl_seconds,
-        } => crate::human::serve_guardian(shell_pid, &session_token, ttl_seconds),
+            projects,
+        } => crate::human::serve_guardian(shell_pid, &session_token, ttl_seconds, projects),
     }
 }
 
@@ -2918,6 +2936,7 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
             }
         }
         WorktreesCommand::Approve { request_id, json } => {
+            require_human_terminal_confirmation("APPROVE-WORKTREE", request_id)?;
             if let Some(worktree) = worktrees::approve_pending(request_id)? {
                 if json {
                     println!(
@@ -2946,6 +2965,7 @@ fn worktrees_command(command: WorktreesCommand) -> Result<()> {
             }
         }
         WorktreesCommand::Deny { request_id, json } => {
+            require_human_terminal_confirmation("DENY-WORKTREE", request_id)?;
             if worktrees::deny_pending(request_id)? {
                 if json {
                     println!(
@@ -3417,9 +3437,18 @@ fn with_passphrase_vault_access<T>(
     let active_expires_at = broker::active_session_expiry(&resolved.name, &resolved.vault)?;
     let active_ttl = active_expires_at
         .and_then(|expires_at| remaining_session_ttl(expires_at, chrono::Utc::now()));
-
     if active_ttl.is_some() {
-        broker::stop().context("failed to restore active broker session before vault access")?;
+        if let Some(session_fingerprint) =
+            broker::active_session_fingerprint(&resolved.name, &resolved.vault)?
+        {
+            let file_fingerprint = vault_file_fingerprint(&resolved.vault)?;
+            if session_fingerprint != file_fingerprint {
+                anyhow::bail!(
+                    "active broker session is stale for {}; run ward unlock again before modifying the vault",
+                    resolved.name
+                );
+            }
+        }
     }
 
     let result = operation();
@@ -3439,6 +3468,11 @@ fn with_passphrase_vault_access<T>(
         }
     }
     result
+}
+
+fn vault_file_fingerprint(vault: &Path) -> Result<String> {
+    let bytes = fs::read(vault).with_context(|| format!("failed to read {}", vault.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn refresh_project_store_with_passphrase(
@@ -3821,6 +3855,7 @@ fn allow_for_target(
     if matches!(scope, ApprovalScope::Once | ApprovalScope::Deny) {
         anyhow::bail!("ward allow supports session, branch, and always scopes");
     }
+    require_manual_allow_confirmation(scope)?;
     require_agent_identity_for_non_human(agent.as_deref())?;
 
     let git = git_context::collect_git_context(&cwd);
@@ -3866,6 +3901,49 @@ fn allow_for_target(
     audit_logs::append_event(LogKind::Approvals, approval_event)?;
     println!("Created {} grant {}", scope, grant.id);
     Ok(())
+}
+
+fn require_manual_allow_confirmation(scope: ApprovalScope) -> Result<()> {
+    #[cfg(any(test, coverage))]
+    {
+        let _ = scope;
+        return Ok(());
+    }
+
+    #[cfg(not(any(test, coverage)))]
+    {
+        use std::io::IsTerminal as _;
+
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            anyhow::bail!(
+                "ward allow requires an interactive local terminal; agents must use ward run --wait-for-approval"
+            );
+        }
+        eprintln!("Ward allow creates a durable {scope} grant.");
+        eprintln!(
+            "Type `ALLOW {}` to continue:",
+            approval_scope_cli_value(scope)
+        );
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read allow confirmation")?;
+        if input.trim() != format!("ALLOW {}", approval_scope_cli_value(scope)) {
+            anyhow::bail!("confirmation did not match; no grant was created");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(test, coverage)))]
+fn approval_scope_cli_value(scope: ApprovalScope) -> &'static str {
+    match scope {
+        ApprovalScope::Once => "once",
+        ApprovalScope::Session => "session",
+        ApprovalScope::Branch => "branch",
+        ApprovalScope::Always => "always",
+        ApprovalScope::Deny => "deny",
+    }
 }
 
 fn grants_command(command: GrantsCommand) -> Result<()> {
@@ -3974,6 +4052,35 @@ fn wait_for_approval_command(request_id: uuid::Uuid, json: bool, timeout: &str) 
     }
 }
 
+fn require_human_terminal_confirmation(action: &str, request_id: uuid::Uuid) -> Result<()> {
+    #[cfg(any(test, coverage))]
+    {
+        let _ = (action, request_id);
+        return Ok(());
+    }
+
+    #[cfg(not(any(test, coverage)))]
+    {
+        use std::io::IsTerminal as _;
+
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            anyhow::bail!(
+                "Ward {action} requires an interactive local terminal; use the dashboard approval flow or ask a human to run this command"
+        );
+        }
+        eprintln!("Ward {action} requires local human confirmation.");
+        eprintln!("Type `{action} {request_id}` to continue:");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .context("failed to read approval confirmation")?;
+        if input.trim() != format!("{action} {request_id}") {
+            anyhow::bail!("confirmation did not match; no approval state was changed");
+        }
+        Ok(())
+    }
+}
+
 fn approve(
     request_id: uuid::Uuid,
     scope: ApprovalScope,
@@ -3981,12 +4088,17 @@ fn approve(
     agent_mediated: bool,
     json: bool,
 ) -> Result<()> {
+    if agent_mediated {
+        anyhow::bail!(
+            "--agent-mediated can no longer create approvals; agents must use `ward run --wait-for-approval` or `ward approvals wait <request-id> --json`"
+        );
+    }
+    require_human_terminal_confirmation("APPROVE", request_id)?;
     match approve_inner(
         request_id,
         scope,
         confirm_critical,
-        agent_mediated,
-        approval_channel_for_terminal(agent_mediated),
+        ApprovalChannel::TerminalApprove,
     ) {
         Ok(response) => {
             if json {
@@ -4029,35 +4141,25 @@ fn approve_inner(
     request_id: uuid::Uuid,
     scope: ApprovalScope,
     confirm_critical: bool,
-    agent_mediated: bool,
     approval_channel: ApprovalChannel,
 ) -> Result<ApproveJsonResponse> {
     if scope == ApprovalScope::Deny {
         anyhow::bail!("use ward deny for denied requests");
     }
     let pending = pending_requests::load_pending_request(request_id)?;
-    let cwd = env::current_dir()?;
-    let resolved = registry::resolve_project(Some(&pending.access.project), &cwd)?;
     let critical = detection::has_critical_findings(&pending.policy.findings);
     validate_pending_approval(&pending, scope, confirm_critical)?;
-    let source = if agent_mediated {
-        approvals::ApprovalSource::AgentMediated
-    } else {
-        approvals::ApprovalSource::LocalTty
+    let status =
+        broker::approve_pending_request(request_id, scope, confirm_critical, approval_channel)?;
+    let source = approvals::ApprovalSource::BrokerApproval;
+    let decision = ApprovalDecision {
+        approved: true,
+        scope,
+        approved_env: status.access.env.clone(),
+        denied_env: Vec::new(),
+        source,
+        grant_id: Some(status.grant_id),
     };
-    let receipt_context = Some(grants::GrantReceiptContext::pending(
-        request_id,
-        critical && confirm_critical,
-        pending.verified_context.clone(),
-    ));
-    let access = &pending.access;
-    let vault = &resolved.vault;
-    let grant = grants::persist_manual_grant(access, scope, source, vault, receipt_context)?;
-    pending_requests::consume_pending_request(request_id)?;
-    pending_requests::record_resolution(request_id, "approved", &pending.access.project)?;
-    let receipt = grant.receipt.as_ref();
-    let mut decision = grants::approval_from_grant(&pending.access, &grant);
-    decision.source = source;
     let request_snapshot = request_audit_snapshot(
         &pending.access,
         &pending.policy,
@@ -4071,10 +4173,10 @@ fn approve_inner(
         approval_channel,
         request_snapshot: Some(request_snapshot),
         decision: &decision,
-        persisted_grant: Some(grant.id),
-        approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.as_str()),
-        signer_key_id: receipt.map(|receipt| receipt.signer_key_id.as_str()),
-        signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.as_str()),
+        persisted_grant: Some(status.grant_id),
+        approval_receipt_hash: status.approval_receipt_hash.as_deref(),
+        signer_key_id: status.signer_key_id.as_deref(),
+        signature_algorithm: status.signature_algorithm.as_deref(),
         critical_confirmation: critical && confirm_critical,
         human_proof: approval_human_proof(source),
     };
@@ -4083,10 +4185,10 @@ fn approve_inner(
         status: "approved",
         request_id,
         project: pending.access.project,
-        grant_id: grant.id,
-        approval_receipt_hash: receipt.map(|receipt| receipt.payload_hash.clone()),
-        signer_key_id: receipt.map(|receipt| receipt.signer_key_id.clone()),
-        signature_algorithm: receipt.map(|receipt| receipt.signature_algorithm.clone()),
+        grant_id: status.grant_id,
+        approval_receipt_hash: status.approval_receipt_hash,
+        signer_key_id: status.signer_key_id,
+        signature_algorithm: status.signature_algorithm,
         approval_source: source,
         approval_channel,
     })
@@ -4101,7 +4203,6 @@ pub(crate) fn approve_request_from_dashboard(
         request_id,
         scope,
         confirm_critical,
-        true,
         ApprovalChannel::Dashboard,
     )?;
     serde_json::to_value(response).context("failed to serialize approval response")
@@ -4120,7 +4221,13 @@ fn validate_pending_approval(
 }
 
 fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> {
-    let pending = match pending_requests::consume_pending_request(request_id) {
+    if agent_mediated {
+        anyhow::bail!(
+            "--agent-mediated can no longer deny requests; agents must use `ward run --wait-for-approval` or `ward approvals wait <request-id> --json`"
+        );
+    }
+    require_human_terminal_confirmation("DENY", request_id)?;
+    let pending = match pending_requests::load_pending_request(request_id) {
         Ok(pending) => pending,
         Err(error) if json => {
             if print_pending_request_error_json(request_id, &error)? {
@@ -4130,12 +4237,8 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         }
         Err(error) => return Err(error),
     };
-    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
-    let source = if agent_mediated {
-        approvals::ApprovalSource::AgentMediated
-    } else {
-        approvals::ApprovalSource::LocalTty
-    };
+    let status = broker::deny_pending_request(request_id, ApprovalChannel::TerminalApprove)?;
+    let source = approvals::ApprovalSource::BrokerApproval;
     let decision = ApprovalDecision {
         approved: false,
         scope: ApprovalScope::Deny,
@@ -4144,7 +4247,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
         source,
         grant_id: None,
     };
-    let approval_channel = approval_channel_for_terminal(agent_mediated);
+    let approval_channel = ApprovalChannel::TerminalApprove;
     let request_snapshot = request_audit_snapshot(
         &pending.access,
         &pending.policy,
@@ -4172,7 +4275,7 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
             serde_json::to_string_pretty(&serde_json::json!({
                 "status": "denied",
                 "requestId": request_id,
-                "project": pending.access.project,
+                "project": status.project,
                 "approvalSource": source,
                 "approvalChannel": approval_channel,
             }))?
@@ -4184,9 +4287,9 @@ fn deny(request_id: uuid::Uuid, agent_mediated: bool, json: bool) -> Result<()> 
 }
 
 pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Value> {
-    let pending = pending_requests::consume_pending_request(request_id)?;
-    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
-    let source = approvals::ApprovalSource::AgentMediated;
+    let pending = pending_requests::load_pending_request(request_id)?;
+    let status = broker::deny_pending_request(request_id, ApprovalChannel::Dashboard)?;
+    let source = approvals::ApprovalSource::BrokerApproval;
     let decision = ApprovalDecision {
         approved: false,
         scope: ApprovalScope::Deny,
@@ -4219,7 +4322,7 @@ pub(crate) fn deny_request_from_dashboard(request_id: uuid::Uuid) -> Result<Valu
     Ok(serde_json::json!({
         "status": "denied",
         "requestId": request_id,
-        "project": pending.access.project,
+        "project": status.project,
         "approvalSource": source,
         "approvalChannel": ApprovalChannel::Dashboard,
     }))
@@ -4613,8 +4716,8 @@ fn run_with_context(
                 if broker_execution_rejection_is_authoritative(&broker_err) {
                     anyhow::bail!("broker rejected execution: {broker_err}");
                 }
-                // If an active unlock session exists but the broker isn't running,
-                // the vault may be session-encrypted. Direct decryption won't work.
+                // If only broker metadata exists and the broker is unavailable,
+                // there is no usable secret material for no-prompt execution.
                 let fallback_passphrase = match unlock::active_run_lookup(
                     &resolved.name,
                     &resolved.vault,
@@ -4622,9 +4725,9 @@ fn run_with_context(
                     unlock::RunUnlockLookup::Available(passphrase) => Some(passphrase),
                     unlock::RunUnlockLookup::MaterialUnavailable { .. } => {
                         anyhow::bail!(
-                                "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
-                                broker_err
-                            );
+                            "broker session metadata exists but broker is not running ({})\nRun `ward unlock` to recreate the master session.",
+                            broker_err
+                        );
                     }
                     unlock::RunUnlockLookup::Missing => None,
                 };
@@ -4632,12 +4735,13 @@ fn run_with_context(
                     Some(passphrase) => passphrase,
                     None => vault::read_existing_passphrase()?,
                 };
+                let plaintext = vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
+                let env = env_file::parse_env_map(&plaintext)?;
                 runner::run_command(RunCommandRequest {
                     cwd: cwd.clone(),
-                    vault: resolved.vault.clone(),
                     env_names: decision.approved_env.clone(),
+                    env,
                     command: command_args,
-                    passphrase,
                     inherited_env: std::env::vars().collect(),
                     cancellation: None,
                     human_shell_pid: if human_terminal {
@@ -4764,7 +4868,6 @@ fn doctor_workspace(cwd: &Path) -> Result<()> {
         term::next("run: ward setup --workspace --all");
         return Ok(());
     }
-    let broker_status = broker::status().ok();
     for target in targets {
         let cfg_status = if config::config_path(&target.path).is_file() {
             "config ok"
@@ -4776,14 +4879,8 @@ fn doctor_workspace(cwd: &Path) -> Result<()> {
         } else {
             "vault missing"
         };
-        let session = broker_status
-            .as_ref()
-            .map(|status| {
-                status.sessions.iter().any(|session| {
-                    session.project == target.name && same_path(&session.vault, &target.vault)
-                })
-            })
-            .unwrap_or(false);
+        let session =
+            broker::list_vault_keys_from_active_session(&target.name, &target.vault).is_ok();
         let session_status = if session { "session active" } else { "locked" };
         let app = target.app_slug.as_deref().unwrap_or(&target.name);
         term::info(&format!(
@@ -4943,14 +5040,14 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
                         term::info(&format!("started  {}", started_at.to_rfc3339()));
                     }
                     term::info(&format!("sessions  {}", status.sessions.len()));
-                    let active = status
-                        .sessions
-                        .iter()
-                        .any(|s| s.project == project.name && same_path(&s.vault, &project.vault));
-                    if active {
-                        term::ok("Active broker unlock session is available");
-                    } else {
-                        warn_missing_broker_session(&project.name, &project.vault);
+                    term::info(&format!("broker approvals  {}", status.approval_count));
+                    match broker::list_vault_keys_from_active_session(&project.name, &project.vault)
+                    {
+                        Ok(names) => {
+                            term::ok("active broker session can serve env names");
+                            term::info(&format!("env names in memory  {}", names.len()));
+                        }
+                        Err(_) => warn_missing_broker_session(&project.name, &project.vault),
                     }
                 }
                 Ok(_) => warn_missing_broker_session(&project.name, &project.vault),
@@ -4990,12 +5087,11 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
                 }
                 Err(error) => term::fail(&format!("project-store check failed — {error}")),
             }
-            match broker::active_session_expiry(&project.name, &project.vault) {
-                Ok(Some(_)) => term::ok("active broker session can refresh/provision"),
-                Ok(None) => {
+            match broker::list_vault_keys_from_active_session(&project.name, &project.vault) {
+                Ok(_) => term::ok("active broker session can refresh/provision"),
+                Err(_) => {
                     term::warn("run ward unlock --ttl 8h to refresh/provision from this project")
                 }
-                Err(error) => term::fail(&format!("broker session check failed — {error}")),
             }
         }
         Err(error) => term::fail(&format!("registry resolve failed — {error}")),
@@ -5273,8 +5369,8 @@ pub(crate) fn create_run_unlock_session(
 ) -> Result<unlock::UnlockSession> {
     let ttl = unlock::parse_ttl(ttl)?;
 
-    // Send unlock to broker first. The broker handles both passphrase-encrypted and
-    // session-encrypted vaults (restoring from the existing session before re-decrypting).
+    // Send unlock to the broker first. The broker decrypts the stable vault once
+    // and keeps the runtime env map in memory for command injection.
     broker::unlock_project_with_mode(
         project,
         vault_path,
@@ -5372,15 +5468,19 @@ fn unlock_vault_for_target(
         let targets = workspace_target::resolve_many(&selector, &cwd)?;
         for target in targets {
             let resolved = target.resolved_project();
-            match broker::active_session_expiry(&resolved.name, &resolved.vault)? {
-                Some(expires_at) => {
+            match broker::list_vault_keys_from_active_session(&resolved.name, &resolved.vault) {
+                Ok(names) => {
+                    let expires_at =
+                        broker::active_session_expiry(&resolved.name, &resolved.vault)?
+                            .context("broker session can serve env names but has no expiry")?;
                     println!(
-                        "{} broker session active until {}.",
+                        "{} broker session active until {} ({} env names in memory).",
                         resolved.name,
-                        expires_at.to_rfc3339()
+                        expires_at.to_rfc3339(),
+                        names.len()
                     );
                 }
-                None => anyhow::bail!(
+                Err(_) => anyhow::bail!(
                     "broker has no active session for {}; run ward unlock --ttl 8h",
                     resolved.name
                 ),
@@ -5418,7 +5518,54 @@ fn unlock_vault_for_target(
     Ok(())
 }
 
-fn lock() -> Result<()> {
+fn lock(
+    project: Option<String>,
+    app: Option<String>,
+    workspace_scope: bool,
+    all: bool,
+) -> Result<()> {
+    if project.is_some() && app.is_some() {
+        anyhow::bail!("choose either --project or --app, not both");
+    }
+    if all && (project.is_some() || app.is_some() || workspace_scope) {
+        anyhow::bail!("--all cannot be combined with --project, --app, or --workspace");
+    }
+    if workspace_scope && (project.is_some() || app.is_some()) {
+        anyhow::bail!("--workspace cannot be combined with --project or --app");
+    }
+
+    if project.is_some() || app.is_some() || workspace_scope {
+        let cwd = env::current_dir()?;
+        let targets = if workspace_scope {
+            let discovery = workspace::discover_containing(&cwd)?
+                .context("--workspace requires running inside a Ward workspace")?;
+            let targets = workspace_target::configured_workspace_targets(&discovery)?;
+            if targets.is_empty() {
+                anyhow::bail!("workspace has no configured Ward app projects");
+            }
+            targets
+        } else {
+            vec![workspace_target::resolve_one(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+            )?]
+        };
+
+        for target in targets {
+            let status = broker::lock_project(&target.name, &target.vault)?;
+            println!(
+                "Locked {}: broker_session_removed={} revoked_session_grants={} cleared_unlock_sessions={} cancelled_human_commands={}",
+                status.project,
+                status.broker_session_removed,
+                status.revoked_session_grants,
+                status.cleared_unlock_sessions,
+                status.cancelled_human_commands,
+            );
+        }
+        return Ok(());
+    }
+
+    let _ = all;
     if crate::human::is_human_terminal() {
         let _ = crate::human::send_guardian_shutdown();
     }
@@ -5457,10 +5604,8 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
         old_vault.display()
     );
 
-    if broker::active_session_expiry(&project_name, &old_vault)?.is_some() {
-        broker::stop().context("failed to restore active broker session before rotation")?;
-        unlock::clear_project_unlocks(&project_name)?;
-    }
+    let active_ttl = broker::active_session_expiry(&project_name, &old_vault)?
+        .and_then(|expires_at| remaining_session_ttl(expires_at, chrono::Utc::now()));
 
     let plaintext = vault::decrypt_vault_file(&old_vault, &passphrase)?;
     let new_vault = loop {
@@ -5490,6 +5635,12 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
     ));
     env_file::refresh_locked_env(&cwd, &new_vault)?;
     config::ensure_gitignore(&cwd, true)?;
+    if let Some(ttl) = active_ttl {
+        broker::unlock_project(&project_name, &new_vault, &passphrase, ttl)
+            .context("vault rotated, but Ward could not refresh the active broker session")?;
+        unlock::clear_project_unlocks(&project_name)?;
+        let _ = unlock::create_run_unlock(&project_name, &new_vault, &passphrase, ttl);
+    }
     println!("[ok] Vault rotated to {}", new_vault.display());
     println!("[ok] .ward.json updated with new nonce.");
     Ok(())
@@ -5632,17 +5783,8 @@ fn decrypt_vault_for_recovery(
     vault_path: &Path,
     passphrase: &str,
 ) -> Result<String> {
-    match vault::decrypt_vault_file(vault_path, passphrase) {
-        Ok(plaintext) => Ok(plaintext),
-        Err(first_error) => {
-            if broker::active_session_expiry(project, vault_path)?.is_some() {
-                broker::stop()?;
-                return vault::decrypt_vault_file(vault_path, passphrase)
-                    .context("failed to decrypt vault after stopping the active broker session");
-            }
-            Err(first_error)
-        }
-    }
+    let _ = project;
+    vault::decrypt_vault_file(vault_path, passphrase)
 }
 
 fn prompt_shell_reload(_rc: &Path) {
@@ -6505,17 +6647,10 @@ fn approval_channel_for_source(source: approvals::ApprovalSource) -> ApprovalCha
         approvals::ApprovalSource::LocalTty => ApprovalChannel::LocalPrompt,
         approvals::ApprovalSource::ManualAllow => ApprovalChannel::ManualAllow,
         approvals::ApprovalSource::AgentMediated => ApprovalChannel::AgentMediatedCli,
+        approvals::ApprovalSource::BrokerApproval => ApprovalChannel::Dashboard,
         approvals::ApprovalSource::Grant => ApprovalChannel::GrantReuse,
         approvals::ApprovalSource::PolicyAuto => ApprovalChannel::PolicyAuto,
         approvals::ApprovalSource::PolicyDeny => ApprovalChannel::PolicyDeny,
-    }
-}
-
-fn approval_channel_for_terminal(agent_mediated: bool) -> ApprovalChannel {
-    if agent_mediated {
-        ApprovalChannel::AgentMediatedCli
-    } else {
-        ApprovalChannel::TerminalApprove
     }
 }
 
@@ -6538,6 +6673,7 @@ fn should_log_approval_event(decision: &ApprovalDecision) -> bool {
 fn approval_human_proof(source: approvals::ApprovalSource) -> Option<&'static str> {
     match source {
         approvals::ApprovalSource::AgentMediated => Some("external-agent-ui"),
+        approvals::ApprovalSource::BrokerApproval => Some("broker-approval"),
         approvals::ApprovalSource::LocalTty => Some("local-tty"),
         approvals::ApprovalSource::ManualAllow => Some("local-cli"),
         _ => None,
@@ -6783,7 +6919,7 @@ fn wait_for_run_approval(
     let timeout = unlock::parse_ttl(approval_timeout)?;
     let deadline = chrono::Utc::now() + timeout;
     eprintln!(
-        "Ward is waiting for approval {}. Open the dashboard notification center or run: ward approve {} --scope session --agent-mediated --json",
+        "Ward is waiting for approval {}. Open the dashboard notification center, or ask a human to run: ward approve {} --scope session",
         pending.id, pending.id
     );
 
@@ -6988,15 +7124,20 @@ fn broker_execution_rejection_is_authoritative(error: &anyhow::Error) -> bool {
     matches!(
         broker_error.reason(),
         "agent_proof_invalid"
+            | "agent_self_approval_rejected"
+            | "approval_required"
             | "broker_client_untrusted"
             | "execute_authorization_expired"
             | "execute_authorization_invalid"
             | "execute_authorization_mismatch"
             | "execute_authorization_replayed"
             | "execute_authorization_required"
+            | "grant_lookup_failed"
+            | "human_approval_required"
             | "human_session_required"
             | "mode_confirmation_required"
             | "mode_env_violation"
+            | "policy_denied"
             | "security_policy_violation"
     )
 }
@@ -7703,16 +7844,6 @@ fn warn_missing_broker_session(project: &str, vault: &Path) {
         Err(e) => term::warn(&format!(
             "local unlock metadata unreadable without an active session — run ward unlock again ({e})"
         )),
-    }
-}
-
-fn same_path(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
     }
 }
 
@@ -9373,7 +9504,12 @@ mod tests {
         })
         .unwrap();
         dispatch(Cli {
-            command: Commands::Lock,
+            command: Commands::Lock {
+                project: None,
+                app: None,
+                workspace: false,
+                all: false,
+            },
         })
         .unwrap();
 
@@ -10458,9 +10594,8 @@ mod tests {
                 "--scope",
                 "once",
                 "--confirm-critical",
-                "--agent-mediated",
             ],
-            vec!["ward", "deny", &request_id, "--agent-mediated"],
+            vec!["ward", "deny", &request_id],
             vec![
                 "ward",
                 "run",
@@ -10603,7 +10738,12 @@ mod tests {
             format!(
                 "{:?}",
                 Cli {
-                    command: Commands::Lock
+                    command: Commands::Lock {
+                        project: None,
+                        app: None,
+                        workspace: false,
+                        all: false,
+                    }
                 }
             ),
             format!(
@@ -10896,7 +11036,15 @@ mod tests {
                     verify_only: false,
                 }
             ),
-            format!("{:?}", Commands::Lock),
+            format!(
+                "{:?}",
+                Commands::Lock {
+                    project: None,
+                    app: None,
+                    workspace: false,
+                    all: false,
+                }
+            ),
             format!(
                 "{:?}",
                 GrantsCommand::Revoke {

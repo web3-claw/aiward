@@ -25,6 +25,7 @@ pub enum ApprovalSource {
     LocalTty,
     ManualAllow,
     AgentMediated,
+    BrokerApproval,
     Grant,
     PolicyAuto,
     PolicyDeny,
@@ -183,7 +184,7 @@ impl ApprovalSource {
     pub fn is_persistable_approval(self) -> bool {
         matches!(
             self,
-            ApprovalSource::LocalTty | ApprovalSource::ManualAllow | ApprovalSource::AgentMediated
+            ApprovalSource::LocalTty | ApprovalSource::ManualAllow | ApprovalSource::BrokerApproval
         )
     }
 }

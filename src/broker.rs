@@ -21,15 +21,15 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-#[cfg(not(test))]
 use sha2::{Digest, Sha256};
 
 use crate::{
     agents::{self, AgentProof},
     approval_receipts::{self, ApprovalReceipt, ApprovalReceiptPayload},
-    approvals::{ApprovalScope, ApprovalSource},
-    config, detection, env_file, fs_util, grants, logs, modes, project_store, project_teardown,
-    recovery, registry,
+    approvals::{ApprovalChannel, ApprovalDecision, ApprovalScope, ApprovalSource},
+    config, detection, env_file, fs_util, grants, logs, modes, pending_requests,
+    policy::{self, AccessRequest},
+    project_store, project_teardown, recovery, registry,
     runner::{self, RunCommandOutcome, RunCommandRequest},
     teams, unlock, vault,
 };
@@ -47,6 +47,8 @@ pub struct BrokerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<DateTime<Utc>>,
     pub sessions: Vec<BrokerSessionStatus>,
+    #[serde(default)]
+    pub approval_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,20 @@ pub struct BrokerSessionStatus {
     pub expires_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_mode: Option<String>,
+    #[serde(default)]
+    pub env_count: usize,
+    #[serde(default)]
+    pub subsession_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_slug: Option<String>,
+    #[serde(default)]
+    pub state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +111,29 @@ pub struct BrokerProjectLockStatus {
     pub revoked_session_grants: usize,
     pub cleared_unlock_sessions: usize,
     pub cancelled_human_commands: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrokerApprovalStatus {
+    pub request_id: uuid::Uuid,
+    pub project: String,
+    pub scope: ApprovalScope,
+    pub channel: ApprovalChannel,
+    pub grant_id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_receipt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_algorithm: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uses_remaining: Option<u32>,
+    #[serde(default)]
+    pub critical_confirmation: bool,
+    pub access: AccessRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -206,10 +245,25 @@ enum BrokerRequest {
         vault: PathBuf,
         payload: ApprovalReceiptPayload,
     },
+    ApproveRequest {
+        request_id: uuid::Uuid,
+        scope: ApprovalScope,
+        confirm_critical: bool,
+        channel: ApprovalChannel,
+    },
+    DenyRequest {
+        request_id: uuid::Uuid,
+        channel: ApprovalChannel,
+    },
+    ListApprovals {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project: Option<String>,
+    },
     RegisterHumanSession {
         shell_pid: u32,
         session_token: String,
         ttl_seconds: i64,
+        projects: Vec<String>,
     },
     DeregisterHumanSession {
         shell_pid: u32,
@@ -268,6 +322,12 @@ enum BrokerResponse {
     },
     Signed {
         receipt: ApprovalReceipt,
+    },
+    Approval {
+        status: BrokerApprovalStatus,
+    },
+    Approvals {
+        approvals: Vec<BrokerApprovalStatus>,
     },
     Output {
         stream: String,
@@ -334,6 +394,7 @@ impl std::error::Error for BrokerError {}
 struct HumanSessionEntry {
     session_token: String,
     expires_at: DateTime<Utc>,
+    projects: BTreeSet<String>,
 }
 
 struct ActiveHumanCommand {
@@ -342,8 +403,45 @@ struct ActiveHumanCommand {
     child_pid: Arc<AtomicU32>,
 }
 
+#[derive(Debug, Clone)]
+struct BrokerApprovalRecord {
+    request_id: uuid::Uuid,
+    project: String,
+    vault: PathBuf,
+    access: AccessRequest,
+    scope: ApprovalScope,
+    channel: ApprovalChannel,
+    grant_id: uuid::Uuid,
+    approval_receipt_hash: Option<String>,
+    signer_key_id: Option<String>,
+    signature_algorithm: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    uses_remaining: Option<u32>,
+    critical_confirmation: bool,
+}
+
+impl BrokerApprovalRecord {
+    fn status(&self) -> BrokerApprovalStatus {
+        BrokerApprovalStatus {
+            request_id: self.request_id,
+            project: self.project.clone(),
+            scope: self.scope,
+            channel: self.channel,
+            grant_id: self.grant_id,
+            approval_receipt_hash: self.approval_receipt_hash.clone(),
+            signer_key_id: self.signer_key_id.clone(),
+            signature_algorithm: self.signature_algorithm.clone(),
+            expires_at: self.expires_at,
+            uses_remaining: self.uses_remaining,
+            critical_confirmation: self.critical_confirmation,
+            access: self.access.clone(),
+        }
+    }
+}
+
 struct BrokerState {
     sessions: BTreeMap<String, BrokerSession>,
+    approvals: BTreeMap<uuid::Uuid, BrokerApprovalRecord>,
     human_sessions: HashMap<u32, HumanSessionEntry>,
     human_commands: HashMap<u32, BTreeMap<u64, ActiveHumanCommand>>,
     execute_nonces: HashMap<String, DateTime<Utc>>,
@@ -355,6 +453,7 @@ impl Default for BrokerState {
     fn default() -> Self {
         Self {
             sessions: BTreeMap::new(),
+            approvals: BTreeMap::new(),
             human_sessions: HashMap::new(),
             human_commands: HashMap::new(),
             execute_nonces: HashMap::new(),
@@ -369,12 +468,15 @@ const BROKER_VERSION: &str = env!("CARGO_PKG_VERSION");
 struct BrokerSession {
     project: String,
     vault: PathBuf,
+    env: BTreeMap<String, String>,
+    vault_fingerprint: String,
+    signing_key: approval_receipts::SessionSigningKey,
     passphrase: String,
-    /// Ephemeral key used to re-encrypt the vault on disk while the session is active.
-    /// If Some, the vault file is encrypted with this key (not passphrase) until lock.
-    session_key: Option<String>,
     expires_at: DateTime<Utc>,
     active_mode: Option<modes::ActiveMode>,
+    workspace_root: Option<PathBuf>,
+    workspace_name: Option<String>,
+    app_slug: Option<String>,
 }
 
 pub fn run_dir() -> PathBuf {
@@ -684,6 +786,7 @@ pub fn status() -> Result<BrokerStatus> {
             version: BROKER_VERSION.to_string(),
             started_at: None,
             sessions: Vec::new(),
+            approval_count: 0,
         }),
     }
 }
@@ -698,6 +801,15 @@ fn ping_status() -> Result<BrokerStatus> {
 pub fn active_session_expiry(project: &str, vault: &Path) -> Result<Option<DateTime<Utc>>> {
     let status = status()?;
     Ok(matching_session_expiry(&status, project, vault, Utc::now()))
+}
+
+pub fn active_session_fingerprint(project: &str, vault: &Path) -> Result<Option<String>> {
+    let status = status()?;
+    Ok(status
+        .sessions
+        .iter()
+        .find(|session| session.project == project && same_vault_path(&session.vault, vault))
+        .and_then(|session| session.vault_fingerprint.clone()))
 }
 
 fn matching_session_expiry(
@@ -753,6 +865,57 @@ pub fn lock_project(project: &str, vault: &Path) -> Result<BrokerProjectLockStat
         vault: vault.to_path_buf(),
     })? {
         BrokerResponse::ProjectLock { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn approve_pending_request(
+    request_id: uuid::Uuid,
+    scope: ApprovalScope,
+    confirm_critical: bool,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    ensure_running()?;
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::ApproveRequest {
+        request_id,
+        scope,
+        confirm_critical,
+        channel,
+    })? {
+        BrokerResponse::Approval { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn deny_pending_request(
+    request_id: uuid::Uuid,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    ensure_running()?;
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if !broker_process_supported(&exe) {
+        anyhow::bail!("Ward broker is unavailable from this executable");
+    }
+    match send_simple(BrokerRequest::DenyRequest {
+        request_id,
+        channel,
+    })? {
+        BrokerResponse::Approval { status } => Ok(status),
+        BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
+        other => anyhow::bail!("unexpected broker response: {other:?}"),
+    }
+}
+
+pub fn list_approvals(project: Option<String>) -> Result<Vec<BrokerApprovalStatus>> {
+    ensure_running()?;
+    match send_simple(BrokerRequest::ListApprovals { project })? {
+        BrokerResponse::Approvals { approvals } => Ok(approvals),
         BrokerResponse::Error { reason, message } => Err(BrokerError::new(reason, message).into()),
         other => anyhow::bail!("unexpected broker response: {other:?}"),
     }
@@ -906,6 +1069,7 @@ pub fn register_human_session(
     _shell_pid: u32,
     _session_token: &str,
     _ttl_seconds: i64,
+    _projects: &[String],
 ) -> Result<()> {
     Ok(())
 }
@@ -916,11 +1080,17 @@ pub fn deregister_human_session(_shell_pid: u32, _session_token: &str) -> Result
 }
 
 #[cfg(not(test))]
-pub fn register_human_session(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> Result<()> {
+pub fn register_human_session(
+    shell_pid: u32,
+    session_token: &str,
+    ttl_seconds: i64,
+    projects: &[String],
+) -> Result<()> {
     match send_simple(BrokerRequest::RegisterHumanSession {
         shell_pid,
         session_token: session_token.to_string(),
         ttl_seconds,
+        projects: projects.to_vec(),
     })? {
         BrokerResponse::Ok => Ok(()),
         BrokerResponse::Error { message, .. } => anyhow::bail!("{message}"),
@@ -972,6 +1142,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
         let mut broker_state = state.lock().expect("broker state poisoned");
         cleanup_inactive_human_sessions(&mut broker_state);
         cleanup_expired_execute_nonces(&mut broker_state);
+        cleanup_expired_approvals(&mut broker_state);
     }
     match request {
         BrokerRequest::Ping => {
@@ -980,14 +1151,6 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
         }
         BrokerRequest::Stop => {
             cancel_all_human_commands(&mut state.lock().expect("broker state poisoned"));
-            if let Err(error) = restore_all_sessions(&state) {
-                let response = broker_error(
-                    "restore_failed",
-                    format!("failed to restore vaults before broker shutdown: {error}"),
-                );
-                write_response(&mut stream, &response)?;
-                return Ok(false);
-            }
             write_response(&mut stream, &BrokerResponse::Ok)?;
             return Ok(true);
         }
@@ -1014,134 +1177,15 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             ttl_seconds,
             mode,
         } => {
-            // If the vault is currently session-encrypted (active session exists),
-            // restore it to passphrase-encrypted form before attempting to decrypt.
+            match build_project_session(&project, &vault, &passphrase, ttl_seconds, mode.as_deref())
             {
-                let state = state.lock().expect("broker state poisoned");
-                if let Some(session) = state.sessions.get(&session_key(&project, &vault)) {
-                    if let Some(ref ek) = session.session_key {
-                        if let Err(error) =
-                            restore_vault_from_session(&vault, ek, &session.passphrase)
-                        {
-                            let response = broker_error(
-                                "restore_failed",
-                                format!("failed to restore active session before unlock: {error}"),
-                            );
-                            write_response(&mut stream, &response)?;
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
-            match vault::decrypt_vault_file(&vault, &passphrase).and_then(|plaintext| {
-                approval_receipts::ensure_project_key(&project, &passphrase).map(|_| plaintext)
-            }) {
-                Ok(plaintext) => {
-                    let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
-
-                    // Re-encrypt vault with ephemeral key so passphrase-encrypted
-                    // form does not exist on disk while the session is active.
-                    let ephemeral_key = generate_session_key();
-                    let ephemeral_key = match vault::encrypt_env(&plaintext, &ephemeral_key) {
-                        Ok(envelope) => match vault::write_vault(&vault, &envelope) {
-                            Ok(()) => Some(ephemeral_key),
-                            Err(_) => None,
-                        },
-                        Err(_) => None,
-                    };
+                Ok(session) => {
                     let session_id = session_key(&project, &vault);
                     state
                         .lock()
                         .expect("broker state poisoned")
                         .sessions
-                        .insert(
-                            session_id.clone(),
-                            BrokerSession {
-                                project: project.clone(),
-                                vault: vault.clone(),
-                                passphrase: passphrase.clone(),
-                                session_key: ephemeral_key.clone(),
-                                expires_at,
-                                active_mode: None,
-                            },
-                        );
-
-                    // Load active mode config from broker vault if requested
-                    let active_mode = if let Some(mode_name) = &mode {
-                        match modes::load_broker_modes(&project, &passphrase) {
-                            Ok(mode_configs) => match modes::find_mode(&mode_configs, mode_name) {
-                                Some(config) => Some(modes::ActiveMode {
-                                    config: config.clone(),
-                                    expires_at,
-                                }),
-                                None => {
-                                    if let Some(ref ek) = ephemeral_key {
-                                        if let Err(error) =
-                                            restore_vault_from_session(&vault, ek, &passphrase)
-                                        {
-                                            let response = broker_error(
-                                                "restore_failed",
-                                                format!(
-                                                    "failed to restore vault after mode lookup failure: {error}"
-                                                ),
-                                            );
-                                            write_response(&mut stream, &response)?;
-                                            return Ok(false);
-                                        }
-                                    }
-                                    state
-                                        .lock()
-                                        .expect("broker state poisoned")
-                                        .sessions
-                                        .remove(&session_id);
-                                    let response = broker_error(
-                                            "mode_not_found",
-                                            format!("mode '{mode_name}' not found — run `ward modes push` first"),
-                                        );
-                                    write_response(&mut stream, &response)?;
-                                    return Ok(false);
-                                }
-                            },
-                            Err(error) => {
-                                if let Some(ref ek) = ephemeral_key {
-                                    if let Err(restore_error) =
-                                        restore_vault_from_session(&vault, ek, &passphrase)
-                                    {
-                                        let response = broker_error(
-                                            "restore_failed",
-                                            format!(
-                                                "failed to restore vault after mode load failure: {restore_error}"
-                                            ),
-                                        );
-                                        write_response(&mut stream, &response)?;
-                                        return Ok(false);
-                                    }
-                                }
-                                state
-                                    .lock()
-                                    .expect("broker state poisoned")
-                                    .sessions
-                                    .remove(&session_id);
-                                let response = broker_error(
-                                    "modes_vault_unavailable",
-                                    format!("could not load modes vault: {error} — run `ward modes push` first"),
-                                );
-                                write_response(&mut stream, &response)?;
-                                return Ok(false);
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(session) = state
-                        .lock()
-                        .expect("broker state poisoned")
-                        .sessions
-                        .get_mut(&session_id)
-                    {
-                        session.active_mode = active_mode;
-                    }
+                        .insert(session_id, session);
                     write_response(&mut stream, &BrokerResponse::Ok)?;
                 }
                 Err(error) => {
@@ -1178,12 +1222,81 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 }
             }
         }
+        BrokerRequest::ApproveRequest {
+            request_id,
+            scope,
+            confirm_critical,
+            channel,
+        } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            match approve_pending_request_in_state(
+                &state,
+                request_id,
+                scope,
+                confirm_critical,
+                channel,
+            ) {
+                Ok(status) => write_response(&mut stream, &BrokerResponse::Approval { status })?,
+                Err(error) => {
+                    let response = broker_error("approval_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
+        BrokerRequest::DenyRequest {
+            request_id,
+            channel,
+        } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            match deny_pending_request_in_state(&state, request_id, channel) {
+                Ok(status) => write_response(&mut stream, &BrokerResponse::Approval { status })?,
+                Err(error) => {
+                    let response = broker_error("deny_failed", error.to_string());
+                    write_response(&mut stream, &response)?;
+                }
+            }
+        }
+        BrokerRequest::ListApprovals { project } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
+            let mut state = state.lock().expect("broker state poisoned");
+            cleanup_expired_approvals(&mut state);
+            let approvals = state
+                .approvals
+                .values()
+                .filter(|approval| {
+                    project
+                        .as_deref()
+                        .is_none_or(|project| approval.project == project)
+                })
+                .map(BrokerApprovalRecord::status)
+                .collect();
+            write_response(&mut stream, &BrokerResponse::Approvals { approvals })?;
+        }
         BrokerRequest::RegisterHumanSession {
             shell_pid,
             session_token,
             ttl_seconds,
+            projects,
         } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
             let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+            let projects = projects.into_iter().collect::<BTreeSet<_>>();
             state
                 .lock()
                 .expect("broker state poisoned")
@@ -1193,6 +1306,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     HumanSessionEntry {
                         session_token,
                         expires_at,
+                        projects,
                     },
                 );
             write_response(&mut stream, &BrokerResponse::Ok)?;
@@ -1201,6 +1315,11 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             shell_pid,
             session_token,
         } => {
+            if let Err(message) = require_trusted_client(&stream) {
+                let response = broker_error("broker_client_untrusted", message);
+                write_response(&mut stream, &response)?;
+                return Ok(false);
+            }
             let mut state = state.lock().expect("broker state poisoned");
             match state.human_sessions.get(&shell_pid) {
                 Some(entry) if entry.session_token == session_token => {
@@ -1252,26 +1371,13 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     }
                 }
             };
-            let passphrase = {
+            let session_material = {
                 let state = state.lock().expect("broker state poisoned");
-                active_session(&state, &project, &vault).map(|session| {
-                    // Use ephemeral session key if vault is currently session-encrypted
-                    session
-                        .session_key
-                        .clone()
-                        .unwrap_or_else(|| session.passphrase.clone())
-                })
+                active_session(&state, &project, &vault)
+                    .map(|session| (session.env.clone(), session.active_mode.clone()))
             };
-            let (passphrase, active_mode) = match passphrase {
-                Ok(passphrase) => {
-                    let active_mode = {
-                        let state = state.lock().expect("broker state poisoned");
-                        active_session(&state, &project, &vault)
-                            .ok()
-                            .and_then(|s| s.active_mode.clone())
-                    };
-                    (passphrase, active_mode)
-                }
+            let (session_env, active_mode) = match session_material {
+                Ok(material) => material,
                 Err(error) => {
                     let response = broker_error("unlock_required", error.to_string());
                     write_response(&mut stream, &response)?;
@@ -1365,10 +1471,9 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     }
                     RunCommandRequest {
                         cwd,
-                        vault,
                         env_names,
+                        env: session_env,
                         command,
-                        passphrase,
                         inherited_env,
                         cancellation: Some(Arc::clone(&cancellation)),
                         human_shell_pid,
@@ -1407,7 +1512,8 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                 write_response(&mut stream, &response)?;
                 return Ok(false);
             }
-            if let Err((reason, message)) = validate_list_keys_authorization(&state, &authorization)
+            if let Err((reason, message)) =
+                validate_list_keys_authorization(&state, &project, &authorization)
             {
                 let response = broker_error(reason, message);
                 write_response(&mut stream, &response)?;
@@ -1415,24 +1521,8 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             }
             let key_result = {
                 let state = state.lock().expect("broker state poisoned");
-                active_session(&state, &project, &vault).and_then(|session| {
-                    let decrypt_key = session
-                        .session_key
-                        .clone()
-                        .unwrap_or_else(|| session.passphrase.clone());
-                    let plaintext = vault::decrypt_vault_file(&vault, &decrypt_key)?;
-                    let names = plaintext
-                        .lines()
-                        .filter_map(|line| {
-                            let line = line.trim();
-                            if line.is_empty() || line.starts_with('#') {
-                                return None;
-                            }
-                            line.splitn(2, '=').next().map(str::to_string)
-                        })
-                        .collect::<Vec<_>>();
-                    Ok(names)
-                })
+                active_session(&state, &project, &vault)
+                    .map(|session| session.env.keys().cloned().collect::<Vec<_>>())
             };
             match key_result {
                 Ok(names) => write_response(&mut stream, &BrokerResponse::Keys { names })?,
@@ -1467,33 +1557,27 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
 
             match setup_project_with_passphrase(&target_path, project.as_deref(), &passphrase) {
                 Ok(status) => {
-                    let new_session_key =
-                        match vault::decrypt_vault_file(&status.vault, &passphrase).and_then(
-                            |plaintext| {
-                                let ephemeral_key = generate_session_key();
-                                let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
-                                vault::write_vault(&status.vault, &envelope)?;
-                                Ok(ephemeral_key)
-                            },
-                        ) {
-                            Ok(ephemeral_key) => Some(ephemeral_key),
-                            Err(_) => None,
-                        };
-                    state
-                        .lock()
-                        .expect("broker state poisoned")
-                        .sessions
-                        .insert(
-                            session_key(&status.project, &status.vault),
-                            BrokerSession {
-                                project: status.project.clone(),
-                                vault: status.vault.clone(),
-                                passphrase,
-                                session_key: new_session_key,
-                                expires_at,
-                                active_mode: None,
-                            },
-                        );
+                    match build_project_session_with_expiry(
+                        &status.project,
+                        &status.vault,
+                        &passphrase,
+                        expires_at,
+                        None,
+                    ) {
+                        Ok(session) => {
+                            state
+                                .lock()
+                                .expect("broker state poisoned")
+                                .sessions
+                                .insert(session_key(&status.project, &status.vault), session);
+                        }
+                        Err(error) => {
+                            let response =
+                                broker_error("project_session_failed", error.to_string());
+                            write_response(&mut stream, &response)?;
+                            return Ok(false);
+                        }
+                    }
                     write_response(&mut stream, &BrokerResponse::ProjectSetup { status })?;
                 }
                 Err(error) => {
@@ -1574,29 +1658,27 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
             };
             match provision_result {
                 Ok((status, expires_at, passphrase)) => {
-                    let new_session_key = vault::decrypt_vault_file(&status.vault, &passphrase)
-                        .and_then(|plaintext| {
-                            let ephemeral_key = generate_session_key();
-                            let envelope = vault::encrypt_env(&plaintext, &ephemeral_key)?;
-                            vault::write_vault(&status.vault, &envelope)?;
-                            Ok(ephemeral_key)
-                        })
-                        .ok();
-                    state
-                        .lock()
-                        .expect("broker state poisoned")
-                        .sessions
-                        .insert(
-                            session_key(&status.project, &status.vault),
-                            BrokerSession {
-                                project: status.project.clone(),
-                                vault: status.vault.clone(),
-                                passphrase,
-                                session_key: new_session_key,
-                                expires_at,
-                                active_mode: None,
-                            },
-                        );
+                    match build_project_session_with_expiry(
+                        &status.project,
+                        &status.vault,
+                        &passphrase,
+                        expires_at,
+                        None,
+                    ) {
+                        Ok(session) => {
+                            state
+                                .lock()
+                                .expect("broker state poisoned")
+                                .sessions
+                                .insert(session_key(&status.project, &status.vault), session);
+                        }
+                        Err(error) => {
+                            let response =
+                                broker_error("project_session_failed", error.to_string());
+                            write_response(&mut stream, &response)?;
+                            return Ok(false);
+                        }
+                    }
                     write_response(&mut stream, &BrokerResponse::ProjectProvision { status })?;
                 }
                 Err(error) => {
@@ -1632,7 +1714,7 @@ fn handle_client(mut stream: UnixStream, state: Arc<Mutex<BrokerState>>) -> Resu
                     vault: vault.clone(),
                     export_path,
                     restore_env,
-                    decrypt_key: material.decrypt_key,
+                    decrypt_key: material.passphrase,
                 })
             }) {
                 Ok(status) => {
@@ -1653,18 +1735,120 @@ fn sign_with_session(
     session: &BrokerSession,
     mut payload: ApprovalReceiptPayload,
 ) -> Result<ApprovalReceipt> {
-    let passphrase = &session.passphrase;
-    let project = &session.project;
-    let ciphertext =
-        approval_receipts::session_signing_key_ciphertext(project, passphrase, passphrase)?;
-    let signing_key = approval_receipts::decrypt_session_signing_key(&ciphertext, passphrase)?;
-    payload.signer_key_id = signing_key.signer_key_id.clone();
-    approval_receipts::sign_payload(payload, &signing_key)
+    payload.signer_key_id = session.signing_key.signer_key_id.clone();
+    approval_receipts::sign_payload(payload, &session.signing_key)
+}
+
+fn approve_pending_request_in_state(
+    state: &Arc<Mutex<BrokerState>>,
+    request_id: uuid::Uuid,
+    scope: ApprovalScope,
+    confirm_critical: bool,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    if scope == ApprovalScope::Deny {
+        anyhow::bail!("use DenyRequest for denied requests");
+    }
+
+    let pending = pending_requests::load_pending_request(request_id)?;
+    let critical = detection::has_critical_findings(&pending.policy.findings);
+    if critical && !confirm_critical {
+        anyhow::bail!("critical request requires explicit critical confirmation");
+    }
+    crate::approvals::validate_scope_for_findings(scope, &pending.policy.findings)?;
+
+    let resolved = registry::resolve_project(Some(&pending.access.project), Path::new("."))?;
+    let mut decision = ApprovalDecision {
+        approved: true,
+        scope,
+        approved_env: pending.access.env.clone(),
+        denied_env: Vec::new(),
+        source: ApprovalSource::BrokerApproval,
+        grant_id: None,
+    };
+    let now = Utc::now();
+    let mut grant = grants::grant_from_decision(&pending.access, &decision, now)?;
+    grant.request_id = Some(request_id);
+    let payload = approval_receipts::build_payload_with_context(
+        &pending.access,
+        grant.id,
+        request_id,
+        &grant.approved_env,
+        grant.scope,
+        grant.expires_at,
+        critical && confirm_critical,
+        grant.created_at,
+        String::new(),
+        pending.verified_context.as_ref(),
+    );
+    let receipt = {
+        let state = state.lock().expect("broker state poisoned");
+        let session = active_session(&state, &pending.access.project, &resolved.vault)?;
+        sign_with_session(session, payload)?
+    };
+    grant.receipt = Some(receipt);
+    grants::append_grant_to_path(&grants::grants_path(), &grant)?;
+    pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "approved", &pending.access.project)?;
+
+    let receipt = grant
+        .receipt
+        .as_ref()
+        .expect("broker-created grant should have a receipt");
+    decision.grant_id = Some(grant.id);
+    let record = BrokerApprovalRecord {
+        request_id,
+        project: pending.access.project.clone(),
+        vault: resolved.vault,
+        access: pending.access,
+        scope,
+        channel,
+        grant_id: grant.id,
+        approval_receipt_hash: Some(receipt.payload_hash.clone()),
+        signer_key_id: Some(receipt.signer_key_id.clone()),
+        signature_algorithm: Some(receipt.signature_algorithm.clone()),
+        expires_at: grant.expires_at,
+        uses_remaining: grant.uses_remaining,
+        critical_confirmation: critical && confirm_critical,
+    };
+    let status = record.status();
+    if matches!(scope, ApprovalScope::Once | ApprovalScope::Session) {
+        state
+            .lock()
+            .expect("broker state poisoned")
+            .approvals
+            .insert(request_id, record);
+    }
+    Ok(status)
+}
+
+fn deny_pending_request_in_state(
+    _state: &Arc<Mutex<BrokerState>>,
+    request_id: uuid::Uuid,
+    channel: ApprovalChannel,
+) -> Result<BrokerApprovalStatus> {
+    let pending = pending_requests::consume_pending_request(request_id)?;
+    pending_requests::record_resolution(request_id, "denied", &pending.access.project)?;
+    Ok(BrokerApprovalStatus {
+        request_id,
+        project: pending.access.project.clone(),
+        scope: ApprovalScope::Deny,
+        channel,
+        grant_id: uuid::Uuid::nil(),
+        approval_receipt_hash: None,
+        signer_key_id: None,
+        signature_algorithm: None,
+        expires_at: None,
+        uses_remaining: None,
+        critical_confirmation: false,
+        access: pending.access,
+    })
 }
 
 struct ActiveProjectMaterial {
     passphrase: String,
-    decrypt_key: String,
+    plaintext: String,
+    env: BTreeMap<String, String>,
     expires_at: DateTime<Utc>,
 }
 
@@ -1676,10 +1860,8 @@ fn active_project_material(
     let session = active_session(state, project, vault)?;
     Ok(ActiveProjectMaterial {
         passphrase: session.passphrase.clone(),
-        decrypt_key: session
-            .session_key
-            .clone()
-            .unwrap_or_else(|| session.passphrase.clone()),
+        plaintext: env_file::serialize_env_map(&session.env),
+        env: session.env.clone(),
         expires_at: session.expires_at,
     })
 }
@@ -1695,13 +1877,12 @@ fn snapshot_project_with_material(
         .get(project)
         .with_context(|| format!("project {project} is not registered"))?;
     let config = config::read_project_config(&registered.path)?;
-    let plaintext = vault::decrypt_vault_file(vault, &material.decrypt_key)?;
     let store = project_store::refresh_from_plaintext(
         project,
         &registered.path,
         vault,
         &config,
-        &plaintext,
+        &material.plaintext,
         &material.passphrase,
     )?;
     Ok(BrokerProjectSnapshotStatus { store })
@@ -1729,8 +1910,7 @@ fn provision_project_with_material(
             )
         })?;
     let source_config = config::read_project_config(&source_registered.path)?;
-    let source_plaintext = vault::decrypt_vault_file(&request.source_vault, &material.decrypt_key)?;
-    let source_env = env_file::parse_env_map(&source_plaintext)?;
+    let source_env = material.env.clone();
     let missing = selected_env
         .iter()
         .filter(|name| !source_env.contains_key(*name))
@@ -2092,10 +2272,14 @@ fn active_session<'a>(
     Ok(session)
 }
 
-fn validate_human_session(state: &BrokerState, shell_pid: u32) -> std::result::Result<(), String> {
+fn validate_human_session(
+    state: &BrokerState,
+    project: &str,
+    shell_pid: u32,
+) -> std::result::Result<(), String> {
     let Some(entry) = state.human_sessions.get(&shell_pid) else {
         return Err(format!(
-            "Ward human mode is not active for this terminal; run ward human (shell pid: {shell_pid})"
+            "Ward human mode is not active for project {project} in this terminal; run ward human (shell pid: {shell_pid})"
         ));
     };
     if entry.expires_at <= Utc::now() {
@@ -2106,6 +2290,11 @@ fn validate_human_session(state: &BrokerState, shell_pid: u32) -> std::result::R
     if !process_exists(shell_pid) {
         return Err(format!(
             "Ward human shell is no longer running; run ward human in the active terminal (shell pid: {shell_pid})"
+        ));
+    }
+    if !entry.projects.contains(project) {
+        return Err(format!(
+            "Ward human mode in this terminal is not attached to project {project}; run ward human --project {project} (shell pid: {shell_pid})"
         ));
     }
     Ok(())
@@ -2129,7 +2318,7 @@ fn validate_execute_authorization(
     match authorization {
         ExecuteAuthorization::Human { shell_pid } => {
             cleanup_inactive_human_sessions(state);
-            validate_human_session(state, *shell_pid)
+            validate_human_session(state, project, *shell_pid)
                 .map_err(|message| ("human_session_required".to_string(), message))?;
             Ok(Some(*shell_pid))
         }
@@ -2167,6 +2356,7 @@ fn validate_execute_authorization(
                 ));
             }
             validate_execute_payload(state, project, vault, cwd, env_names, command, &payload)?;
+            validate_agent_execute_authority(state, &payload, proof)?;
             Ok(None)
         }
         ExecuteAuthorization::Internal { payload } => {
@@ -2219,15 +2409,207 @@ fn validate_execute_payload(
     Ok(())
 }
 
+fn validate_agent_execute_authority(
+    state: &mut BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+) -> std::result::Result<(), (String, String)> {
+    match payload.approval_source {
+        ApprovalSource::PolicyAuto => validate_policy_auto_authority(state, payload),
+        ApprovalSource::Grant | ApprovalSource::BrokerApproval => {
+            validate_grant_authority(state, payload, proof)
+        }
+        ApprovalSource::AgentMediated => Err((
+            "agent_self_approval_rejected".to_string(),
+            "agent-mediated approvals are no longer accepted; wait for dashboard or human approval"
+                .to_string(),
+        )),
+        ApprovalSource::LocalTty | ApprovalSource::ManualAllow => Err((
+            "human_approval_required".to_string(),
+            "agent executions cannot claim terminal or manual approval authority".to_string(),
+        )),
+        ApprovalSource::PolicyDeny => Err((
+            "policy_denied".to_string(),
+            "Ward policy denied this execution".to_string(),
+        )),
+    }
+}
+
+fn validate_policy_auto_authority(
+    state: &BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+) -> std::result::Result<(), (String, String)> {
+    let access = access_from_execute_payload(payload);
+    let resolved = registry::resolve_project(Some(&payload.project), Path::new("."))
+        .map_err(|error| ("project_unresolved".to_string(), error.to_string()))?;
+    if !same_vault_path(&resolved.vault, &payload.vault) {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "execution vault does not match the registered project vault".to_string(),
+        ));
+    }
+    let config = config::read_project_config(&resolved.path)
+        .map_err(|error| ("project_config_unavailable".to_string(), error.to_string()))?;
+    let findings =
+        detection::preflight_findings(&access.command, &access.env, access.action.as_deref());
+    let active_mode = active_session(state, &payload.project, &payload.vault)
+        .ok()
+        .and_then(|session| session.active_mode.as_ref());
+    let evaluation = policy::evaluate_request(&config, &access, active_mode, findings);
+    if evaluation.approval_mode == policy::ApprovalMode::Deny
+        || evaluation.requires_prompt
+        || !evaluation.denied_env.is_empty()
+        || !access
+            .env
+            .iter()
+            .all(|env_name| evaluation.approved_env.contains(env_name))
+    {
+        return Err((
+            "approval_required".to_string(),
+            "broker policy evaluation requires human approval".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_grant_authority(
+    state: &mut BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+) -> std::result::Result<(), (String, String)> {
+    let grant_id = payload.grant_id.ok_or_else(|| {
+        (
+            "execute_authorization_mismatch".to_string(),
+            "approved execution is missing a grant id".to_string(),
+        )
+    })?;
+    match payload.approval_scope {
+        ApprovalScope::Once | ApprovalScope::Session => {
+            validate_live_broker_approval(state, payload, grant_id)
+        }
+        ApprovalScope::Branch | ApprovalScope::Always => {
+            validate_durable_grant(payload, proof, grant_id)
+        }
+        ApprovalScope::Deny => Err((
+            "policy_denied".to_string(),
+            "denied approvals cannot authorize execution".to_string(),
+        )),
+    }
+}
+
+fn validate_live_broker_approval(
+    state: &mut BrokerState,
+    payload: &ExecuteAuthorizationPayload,
+    grant_id: uuid::Uuid,
+) -> std::result::Result<(), (String, String)> {
+    cleanup_expired_approvals(state);
+    let Some(record) = state.approvals.values_mut().find(|approval| {
+        approval.grant_id == grant_id
+            && approval.project == payload.project
+            && same_vault_path(&approval.vault, &payload.vault)
+    }) else {
+        return Err((
+            "approval_required".to_string(),
+            "no active broker approval matched this once/session execution".to_string(),
+        ));
+    };
+    if record.scope != payload.approval_scope
+        || record.access.agent != payload.agent
+        || record.access.branch != payload.branch
+        || record.access.action != payload.action
+        || record.access.command != payload.command.join(" ")
+        || record.access.env != payload.env_names
+        || record.approval_receipt_hash != payload.approval_receipt_hash
+        || record.uses_remaining.unwrap_or(1) == 0
+    {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "active broker approval does not match requested command/env scope".to_string(),
+        ));
+    }
+    if let Some(uses_remaining) = record.uses_remaining.as_mut() {
+        *uses_remaining = uses_remaining.saturating_sub(1);
+    }
+    Ok(())
+}
+
+fn validate_durable_grant(
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+    grant_id: uuid::Uuid,
+) -> std::result::Result<(), (String, String)> {
+    let access = access_from_execute_payload(payload);
+    let critical = detection::has_critical_findings(&detection::preflight_findings(
+        &access.command,
+        &access.env,
+        access.action.as_deref(),
+    ));
+    let verified_context = verified_context_from_payload(payload, proof);
+    let matched = match verified_context.as_ref() {
+        Some(context) => grants::find_matching_grant_with_context(&access, context),
+        None => grants::find_matching_grant(&access),
+    }
+    .map_err(|error| ("grant_lookup_failed".to_string(), error.to_string()))?;
+    let Some(grant) = matched else {
+        return Err((
+            "approval_required".to_string(),
+            "no durable grant matched this execution".to_string(),
+        ));
+    };
+    let receipt_hash = grant
+        .receipt
+        .as_ref()
+        .map(|receipt| receipt.payload_hash.clone());
+    if grant.id != grant_id
+        || grant.scope != payload.approval_scope
+        || receipt_hash != payload.approval_receipt_hash
+        || critical
+    {
+        return Err((
+            "execute_authorization_mismatch".to_string(),
+            "durable grant does not match requested command/env scope".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn access_from_execute_payload(payload: &ExecuteAuthorizationPayload) -> AccessRequest {
+    AccessRequest {
+        project: payload.project.clone(),
+        agent: payload.agent.clone(),
+        branch: payload.branch.clone(),
+        action: payload.action.clone(),
+        command: payload.command.join(" "),
+        env: payload.env_names.clone(),
+    }
+}
+
+fn verified_context_from_payload(
+    payload: &ExecuteAuthorizationPayload,
+    proof: &AgentProof,
+) -> Option<crate::context::VerifiedContext> {
+    Some(crate::context::VerifiedContext {
+        project: payload.project.clone(),
+        agent: payload.agent.clone()?,
+        agent_key_id: proof.agent_key_id.clone(),
+        worktree: payload.worktree.clone()?,
+        branch: payload.branch.clone()?,
+        git_remote: payload.git_remote.clone()?,
+        commit: payload.commit.clone()?,
+        git_common_dir: None,
+    })
+}
+
 fn validate_list_keys_authorization(
     state: &Arc<Mutex<BrokerState>>,
+    project: &str,
     authorization: &ListKeysAuthorization,
 ) -> std::result::Result<(), (String, String)> {
     match authorization {
         ListKeysAuthorization::Human { shell_pid } => {
             let mut state = state.lock().expect("broker state poisoned");
             cleanup_inactive_human_sessions(&mut state);
-            validate_human_session(&state, *shell_pid)
+            validate_human_session(&state, project, *shell_pid)
                 .map_err(|message| ("human_session_required".to_string(), message))
         }
         ListKeysAuthorization::Internal { purpose } => {
@@ -2267,6 +2649,23 @@ fn cleanup_expired_execute_nonces(state: &mut BrokerState) {
     state
         .execute_nonces
         .retain(|_, expires_at| *expires_at > now);
+}
+
+fn cleanup_expired_approvals(state: &mut BrokerState) {
+    let now = Utc::now();
+    let active_sessions = state
+        .sessions
+        .iter()
+        .filter(|(_, session)| session.expires_at > now)
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    state.approvals.retain(|_, approval| {
+        approval
+            .expires_at
+            .is_none_or(|expires_at| expires_at > now)
+            && approval.uses_remaining.unwrap_or(1) > 0
+            && active_sessions.contains(&session_key(&approval.project, &approval.vault))
+    });
 }
 
 #[cfg(test)]
@@ -2505,6 +2904,7 @@ fn cleanup_inactive_human_sessions(state: &mut BrokerState) {
 }
 
 fn status_from_state(state: &BrokerState) -> BrokerStatus {
+    let now = Utc::now();
     BrokerStatus {
         running: true,
         socket: socket_path(),
@@ -2515,14 +2915,22 @@ fn status_from_state(state: &BrokerState) -> BrokerStatus {
         sessions: state
             .sessions
             .values()
-            .filter(|session| session.expires_at > Utc::now())
+            .filter(|session| session.expires_at > now)
             .map(|session| BrokerSessionStatus {
                 project: session.project.clone(),
                 vault: session.vault.clone(),
                 expires_at: session.expires_at,
                 active_mode: session.active_mode.as_ref().map(|m| m.config.name.clone()),
+                env_count: session.env.len(),
+                subsession_count: project_subsession_count(state, &session.project),
+                vault_fingerprint: Some(session.vault_fingerprint.clone()),
+                workspace_root: session.workspace_root.clone(),
+                workspace_name: session.workspace_name.clone(),
+                app_slug: session.app_slug.clone(),
+                state: "active".to_string(),
             })
             .collect(),
+        approval_count: state.approvals.len(),
     }
 }
 
@@ -2541,6 +2949,97 @@ fn current_parent_pid() -> Option<u32> {
 
 fn session_key(project: &str, vault: &Path) -> String {
     format!("{}|{}", project, vault.display())
+}
+
+fn project_subsession_count(state: &BrokerState, project: &str) -> usize {
+    state
+        .human_sessions
+        .values()
+        .filter(|entry| entry.expires_at > Utc::now() && entry.projects.contains(project))
+        .count()
+}
+
+fn build_project_session(
+    project: &str,
+    vault: &Path,
+    passphrase: &str,
+    ttl_seconds: i64,
+    mode: Option<&str>,
+) -> Result<BrokerSession> {
+    let expires_at = Utc::now() + Duration::seconds(ttl_seconds);
+    build_project_session_with_expiry(project, vault, passphrase, expires_at, mode)
+}
+
+fn build_project_session_with_expiry(
+    project: &str,
+    vault: &Path,
+    passphrase: &str,
+    expires_at: DateTime<Utc>,
+    mode: Option<&str>,
+) -> Result<BrokerSession> {
+    let plaintext = vault::decrypt_vault_file(vault, passphrase)
+        .with_context(|| format!("failed to decrypt {}", vault.display()))?;
+    let env = env_file::parse_env_map(&plaintext)
+        .with_context(|| format!("failed to parse {}", vault.display()))?;
+    let signing_key = {
+        let ciphertext =
+            approval_receipts::session_signing_key_ciphertext(project, passphrase, passphrase)?;
+        approval_receipts::decrypt_session_signing_key(&ciphertext, passphrase)?
+    };
+    let active_mode = load_active_mode(project, passphrase, expires_at, mode)?;
+    let (workspace_root, workspace_name, app_slug) = session_workspace_metadata(project);
+    Ok(BrokerSession {
+        project: project.to_string(),
+        vault: vault.to_path_buf(),
+        env,
+        vault_fingerprint: vault_fingerprint(vault)?,
+        signing_key,
+        passphrase: passphrase.to_string(),
+        expires_at,
+        active_mode,
+        workspace_root,
+        workspace_name,
+        app_slug,
+    })
+}
+
+fn load_active_mode(
+    project: &str,
+    passphrase: &str,
+    expires_at: DateTime<Utc>,
+    mode: Option<&str>,
+) -> Result<Option<modes::ActiveMode>> {
+    let Some(mode_name) = mode else {
+        return Ok(None);
+    };
+    let mode_configs = modes::load_broker_modes(project, passphrase).map_err(|error| {
+        anyhow::anyhow!("could not load modes vault: {error} — run `ward modes push` first")
+    })?;
+    let config = modes::find_mode(&mode_configs, mode_name)
+        .with_context(|| format!("mode '{mode_name}' not found — run `ward modes push` first"))?;
+    Ok(Some(modes::ActiveMode {
+        config: config.clone(),
+        expires_at,
+    }))
+}
+
+fn session_workspace_metadata(project: &str) -> (Option<PathBuf>, Option<String>, Option<String>) {
+    registry::list_projects()
+        .ok()
+        .and_then(|registry| registry.projects.get(project).cloned())
+        .map(|registered| {
+            (
+                registered.workspace_root,
+                registered.workspace_name,
+                registered.app_slug,
+            )
+        })
+        .unwrap_or((None, None, None))
+}
+
+fn vault_fingerprint(vault: &Path) -> Result<String> {
+    let bytes = fs::read(vault).with_context(|| format!("failed to read {}", vault.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -2596,13 +3095,6 @@ fn monitor_client_disconnect(mut stream: UnixStream, cancellation: Arc<AtomicBoo
     });
 }
 
-fn generate_session_key() -> String {
-    use rand::RngCore;
-    let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
-    hex::encode(key)
-}
-
 fn install_shutdown_handler(state: Arc<Mutex<BrokerState>>) {
     #[cfg(test)]
     {
@@ -2611,7 +3103,7 @@ fn install_shutdown_handler(state: Arc<Mutex<BrokerState>>) {
     #[cfg(not(test))]
     {
         if let Err(error) = ctrlc::set_handler(move || {
-            let _ = restore_all_sessions(&state);
+            cancel_all_human_commands(&mut state.lock().expect("broker state poisoned"));
             let _ = cleanup_stale_files();
             std::process::exit(0);
         }) {
@@ -2620,49 +3112,20 @@ fn install_shutdown_handler(state: Arc<Mutex<BrokerState>>) {
     }
 }
 
-fn restore_all_sessions(state: &Arc<Mutex<BrokerState>>) -> Result<()> {
-    let state = state.lock().expect("broker state poisoned");
-    for session in state.sessions.values() {
-        if let Some(ref ek) = session.session_key {
-            restore_vault_from_session(&session.vault, ek, &session.passphrase).context(
-                format!(
-                    "failed to restore {} before broker shutdown",
-                    session.vault.display()
-                ),
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn lock_project_in_state(
     state: &Arc<Mutex<BrokerState>>,
     project: &str,
     vault: &Path,
 ) -> Result<BrokerProjectLockStatus> {
     let key = session_key(project, vault);
-    let restore_material = {
-        let state = state.lock().expect("broker state poisoned");
-        state.sessions.get(&key).and_then(|session| {
-            session.session_key.as_ref().map(|session_key| {
-                (
-                    session.vault.clone(),
-                    session_key.clone(),
-                    session.passphrase.clone(),
-                )
-            })
-        })
-    };
-    if let Some((vault, session_key, passphrase)) = restore_material {
-        restore_vault_from_session(&vault, &session_key, &passphrase).context(format!(
-            "failed to restore {} before locking project",
-            vault.display()
-        ))?;
-    }
     let (broker_session_removed, cancelled_human_commands) = {
         let mut state = state.lock().expect("broker state poisoned");
         let removed = state.sessions.remove(&key).is_some();
+        state
+            .approvals
+            .retain(|_, approval| !approval.project.eq(project));
         let cancelled = cancel_project_human_commands(&mut state, project);
+        detach_project_human_sessions(&mut state, project);
         (removed, cancelled)
     };
     let revoked_session_grants = grants::revoke_project_session_grants(project)?;
@@ -2683,14 +3146,18 @@ fn discard_project_runtime_after_teardown(
 ) {
     let mut state = state.lock().expect("broker state poisoned");
     state.sessions.remove(&session_key(project, vault));
+    state
+        .approvals
+        .retain(|_, approval| !approval.project.eq(project));
     cancel_project_human_commands(&mut state, project);
+    detach_project_human_sessions(&mut state, project);
 }
 
-/// Decrypts the session-encrypted vault and re-writes it with the original passphrase.
-fn restore_vault_from_session(vault: &Path, session_key: &str, passphrase: &str) -> Result<()> {
-    let plaintext = vault::decrypt_vault_file(vault, session_key)?;
-    let envelope = vault::encrypt_env(&plaintext, passphrase)?;
-    vault::write_vault(vault, &envelope)
+fn detach_project_human_sessions(state: &mut BrokerState, project: &str) {
+    state.human_sessions.retain(|_, entry| {
+        entry.projects.remove(project);
+        !entry.projects.is_empty()
+    });
 }
 
 fn send_simple(request: BrokerRequest) -> Result<BrokerResponse> {
@@ -2800,6 +3267,7 @@ pub fn coverage_exercise_broker_edges() -> Result<()> {
         version: BROKER_VERSION.to_string(),
         started_at: Some(Utc::now()),
         sessions: Vec::new(),
+        approval_count: 0,
     };
     let ping_result = with_fake_broker(vec![vec![BrokerResponse::Ok]], ping)?;
     assert!(ping_result.is_err());
@@ -3116,6 +3584,151 @@ mod tests {
 
     #[test]
     #[serial]
+    fn unlock_creates_memory_session_without_rewriting_vault() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let passphrase = "master-session-passphrase";
+        let (_vault_dir, vault_path) = test_vault(passphrase);
+        let before = std::fs::read(&vault_path).unwrap();
+        let state = Arc::new(Mutex::new(BrokerState::default()));
+
+        let (_, response) = broker_pair(
+            BrokerRequest::Unlock {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                passphrase: passphrase.to_string(),
+                ttl_seconds: 60,
+                mode: None,
+            },
+            Arc::clone(&state),
+        );
+
+        assert!(matches!(response, BrokerResponse::Ok));
+        assert_eq!(std::fs::read(&vault_path).unwrap(), before);
+        let status = status_from_state(&state.lock().unwrap());
+        assert_eq!(status.sessions.len(), 1);
+        assert_eq!(status.sessions[0].env_count, 1);
+        assert_eq!(status.sessions[0].state, "active");
+        assert!(status.sessions[0].vault_fingerprint.is_some());
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn human_list_keys_requires_project_bound_subsession() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let passphrase = "human-project-binding";
+        let (_vault_dir, vault_path) = test_vault(passphrase);
+        let mut state = BrokerState::default();
+        state.sessions.insert(
+            session_key("demo", &vault_path),
+            build_project_session_with_expiry(
+                "demo",
+                &vault_path,
+                passphrase,
+                Utc::now() + Duration::hours(1),
+                None,
+            )
+            .unwrap(),
+        );
+        state.human_sessions.insert(
+            std::process::id(),
+            HumanSessionEntry {
+                session_token: "token".to_string(),
+                expires_at: Utc::now() + Duration::hours(1),
+                projects: ["other".to_string()].into_iter().collect(),
+            },
+        );
+
+        let (_, response) = broker_pair(
+            BrokerRequest::ListKeys {
+                project: "demo".to_string(),
+                vault: vault_path,
+                authorization: ListKeysAuthorization::Human {
+                    shell_pid: std::process::id(),
+                },
+            },
+            Arc::new(Mutex::new(state)),
+        );
+
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "human_session_required"
+        ));
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial]
+    fn project_lock_removes_only_target_session_and_subsession_binding() {
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("WARD_HOME", home.path());
+        let passphrase = "lock-project";
+        let (_demo_dir, demo_vault) = test_vault(passphrase);
+        let (_other_dir, other_vault) = test_vault(passphrase);
+        let mut state = BrokerState::default();
+        state.sessions.insert(
+            session_key("demo", &demo_vault),
+            build_project_session_with_expiry(
+                "demo",
+                &demo_vault,
+                passphrase,
+                Utc::now() + Duration::hours(1),
+                None,
+            )
+            .unwrap(),
+        );
+        state.sessions.insert(
+            session_key("other", &other_vault),
+            build_project_session_with_expiry(
+                "other",
+                &other_vault,
+                passphrase,
+                Utc::now() + Duration::hours(1),
+                None,
+            )
+            .unwrap(),
+        );
+        state.human_sessions.insert(
+            std::process::id(),
+            HumanSessionEntry {
+                session_token: "token".to_string(),
+                expires_at: Utc::now() + Duration::hours(1),
+                projects: ["demo".to_string(), "other".to_string()]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        let state = Arc::new(Mutex::new(state));
+
+        let (_, response) = broker_pair(
+            BrokerRequest::LockProject {
+                project: "demo".to_string(),
+                vault: demo_vault.clone(),
+            },
+            Arc::clone(&state),
+        );
+
+        assert!(matches!(response, BrokerResponse::ProjectLock { .. }));
+        let state = state.lock().unwrap();
+        assert!(!state
+            .sessions
+            .contains_key(&session_key("demo", &demo_vault)));
+        assert!(state
+            .sessions
+            .contains_key(&session_key("other", &other_vault)));
+        let projects = &state.human_sessions[&std::process::id()].projects;
+        assert!(!projects.contains("demo"));
+        assert!(projects.contains("other"));
+        std::env::remove_var("WARD_HOME");
+    }
+
+    #[test]
+    #[serial]
     fn setup_project_with_passphrase_creates_project_without_exposing_secret_values() {
         let home = tempfile::tempdir().unwrap();
         std::env::set_var("WARD_HOME", home.path());
@@ -3222,14 +3835,14 @@ mod tests {
         let mut state = BrokerState::default();
         state.sessions.insert(
             session_key("demo", &source_vault),
-            BrokerSession {
-                project: "demo".to_string(),
-                vault: source_vault.clone(),
-                passphrase: "1234".to_string(),
-                session_key: None,
-                expires_at: Utc::now() + Duration::hours(1),
-                active_mode: None,
-            },
+            build_project_session_with_expiry(
+                "demo",
+                &source_vault,
+                "1234",
+                Utc::now() + Duration::hours(1),
+                None,
+            )
+            .unwrap(),
         );
         let state = Arc::new(Mutex::new(state));
         let (_, response) = broker_pair(
@@ -3275,7 +3888,8 @@ mod tests {
             .unwrap();
         let material = ActiveProjectMaterial {
             passphrase: "1234".to_string(),
-            decrypt_key: "1234".to_string(),
+            plaintext: source_plaintext.to_string(),
+            env: env_file::parse_env_map(source_plaintext).unwrap(),
             expires_at: Utc::now() + Duration::hours(1),
         };
 
@@ -3373,30 +3987,59 @@ mod tests {
             ppid: Some(1),
             version: BROKER_VERSION.to_string(),
             started_at: Some(now),
+            approval_count: 0,
             sessions: vec![
                 BrokerSessionStatus {
                     project: "other".to_string(),
                     vault: vault.clone(),
                     expires_at,
                     active_mode: None,
+                    env_count: 1,
+                    subsession_count: 0,
+                    vault_fingerprint: None,
+                    workspace_root: None,
+                    workspace_name: None,
+                    app_slug: None,
+                    state: "active".to_string(),
                 },
                 BrokerSessionStatus {
                     project: "demo".to_string(),
                     vault: PathBuf::from("/missing/.env.vault"),
                     expires_at,
                     active_mode: None,
+                    env_count: 1,
+                    subsession_count: 0,
+                    vault_fingerprint: None,
+                    workspace_root: None,
+                    workspace_name: None,
+                    app_slug: None,
+                    state: "active".to_string(),
                 },
                 BrokerSessionStatus {
                     project: "demo".to_string(),
                     vault: same_vault,
                     expires_at,
                     active_mode: None,
+                    env_count: 1,
+                    subsession_count: 0,
+                    vault_fingerprint: None,
+                    workspace_root: None,
+                    workspace_name: None,
+                    app_slug: None,
+                    state: "active".to_string(),
                 },
                 BrokerSessionStatus {
                     project: "demo".to_string(),
                     vault: vault.clone(),
                     expires_at: now - Duration::minutes(1),
                     active_mode: None,
+                    env_count: 1,
+                    subsession_count: 0,
+                    vault_fingerprint: None,
+                    workspace_root: None,
+                    workspace_name: None,
+                    app_slug: None,
+                    state: "expired".to_string(),
                 },
             ],
         };
@@ -3500,14 +4143,14 @@ mod tests {
 
         state.lock().unwrap().sessions.insert(
             session_key("expired", &vault_path),
-            BrokerSession {
-                project: "expired".to_string(),
-                vault: vault_path.clone(),
-                passphrase: passphrase.to_string(),
-                session_key: None,
-                expires_at: Utc::now() - Duration::seconds(1),
-                active_mode: None,
-            },
+            build_project_session_with_expiry(
+                "expired",
+                &vault_path,
+                passphrase,
+                Utc::now() - Duration::seconds(1),
+                None,
+            )
+            .unwrap(),
         );
         let (_, response) = broker_pair(
             BrokerRequest::Execute {
@@ -3652,17 +4295,55 @@ mod tests {
                     "demo",
                     &vault_path,
                     &cwd,
-                    access.env,
-                    command,
+                    access.env.clone(),
+                    command.clone(),
                     "codex",
                 )),
             },
         )
         .unwrap();
-        assert!(!handle_client(server, state).unwrap());
+        assert!(!handle_client(server, Arc::clone(&state)).unwrap());
         let mut reader = BufReader::new(client);
         let finished = read_response(&mut reader).unwrap();
-        assert!(matches!(finished, BrokerResponse::Finished { .. }));
+        assert!(matches!(
+            finished,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "human_approval_required"
+        ));
+
+        let mut forged_payload =
+            test_execute_payload("demo", &vault_path, &cwd, access.env, command.clone());
+        forged_payload.approval_source = ApprovalSource::AgentMediated;
+        forged_payload.agent = Some("codex".to_string());
+        forged_payload.worktree = Some(cwd.clone());
+        forged_payload.branch = Some("main".to_string());
+        forged_payload.git_remote = Some(String::new());
+        forged_payload.commit = Some("abc123".to_string());
+        let proof_payload = serde_json::to_string(&forged_payload).unwrap();
+        let forged_proof = agents::sign_payload("demo", "codex", &proof_payload).unwrap();
+        let (_, response) = broker_pair(
+            BrokerRequest::Execute {
+                project: "demo".to_string(),
+                vault: vault_path.clone(),
+                cwd: cwd.clone(),
+                env_names: forged_payload.env_names.clone(),
+                command,
+                inherited_env: inherited_execution_env(),
+                authorization: Some(ExecuteAuthorization::Agent {
+                    proof: forged_proof,
+                }),
+            },
+            Arc::clone(&state),
+        );
+        assert!(matches!(
+            response,
+            BrokerResponse::Error {
+                reason,
+                ..
+            } if reason == "agent_self_approval_rejected"
+        ));
 
         std::env::remove_var("WARD_HOME");
     }

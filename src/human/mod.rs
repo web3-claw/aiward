@@ -127,7 +127,12 @@ fn write_guardian_response(stream: &mut UnixStream, resp: &GuardianResponse) -> 
 
 // ── Guardian subprocess ───────────────────────────────────────────────────────
 
-pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> Result<()> {
+pub fn serve_guardian(
+    shell_pid: u32,
+    session_token: &str,
+    ttl_seconds: i64,
+    projects: Vec<String>,
+) -> Result<()> {
     let dir = human_run_dir(shell_pid);
     let socket_path = guardian_socket_path(shell_pid);
     let ready_path = ready_marker_path(shell_pid);
@@ -147,7 +152,7 @@ pub fn serve_guardian(shell_pid: u32, session_token: &str, ttl_seconds: i64) -> 
     listener.set_nonblocking(true)?;
 
     broker::ensure_running()?;
-    broker::register_human_session(shell_pid, session_token, ttl_seconds)?;
+    broker::register_human_session(shell_pid, session_token, ttl_seconds, &projects)?;
 
     // Write the ready marker — `activate_human_mode` polls for this.
     fs_util::write_private_file(&ready_path, b"")?;
@@ -242,13 +247,9 @@ pub fn activate_human_mode(
     all: bool,
     ttl: &str,
 ) -> Result<()> {
-    use crate::{config, logs::LogKind, registry, unlock, vault, workspace, workspace_target};
+    use crate::{config, logs::LogKind, registry, unlock, vault, workspace_target};
 
     let cwd = std::env::current_dir()?;
-    let workspace_root_mode = project.is_none()
-        && app.is_none()
-        && config::find_project_root(&cwd).is_none()
-        && workspace::discover_containing(&cwd)?.is_some();
     let (header_project, header_path) = config::find_project_root(&cwd)
         .and_then(|root| {
             config::read_project_config(&root)
@@ -271,16 +272,12 @@ pub fn activate_human_mode(
     );
 
     let passphrase = vault::read_existing_passphrase()?;
-    let selector = workspace_target::TargetSelector {
-        project,
-        app,
-        all: all || workspace_root_mode,
-    };
+    let selector = workspace_target::TargetSelector { project, app, all };
     let targets = workspace_target::resolve_many_with_passphrase(&selector, &cwd, &passphrase)?;
     let duration = unlock::parse_ttl(ttl)?;
     let ttl_seconds = duration.num_seconds();
 
-    // Unlock vault in broker (handles both passphrase-encrypted and session-encrypted vaults).
+    // Unlock each target in the broker master-session map.
     for target in &targets {
         let resolved = target.resolved_project();
         registry::update_project_vault(
@@ -326,14 +323,23 @@ pub fn activate_human_mode(
 
     // Spawn guardian subprocess.
     let exe = std::env::current_exe().context("cannot locate ward binary")?;
-    std::process::Command::new(&exe)
+    let project_names = targets
+        .iter()
+        .map(|target| target.name.clone())
+        .collect::<Vec<_>>();
+    let mut command = std::process::Command::new(&exe);
+    command
         .arg("__human-guardian")
         .arg("--shell-pid")
         .arg(shell_pid.to_string())
         .arg("--session-token")
         .arg(&session_token)
         .arg("--ttl-seconds")
-        .arg(ttl_seconds.to_string())
+        .arg(ttl_seconds.to_string());
+    for project_name in &project_names {
+        command.arg("--project").arg(project_name);
+    }
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
