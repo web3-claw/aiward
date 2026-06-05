@@ -202,7 +202,7 @@ fn implicit_one(cwd: &Path) -> Result<WorkspaceTarget> {
             0 => anyhow::bail!("workspace has no configured Ward app projects; run ward setup --workspace"),
             1 => Ok(targets.into_iter().next().expect("one target exists")),
             _ => anyhow::bail!(
-                "workspace root has multiple Ward app projects; choose one with --app <app> or --project <project>: {}",
+                "workspace root has multiple Ward app projects; human mode is per app, so choose one with --app <app> or --project <project>, or run ward human inside each app folder: {}",
                 target_suggestions(&targets)
             ),
         };

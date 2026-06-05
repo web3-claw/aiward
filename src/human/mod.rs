@@ -1,7 +1,7 @@
 pub mod display;
 
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, IsTerminal, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::PathBuf,
     thread,
@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{broker, fs_util, logs, term};
+use crate::{broker, fs_util, logs, term, workspace_target};
 use base64::Engine as _;
 
 const HUMAN_ACTIVATION_BODY: &str =
@@ -247,9 +247,10 @@ pub fn activate_human_mode(
     all: bool,
     ttl: &str,
 ) -> Result<()> {
-    use crate::{config, logs::LogKind, registry, unlock, vault, workspace_target};
+    use crate::{config, logs::LogKind, registry, unlock, vault};
 
     let cwd = std::env::current_dir()?;
+    let selector = workspace_target::TargetSelector { project, app, all };
     let (header_project, header_path) = config::find_project_root(&cwd)
         .and_then(|root| {
             config::read_project_config(&root)
@@ -271,8 +272,8 @@ pub fn activate_human_mode(
         HUMAN_ACTIVATION_BODY,
     );
 
+    let selector = resolve_human_selector(selector, &cwd)?;
     let passphrase = vault::read_existing_passphrase()?;
-    let selector = workspace_target::TargetSelector { project, app, all };
     let targets = workspace_target::resolve_many_with_passphrase(&selector, &cwd, &passphrase)?;
     let duration = unlock::parse_ttl(ttl)?;
     let ttl_seconds = duration.num_seconds();
@@ -407,6 +408,61 @@ pub fn activate_human_mode(
     )?;
 
     Ok(())
+}
+
+fn resolve_human_selector(
+    selector: workspace_target::TargetSelector,
+    cwd: &std::path::Path,
+) -> Result<workspace_target::TargetSelector> {
+    if selector.project.is_some() || selector.app.is_some() || selector.all {
+        return Ok(selector);
+    }
+    if crate::config::find_project_root(cwd).is_some() {
+        return Ok(selector);
+    }
+    let Some(discovery) = crate::workspace::discover_containing(cwd)? else {
+        return Ok(selector);
+    };
+    let targets = workspace_target::configured_workspace_targets(&discovery)?;
+    match targets.len() {
+        0 => anyhow::bail!("workspace has no configured Ward app projects; run ward setup --workspace"),
+        1 => {
+            let target = targets.into_iter().next().expect("one target exists");
+            Ok(workspace_target::TargetSelector {
+                project: None,
+                app: target.app_slug.or(Some(target.name)),
+                all: false,
+            })
+        }
+        _ if std::io::stdin().is_terminal() => {
+            let labels = targets
+                .iter()
+                .map(|target| {
+                    let app = target.app_slug.as_deref().unwrap_or(&target.name);
+                    format!("{app} ({})", target.name)
+                })
+                .collect::<Vec<_>>();
+            term::section("Project");
+            term::info("This workspace has multiple Ward app projects.");
+            let selected = inquire::Select::new("Activate human mode for which app?", labels.clone())
+                .prompt()
+                .context("app selection cancelled")?;
+            let index = labels
+                .iter()
+                .position(|label| label == &selected)
+                .context("selected app was not found")?;
+            let target = targets[index].clone();
+            Ok(workspace_target::TargetSelector {
+                project: None,
+                app: target.app_slug.or(Some(target.name)),
+                all: false,
+            })
+        }
+        _ => anyhow::bail!(
+            "workspace root has multiple Ward app projects; human mode is per app, so choose one with --app <app> or --project <project>, or run ward human inside each app folder: {}",
+            workspace_target::target_suggestions(&targets)
+        ),
+    }
 }
 
 fn shell_hooks_loaded() -> bool {
