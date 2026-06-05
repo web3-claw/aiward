@@ -1799,7 +1799,7 @@ fn project_view(
         Err(error) => format!("unavailable: {error}"),
     };
 
-    let broker_session_expires_at = broker_status.and_then(|status| {
+    let status_expires_at = broker_status.and_then(|status| {
         status
             .sessions
             .iter()
@@ -1807,15 +1807,21 @@ fn project_view(
             .map(|session| session.expires_at)
             .max()
     });
-    let broker_session_active = broker_session_expires_at.is_some();
 
     let mut vault_keys_verified = false;
-    if broker_session_active {
-        if let Ok(vault_keys) = broker::list_vault_keys_from_active_session(name, &project.vault) {
-            vault_keys_verified = true;
-            env_names.extend(vault_keys);
+    let broker_session_expires_at = if status_expires_at.is_some() {
+        match broker::list_vault_keys_from_active_session(name, &project.vault) {
+            Ok(vault_keys) => {
+                vault_keys_verified = true;
+                env_names.extend(vault_keys);
+                status_expires_at
+            }
+            Err(_) => None,
         }
-    }
+    } else {
+        None
+    };
+    let broker_session_active = broker_session_expires_at.is_some();
 
     profiles.sort_by(|left, right| left.name.cmp(&right.name));
     agent_policies.sort_by(|left, right| left.agent.cmp(&right.agent));
@@ -1892,7 +1898,7 @@ fn discovered_project_view(
         workspace::WorkspaceSetupStatus::NotConfigured => "not configured".to_string(),
     };
     let package_vault = package.path.join(config::DEFAULT_VAULT_FILE);
-    let broker_session_expires_at = broker_status.and_then(|status| {
+    let status_expires_at = broker_status.and_then(|status| {
         status
             .sessions
             .iter()
@@ -1902,6 +1908,14 @@ fn discovered_project_view(
             .map(|session| session.expires_at)
             .max()
     });
+    let broker_session_expires_at = if status_expires_at.is_some() {
+        match broker::list_vault_keys_from_active_session(&package.project_name, &package_vault) {
+            Ok(_) => status_expires_at,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let broker_session_active = broker_session_expires_at.is_some();
 
     Ok(ProjectView {

@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 use dirs;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     agents, anomaly,
@@ -372,7 +373,16 @@ pub enum Commands {
         command: ModesCommand,
     },
     /// Clear unlock sessions and revoke session-scoped approval grants.
-    Lock,
+    Lock {
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long)]
+        app: Option<String>,
+        #[arg(long)]
+        workspace: bool,
+        #[arg(long)]
+        all: bool,
+    },
     /// Export plaintext env and remove Ward files from a project.
     Teardown {
         #[arg(long)]
@@ -454,6 +464,8 @@ pub enum Commands {
         session_token: String,
         #[arg(long)]
         ttl_seconds: i64,
+        #[arg(long = "project")]
+        projects: Vec<String>,
     },
 }
 
@@ -1146,7 +1158,12 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             verify_only,
         } => unlock_vault_for_target(project, app, all, &ttl, mode.as_deref(), verify_only),
         Commands::Modes { command } => modes_command(command),
-        Commands::Lock => lock(),
+        Commands::Lock {
+            project,
+            app,
+            workspace,
+            all,
+        } => lock(project, app, workspace, all),
         Commands::Teardown {
             project,
             app,
@@ -1177,7 +1194,8 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             shell_pid,
             session_token,
             ttl_seconds,
-        } => crate::human::serve_guardian(shell_pid, &session_token, ttl_seconds),
+            projects,
+        } => crate::human::serve_guardian(shell_pid, &session_token, ttl_seconds, projects),
     }
 }
 
@@ -3419,9 +3437,18 @@ fn with_passphrase_vault_access<T>(
     let active_expires_at = broker::active_session_expiry(&resolved.name, &resolved.vault)?;
     let active_ttl = active_expires_at
         .and_then(|expires_at| remaining_session_ttl(expires_at, chrono::Utc::now()));
-
     if active_ttl.is_some() {
-        broker::stop().context("failed to restore active broker session before vault access")?;
+        if let Some(session_fingerprint) =
+            broker::active_session_fingerprint(&resolved.name, &resolved.vault)?
+        {
+            let file_fingerprint = vault_file_fingerprint(&resolved.vault)?;
+            if session_fingerprint != file_fingerprint {
+                anyhow::bail!(
+                    "active broker session is stale for {}; run ward unlock again before modifying the vault",
+                    resolved.name
+                );
+            }
+        }
     }
 
     let result = operation();
@@ -3441,6 +3468,11 @@ fn with_passphrase_vault_access<T>(
         }
     }
     result
+}
+
+fn vault_file_fingerprint(vault: &Path) -> Result<String> {
+    let bytes = fs::read(vault).with_context(|| format!("failed to read {}", vault.display()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }
 
 fn refresh_project_store_with_passphrase(
@@ -4684,8 +4716,8 @@ fn run_with_context(
                 if broker_execution_rejection_is_authoritative(&broker_err) {
                     anyhow::bail!("broker rejected execution: {broker_err}");
                 }
-                // If an active unlock session exists but the broker isn't running,
-                // the vault may be session-encrypted. Direct decryption won't work.
+                // If only broker metadata exists and the broker is unavailable,
+                // there is no usable secret material for no-prompt execution.
                 let fallback_passphrase = match unlock::active_run_lookup(
                     &resolved.name,
                     &resolved.vault,
@@ -4693,9 +4725,9 @@ fn run_with_context(
                     unlock::RunUnlockLookup::Available(passphrase) => Some(passphrase),
                     unlock::RunUnlockLookup::MaterialUnavailable { .. } => {
                         anyhow::bail!(
-                                "broker session exists but broker is not running ({})\nRun `ward unlock` to restore the session.",
-                                broker_err
-                            );
+                            "broker session metadata exists but broker is not running ({})\nRun `ward unlock` to recreate the master session.",
+                            broker_err
+                        );
                     }
                     unlock::RunUnlockLookup::Missing => None,
                 };
@@ -4703,12 +4735,13 @@ fn run_with_context(
                     Some(passphrase) => passphrase,
                     None => vault::read_existing_passphrase()?,
                 };
+                let plaintext = vault::decrypt_vault_file(&resolved.vault, &passphrase)?;
+                let env = env_file::parse_env_map(&plaintext)?;
                 runner::run_command(RunCommandRequest {
                     cwd: cwd.clone(),
-                    vault: resolved.vault.clone(),
                     env_names: decision.approved_env.clone(),
+                    env,
                     command: command_args,
-                    passphrase,
                     inherited_env: std::env::vars().collect(),
                     cancellation: None,
                     human_shell_pid: if human_terminal {
@@ -4835,7 +4868,6 @@ fn doctor_workspace(cwd: &Path) -> Result<()> {
         term::next("run: ward setup --workspace --all");
         return Ok(());
     }
-    let broker_status = broker::status().ok();
     for target in targets {
         let cfg_status = if config::config_path(&target.path).is_file() {
             "config ok"
@@ -4847,14 +4879,8 @@ fn doctor_workspace(cwd: &Path) -> Result<()> {
         } else {
             "vault missing"
         };
-        let session = broker_status
-            .as_ref()
-            .map(|status| {
-                status.sessions.iter().any(|session| {
-                    session.project == target.name && same_path(&session.vault, &target.vault)
-                })
-            })
-            .unwrap_or(false);
+        let session =
+            broker::list_vault_keys_from_active_session(&target.name, &target.vault).is_ok();
         let session_status = if session { "session active" } else { "locked" };
         let app = target.app_slug.as_deref().unwrap_or(&target.name);
         term::info(&format!(
@@ -5015,14 +5041,13 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
                     }
                     term::info(&format!("sessions  {}", status.sessions.len()));
                     term::info(&format!("broker approvals  {}", status.approval_count));
-                    let active = status
-                        .sessions
-                        .iter()
-                        .any(|s| s.project == project.name && same_path(&s.vault, &project.vault));
-                    if active {
-                        term::ok("Active broker unlock session is available");
-                    } else {
-                        warn_missing_broker_session(&project.name, &project.vault);
+                    match broker::list_vault_keys_from_active_session(&project.name, &project.vault)
+                    {
+                        Ok(names) => {
+                            term::ok("active broker session can serve env names");
+                            term::info(&format!("env names in memory  {}", names.len()));
+                        }
+                        Err(_) => warn_missing_broker_session(&project.name, &project.vault),
                     }
                 }
                 Ok(_) => warn_missing_broker_session(&project.name, &project.vault),
@@ -5062,12 +5087,11 @@ fn doctor_project_at(cwd: PathBuf) -> Result<()> {
                 }
                 Err(error) => term::fail(&format!("project-store check failed — {error}")),
             }
-            match broker::active_session_expiry(&project.name, &project.vault) {
-                Ok(Some(_)) => term::ok("active broker session can refresh/provision"),
-                Ok(None) => {
+            match broker::list_vault_keys_from_active_session(&project.name, &project.vault) {
+                Ok(_) => term::ok("active broker session can refresh/provision"),
+                Err(_) => {
                     term::warn("run ward unlock --ttl 8h to refresh/provision from this project")
                 }
-                Err(error) => term::fail(&format!("broker session check failed — {error}")),
             }
         }
         Err(error) => term::fail(&format!("registry resolve failed — {error}")),
@@ -5345,8 +5369,8 @@ pub(crate) fn create_run_unlock_session(
 ) -> Result<unlock::UnlockSession> {
     let ttl = unlock::parse_ttl(ttl)?;
 
-    // Send unlock to broker first. The broker handles both passphrase-encrypted and
-    // session-encrypted vaults (restoring from the existing session before re-decrypting).
+    // Send unlock to the broker first. The broker decrypts the stable vault once
+    // and keeps the runtime env map in memory for command injection.
     broker::unlock_project_with_mode(
         project,
         vault_path,
@@ -5444,15 +5468,19 @@ fn unlock_vault_for_target(
         let targets = workspace_target::resolve_many(&selector, &cwd)?;
         for target in targets {
             let resolved = target.resolved_project();
-            match broker::active_session_expiry(&resolved.name, &resolved.vault)? {
-                Some(expires_at) => {
+            match broker::list_vault_keys_from_active_session(&resolved.name, &resolved.vault) {
+                Ok(names) => {
+                    let expires_at =
+                        broker::active_session_expiry(&resolved.name, &resolved.vault)?
+                            .context("broker session can serve env names but has no expiry")?;
                     println!(
-                        "{} broker session active until {}.",
+                        "{} broker session active until {} ({} env names in memory).",
                         resolved.name,
-                        expires_at.to_rfc3339()
+                        expires_at.to_rfc3339(),
+                        names.len()
                     );
                 }
-                None => anyhow::bail!(
+                Err(_) => anyhow::bail!(
                     "broker has no active session for {}; run ward unlock --ttl 8h",
                     resolved.name
                 ),
@@ -5490,7 +5518,54 @@ fn unlock_vault_for_target(
     Ok(())
 }
 
-fn lock() -> Result<()> {
+fn lock(
+    project: Option<String>,
+    app: Option<String>,
+    workspace_scope: bool,
+    all: bool,
+) -> Result<()> {
+    if project.is_some() && app.is_some() {
+        anyhow::bail!("choose either --project or --app, not both");
+    }
+    if all && (project.is_some() || app.is_some() || workspace_scope) {
+        anyhow::bail!("--all cannot be combined with --project, --app, or --workspace");
+    }
+    if workspace_scope && (project.is_some() || app.is_some()) {
+        anyhow::bail!("--workspace cannot be combined with --project or --app");
+    }
+
+    if project.is_some() || app.is_some() || workspace_scope {
+        let cwd = env::current_dir()?;
+        let targets = if workspace_scope {
+            let discovery = workspace::discover_containing(&cwd)?
+                .context("--workspace requires running inside a Ward workspace")?;
+            let targets = workspace_target::configured_workspace_targets(&discovery)?;
+            if targets.is_empty() {
+                anyhow::bail!("workspace has no configured Ward app projects");
+            }
+            targets
+        } else {
+            vec![workspace_target::resolve_one(
+                &workspace_target::TargetSelector::one(project, app),
+                &cwd,
+            )?]
+        };
+
+        for target in targets {
+            let status = broker::lock_project(&target.name, &target.vault)?;
+            println!(
+                "Locked {}: broker_session_removed={} revoked_session_grants={} cleared_unlock_sessions={} cancelled_human_commands={}",
+                status.project,
+                status.broker_session_removed,
+                status.revoked_session_grants,
+                status.cleared_unlock_sessions,
+                status.cancelled_human_commands,
+            );
+        }
+        return Ok(());
+    }
+
+    let _ = all;
     if crate::human::is_human_terminal() {
         let _ = crate::human::send_guardian_shutdown();
     }
@@ -5529,10 +5604,8 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
         old_vault.display()
     );
 
-    if broker::active_session_expiry(&project_name, &old_vault)?.is_some() {
-        broker::stop().context("failed to restore active broker session before rotation")?;
-        unlock::clear_project_unlocks(&project_name)?;
-    }
+    let active_ttl = broker::active_session_expiry(&project_name, &old_vault)?
+        .and_then(|expires_at| remaining_session_ttl(expires_at, chrono::Utc::now()));
 
     let plaintext = vault::decrypt_vault_file(&old_vault, &passphrase)?;
     let new_vault = loop {
@@ -5562,6 +5635,12 @@ fn rotate_vault(project: Option<String>, app: Option<String>) -> Result<()> {
     ));
     env_file::refresh_locked_env(&cwd, &new_vault)?;
     config::ensure_gitignore(&cwd, true)?;
+    if let Some(ttl) = active_ttl {
+        broker::unlock_project(&project_name, &new_vault, &passphrase, ttl)
+            .context("vault rotated, but Ward could not refresh the active broker session")?;
+        unlock::clear_project_unlocks(&project_name)?;
+        let _ = unlock::create_run_unlock(&project_name, &new_vault, &passphrase, ttl);
+    }
     println!("[ok] Vault rotated to {}", new_vault.display());
     println!("[ok] .ward.json updated with new nonce.");
     Ok(())
@@ -5704,17 +5783,8 @@ fn decrypt_vault_for_recovery(
     vault_path: &Path,
     passphrase: &str,
 ) -> Result<String> {
-    match vault::decrypt_vault_file(vault_path, passphrase) {
-        Ok(plaintext) => Ok(plaintext),
-        Err(first_error) => {
-            if broker::active_session_expiry(project, vault_path)?.is_some() {
-                broker::stop()?;
-                return vault::decrypt_vault_file(vault_path, passphrase)
-                    .context("failed to decrypt vault after stopping the active broker session");
-            }
-            Err(first_error)
-        }
-    }
+    let _ = project;
+    vault::decrypt_vault_file(vault_path, passphrase)
 }
 
 fn prompt_shell_reload(_rc: &Path) {
@@ -7777,16 +7847,6 @@ fn warn_missing_broker_session(project: &str, vault: &Path) {
     }
 }
 
-fn same_path(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (left.canonicalize(), right.canonicalize()) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
 fn likely_secret_env_files(cwd: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(cwd)? {
@@ -9444,7 +9504,12 @@ mod tests {
         })
         .unwrap();
         dispatch(Cli {
-            command: Commands::Lock,
+            command: Commands::Lock {
+                project: None,
+                app: None,
+                workspace: false,
+                all: false,
+            },
         })
         .unwrap();
 
@@ -10673,7 +10738,12 @@ mod tests {
             format!(
                 "{:?}",
                 Cli {
-                    command: Commands::Lock
+                    command: Commands::Lock {
+                        project: None,
+                        app: None,
+                        workspace: false,
+                        all: false,
+                    }
                 }
             ),
             format!(
@@ -10966,7 +11036,15 @@ mod tests {
                     verify_only: false,
                 }
             ),
-            format!("{:?}", Commands::Lock),
+            format!(
+                "{:?}",
+                Commands::Lock {
+                    project: None,
+                    app: None,
+                    workspace: false,
+                    all: false,
+                }
+            ),
             format!(
                 "{:?}",
                 GrantsCommand::Revoke {

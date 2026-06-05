@@ -16,8 +16,6 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::vault;
-
 #[derive(Debug, Clone)]
 pub struct MissingVaultEnvError {
     missing: Vec<String>,
@@ -50,10 +48,9 @@ pub fn missing_vault_envs(error: &anyhow::Error) -> Option<&[String]> {
 #[derive(Debug, Clone)]
 pub struct RunCommandRequest {
     pub cwd: PathBuf,
-    pub vault: PathBuf,
     pub env_names: Vec<String>,
+    pub env: BTreeMap<String, String>,
     pub command: Vec<String>,
-    pub passphrase: String,
     pub inherited_env: BTreeMap<String, String>,
     pub cancellation: Option<Arc<AtomicBool>>,
     pub human_shell_pid: Option<u32>,
@@ -106,9 +103,7 @@ pub fn run_command_with_emitter(
     }
 
     let started = Instant::now();
-    let plaintext = vault::decrypt_vault_file(&request.vault, &request.passphrase)?;
-    let env_map = parse_env(&plaintext)?;
-    let scoped_env = select_env(&env_map, &request.env_names)?;
+    let scoped_env = select_env(&request.env, &request.env_names)?;
     let redaction_candidates = scoped_env
         .iter()
         .filter(|(_, value)| value.len() >= 4)
@@ -252,16 +247,6 @@ fn terminate_child_group(pid: u32) {
     {
         let _ = pid;
     }
-}
-
-fn parse_env(plaintext: &str) -> Result<BTreeMap<String, String>> {
-    let iter = dotenvy::from_read_iter(std::io::Cursor::new(plaintext.as_bytes()));
-    let mut values = BTreeMap::new();
-    for item in iter {
-        let (key, value) = item?;
-        values.insert(key, value);
-    }
-    Ok(values)
 }
 
 fn select_env(
@@ -453,7 +438,6 @@ fn is_secret_like_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{inspect_output_line, run_command, RedactionCandidate, RunCommandRequest};
-    use crate::vault;
 
     fn redaction_candidate(env_name: &str, value: &str) -> RedactionCandidate {
         RedactionCandidate {
@@ -536,10 +520,9 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let result = run_command(RunCommandRequest {
             cwd: tempdir.path().to_path_buf(),
-            vault: std::path::PathBuf::from("unused"),
             env_names: Vec::new(),
+            env: std::collections::BTreeMap::new(),
             command: Vec::new(),
-            passphrase: "unused".to_string(),
             inherited_env: std::collections::BTreeMap::new(),
             cancellation: None,
             human_shell_pid: None,
@@ -553,17 +536,16 @@ mod tests {
     #[serial_test::serial]
     fn run_command_reports_missing_approved_env() {
         let tempdir = tempfile::tempdir().unwrap();
-        let vault_path = tempdir.path().join(".env.vault");
-        let envelope =
-            vault::encrypt_env("DATABASE_URL=postgres://local\n", "coverage passphrase").unwrap();
-        vault::write_vault(&vault_path, &envelope).unwrap();
+        let env = std::collections::BTreeMap::from([(
+            "DATABASE_URL".to_string(),
+            "postgres://local".to_string(),
+        )]);
 
         let result = run_command(RunCommandRequest {
             cwd: tempdir.path().to_path_buf(),
-            vault: vault_path,
             env_names: vec!["PAYLOAD_SECRET".to_string()],
+            env,
             command: vec!["true".to_string()],
-            passphrase: "coverage passphrase".to_string(),
             inherited_env: std::collections::BTreeMap::new(),
             cancellation: None,
             human_shell_pid: None,
@@ -577,21 +559,20 @@ mod tests {
     #[serial_test::serial]
     fn run_command_captures_stderr_alerts_and_exit_code() {
         let tempdir = tempfile::tempdir().unwrap();
-        let vault_path = tempdir.path().join(".env.vault");
-        let envelope =
-            vault::encrypt_env("PAYLOAD_SECRET=payload-secret\n", "coverage passphrase").unwrap();
-        vault::write_vault(&vault_path, &envelope).unwrap();
+        let env = std::collections::BTreeMap::from([(
+            "PAYLOAD_SECRET".to_string(),
+            "payload-secret".to_string(),
+        )]);
 
         let outcome = run_command(RunCommandRequest {
             cwd: tempdir.path().to_path_buf(),
-            vault: vault_path,
             env_names: vec!["PAYLOAD_SECRET".to_string()],
+            env,
             command: vec![
                 "sh".to_string(),
                 "-c".to_string(),
                 "printf 'PAYLOAD_SECRET=%s\\n' \"$PAYLOAD_SECRET\" >&2; exit 7".to_string(),
             ],
-            passphrase: "coverage passphrase".to_string(),
             inherited_env: std::collections::BTreeMap::new(),
             cancellation: None,
             human_shell_pid: None,
