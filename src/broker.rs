@@ -479,6 +479,16 @@ struct BrokerSession {
     app_slug: Option<String>,
 }
 
+impl Drop for BrokerSession {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.passphrase.zeroize();
+        for value in self.env.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 pub fn run_dir() -> PathBuf {
     logs::ward_home().join("run")
 }

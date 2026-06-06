@@ -967,10 +967,9 @@ pub fn start_dev_server(options: CloudDevStartOptions) -> Result<CloudDevInstanc
             .arg("__cloud-dev-server")
             .arg("--port")
             .arg(port.to_string())
-            .arg("--token")
-            .arg(&instance.token)
             .arg("--db")
             .arg(&db)
+            .env("WARD_INTERNAL_CLOUD_TOKEN", &instance.token)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1163,18 +1162,34 @@ fn respond_json<T: Serialize>(req: tiny_http::Request, status: StatusCode, value
     let _ = req.respond(response);
 }
 
+fn ct_token_eq(expected: &str, provided: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    if expected.len() != provided.len() {
+        return false;
+    }
+    expected.ct_eq(provided).into()
+}
+
 fn authorized(req: &tiny_http::Request, query: &str, token: &str) -> bool {
     if token.is_empty() {
-        return true;
+        return false;
     }
-    if query_param(query, "token").as_deref() == Some(token) {
+    if query_param(query, "token")
+        .as_deref()
+        .is_some_and(|value| ct_token_eq(token, value))
+    {
         return true;
     }
     req.headers().iter().any(|header| {
         let name = header.field.to_string();
         let value = header.value.as_str();
-        (name.eq_ignore_ascii_case("authorization") && value == format!("Bearer {token}"))
-            || (name.eq_ignore_ascii_case("x-ward-cloud-token") && value == token)
+        (name.eq_ignore_ascii_case("authorization")
+            && value
+                .strip_prefix("Bearer ")
+                .is_some_and(|bearer| ct_token_eq(token, bearer)))
+            || (name.eq_ignore_ascii_case("x-ward-cloud-token") && ct_token_eq(token, value))
     })
 }
 

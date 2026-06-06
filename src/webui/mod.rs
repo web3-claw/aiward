@@ -289,8 +289,7 @@ pub fn start_dashboard(options: DashboardStartOptions) -> Result<()> {
         .arg("__dashboard-server")
         .arg("--port")
         .arg(port.to_string())
-        .arg("--token")
-        .arg(&token)
+        .env("WARD_INTERNAL_DASHBOARD_TOKEN", &token)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -847,11 +846,24 @@ fn split_url(url: &str) -> (String, String) {
     }
 }
 
+fn ct_token_eq(expected: &str, provided: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    if expected.len() != provided.len() {
+        return false;
+    }
+    expected.ct_eq(provided).into()
+}
+
 fn authorized(req: &tiny_http::Request, query: &str, token: &str) -> bool {
     if token.is_empty() {
-        return true;
+        return false;
     }
-    if query_param(query, "token").as_deref() == Some(token) {
+    if query_param(query, "token")
+        .as_deref()
+        .is_some_and(|value| ct_token_eq(token, value))
+    {
         return true;
     }
     req.headers().iter().any(|header| {
@@ -860,12 +872,15 @@ fn authorized(req: &tiny_http::Request, query: &str, token: &str) -> bool {
             .to_string()
             .eq_ignore_ascii_case("authorization");
         let value = header.value.as_str();
-        (name && value == format!("Bearer {token}"))
+        (name
+            && value
+                .strip_prefix("Bearer ")
+                .is_some_and(|bearer| ct_token_eq(token, bearer)))
             || (header
                 .field
                 .to_string()
                 .eq_ignore_ascii_case("x-ward-dashboard-token")
-                && value == token)
+                && ct_token_eq(token, value))
     })
 }
 

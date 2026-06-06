@@ -16,6 +16,16 @@ pub struct RecoveryMaterial {
     pub vault_plaintext: Option<String>,
 }
 
+impl Drop for RecoveryMaterial {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.passphrase.zeroize();
+        if let Some(plaintext) = self.vault_plaintext.as_mut() {
+            plaintext.zeroize();
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RecoveryBlob {
@@ -96,7 +106,9 @@ pub fn restore_from_recovery(
     known_passphrase: Option<&str>,
     recovery_passphrase: &str,
 ) -> Result<String> {
-    Ok(restore_material_from_recovery(project, known_passphrase, recovery_passphrase)?.passphrase)
+    let mut material =
+        restore_material_from_recovery(project, known_passphrase, recovery_passphrase)?;
+    Ok(std::mem::take(&mut material.passphrase))
 }
 
 /// Restores the vault passphrase and optional vault material from a recovery file.

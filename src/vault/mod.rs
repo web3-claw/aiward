@@ -341,6 +341,9 @@ pub(crate) fn selected_editor() -> String {
 }
 
 pub(crate) fn test_passphrase() -> Option<String> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
     std::env::var("WARD_UNSAFE_TEST_PASSPHRASE")
         .ok()
         .filter(|value| !value.trim().is_empty())

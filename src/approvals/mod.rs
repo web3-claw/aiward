@@ -120,6 +120,9 @@ pub(crate) fn validate_scope_for_findings(
 }
 
 pub(crate) fn test_approval_scope() -> Result<Option<ApprovalScope>> {
+    if !cfg!(debug_assertions) {
+        return Ok(None);
+    }
     let Ok(value) = std::env::var("WARD_UNSAFE_TEST_APPROVAL") else {
         return Ok(None);
     };

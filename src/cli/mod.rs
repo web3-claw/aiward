@@ -445,14 +445,14 @@ pub enum Commands {
         #[arg(long)]
         port: u16,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
     },
     #[command(hide = true, name = "__cloud-dev-server")]
     CloudDevServer {
         #[arg(long)]
         port: u16,
         #[arg(long)]
-        token: String,
+        token: Option<String>,
         #[arg(long)]
         db: PathBuf,
     },
@@ -1182,8 +1182,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             command,
         } => recovery_command(project, app, command),
         Commands::Dashboard { command } => dashboard_command(command),
-        Commands::DashboardServer { port, token } => crate::webui::serve_standalone(port, token),
-        Commands::CloudDevServer { port, token, db } => cloud::serve_standalone(port, token, db),
+        Commands::DashboardServer { port, token } => {
+            let token = env::var("WARD_INTERNAL_DASHBOARD_TOKEN")
+                .ok()
+                .or(token)
+                .unwrap_or_default();
+            crate::webui::serve_standalone(port, token)
+        }
+        Commands::CloudDevServer { port, token, db } => {
+            let token = env::var("WARD_INTERNAL_CLOUD_TOKEN")
+                .ok()
+                .or(token)
+                .unwrap_or_default();
+            cloud::serve_standalone(port, token, db)
+        }
         Commands::Human {
             project,
             app,
